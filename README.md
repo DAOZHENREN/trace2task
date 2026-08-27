@@ -187,6 +187,8 @@ unminimized, and foreground.
 - Input from another foreground app is discarded while recording is paused.
 - Mouse events include screen coordinates and target-client normalized coordinates.
 - Window movement, resizing, and DPI changes are recorded as `window_changed` events.
+- Window geometry, captures, cursor polling, and replay coordinates use physical pixels under
+  per-monitor DPI awareness, so 125%/150% display scaling does not crop frames or shift clicks.
 
 A Windows recording contains raw `down/up` transitions rather than prematurely guessed motor
 skills:

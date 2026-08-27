@@ -196,7 +196,9 @@ def test_window_recorder_saves_raw_input_transitions_and_target_frames(tmp_path:
     assert metadata["success"] is True
     assert metadata["input_event_count"] == 4
     assert metadata["capture_method"] == "target_client_area"
+    assert metadata["coordinate_space"] == "physical_pixels"
     assert metadata["success_hotkey"] == "f8"
+    assert events[0]["details"]["coordinate_space"] == "physical_pixels"
     assert len(list((Path(result.trace_path).parent / "frames").glob("*.png"))) == 6
     assert len(capture.windows) == 6
     assert monitor.started and monitor.closed

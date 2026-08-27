@@ -9,7 +9,14 @@ from typing import Protocol
 
 import pygame
 
-from trace2task.windows_control import WindowInfo, WindowsBackend, WindowSelector, WindowSession
+from trace2task.windows_control import (
+    WindowInfo,
+    WindowsBackend,
+    WindowSelector,
+    WindowSession,
+    configure_physical_dpi_api,
+    physical_dpi_context,
+)
 
 SRCCOPY = 0x00CC0020
 CAPTUREBLT = 0x40000000
@@ -67,6 +74,7 @@ class GdiWindowCapture:
         self.user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
         self.user32.PrintWindow.restype = wintypes.BOOL
         self.user32.GetForegroundWindow.restype = wintypes.HWND
+        configure_physical_dpi_api(self.user32)
         self.gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
         self.gdi32.CreateCompatibleDC.restype = wintypes.HDC
         self.gdi32.DeleteDC.argtypes = [wintypes.HDC]
@@ -101,6 +109,10 @@ class GdiWindowCapture:
         self.gdi32.GetDIBits.restype = ctypes.c_int
 
     def capture(self, window: WindowInfo) -> pygame.Surface:
+        with physical_dpi_context(self.user32):
+            return self._capture_physical(window)
+
+    def _capture_physical(self, window: WindowInfo) -> pygame.Surface:
         width = window.client_width
         height = window.client_height
         if width <= 0 or height <= 0:

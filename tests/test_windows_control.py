@@ -18,6 +18,7 @@ from trace2task.windows_control import (
     WindowSession,
     WindowsMotorExecutor,
     list_window_records,
+    physical_dpi_context,
 )
 
 
@@ -75,6 +76,31 @@ class FakeWindowsBackend:
 
     def send_key(self, virtual_key: int, is_down: bool) -> None:
         self.events.append(("key", virtual_key, is_down))
+
+
+class FakeDpiSetter:
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    def __call__(self, context: Any) -> object:
+        self.calls.append(context)
+        return "previous-context"
+
+
+class FakeDpiApi:
+    def __init__(self) -> None:
+        self.SetThreadDpiAwarenessContext = FakeDpiSetter()
+
+
+def test_physical_dpi_context_switches_and_restores_thread_coordinates() -> None:
+    user32 = FakeDpiApi()
+
+    with physical_dpi_context(user32):
+        assert len(user32.SetThreadDpiAwarenessContext.calls) == 1
+
+    calls = user32.SetThreadDpiAwarenessContext.calls
+    assert calls[0].value is not None
+    assert calls[1] == "previous-context"
 
 
 def test_parameterized_actions_are_normalized_and_strict() -> None:

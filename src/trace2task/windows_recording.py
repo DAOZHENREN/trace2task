@@ -20,6 +20,8 @@ from trace2task.windows_control import (
     WindowsBackend,
     WindowSelector,
     WindowSession,
+    configure_physical_dpi_api,
+    physical_dpi_context,
 )
 
 WM_HOTKEY = 0x0312
@@ -84,6 +86,7 @@ class Win32InputMonitor:
         self.user32.GetAsyncKeyState.restype = wintypes.SHORT
         self.user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
         self.user32.GetCursorPos.restype = wintypes.BOOL
+        configure_physical_dpi_api(self.user32)
         self._started = False
 
     def start(self) -> None:
@@ -125,8 +128,9 @@ class Win32InputMonitor:
             if self.user32.GetAsyncKeyState(virtual_key) & 0x8000
         )
         cursor = wintypes.POINT()
-        if not self.user32.GetCursorPos(ctypes.byref(cursor)):
-            raise ctypes.WinError(ctypes.get_last_error())
+        with physical_dpi_context(self.user32):
+            if not self.user32.GetCursorPos(ctypes.byref(cursor)):
+                raise ctypes.WinError(ctypes.get_last_error())
         return InputSnapshot(
             keys_down=keys_down,
             buttons_down=buttons_down,
@@ -206,7 +210,11 @@ class WindowRecorder:
             writer.record(
                 "start",
                 self.capture.capture(initial_window),
-                details={"window": asdict(initial_window), "capture": "target_client_area"},
+                details={
+                    "window": asdict(initial_window),
+                    "capture": "target_client_area",
+                    "coordinate_space": "physical_pixels",
+                },
             )
             self.status_callback(
                 f"Recording '{initial_window.title}'. Press F8 to mark success or F9 to cancel."
@@ -298,6 +306,7 @@ class WindowRecorder:
                 "window_selector": asdict(self.session.selector),
                 "initial_window": asdict(initial_window),
                 "capture_method": "target_client_area",
+                "coordinate_space": "physical_pixels",
                 "success_hotkey": "f8",
                 "cancel_hotkey": "f9",
             },

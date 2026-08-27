@@ -3,7 +3,8 @@ from __future__ import annotations
 import ctypes
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,6 +17,7 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_EXTENDEDKEY = 0x0001
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
 MOUSE_FLAGS = {
     "left": (0x0002, 0x0004),
     "right": (0x0008, 0x0010),
@@ -46,6 +48,33 @@ EXTENDED_VIRTUAL_KEYS = {
     VK_CODES[key]
     for key in ("page_up", "page_down", "end", "home", "left", "up", "right", "down", "insert", "delete")
 }
+
+
+def configure_physical_dpi_api(user32: Any) -> None:
+    """Configure the optional Windows 10 thread-DPI API on one user32 handle."""
+    setter = getattr(user32, "SetThreadDpiAwarenessContext", None)
+    if setter is not None:
+        setter.argtypes = [wintypes.HANDLE]
+        setter.restype = wintypes.HANDLE
+
+
+@contextmanager
+def physical_dpi_context(user32: Any) -> Iterator[None]:
+    """Run coordinate-sensitive Win32 calls in physical per-monitor pixels."""
+    setter = getattr(user32, "SetThreadDpiAwarenessContext", None)
+    if setter is None:
+        yield
+        return
+    previous = setter(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    if not previous:
+        # Older/locked-down systems can reject the context switch. Preserve the
+        # old behavior rather than failing unrelated window discovery entirely.
+        yield
+        return
+    try:
+        yield
+    finally:
+        setter(previous)
 
 
 class _KeybdInput(ctypes.Structure):
@@ -202,6 +231,7 @@ class Win32Backend:
         if get_dpi:
             get_dpi.argtypes = [wintypes.HWND]
             get_dpi.restype = wintypes.UINT
+        configure_physical_dpi_api(self.user32)
 
         self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self.kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -229,6 +259,10 @@ class Win32Backend:
         return sorted(windows, key=lambda window: (window.process_name.casefold(), window.title))
 
     def get_window(self, handle: int) -> WindowInfo | None:
+        with physical_dpi_context(self.user32):
+            return self._get_window_physical(handle)
+
+    def _get_window_physical(self, handle: int) -> WindowInfo | None:
         if not self.user32.IsWindow(wintypes.HWND(handle)):
             return None
         title_length = self.user32.GetWindowTextLengthW(wintypes.HWND(handle))
@@ -292,8 +326,9 @@ class Win32Backend:
         return bool(self.user32.SetForegroundWindow(wintypes.HWND(handle)))
 
     def set_cursor_position(self, x: int, y: int) -> None:
-        if not self.user32.SetCursorPos(x, y):
-            raise ctypes.WinError(ctypes.get_last_error())
+        with physical_dpi_context(self.user32):
+            if not self.user32.SetCursorPos(x, y):
+                raise ctypes.WinError(ctypes.get_last_error())
 
     def send_mouse_button(self, button: str, is_down: bool) -> None:
         flags = MOUSE_FLAGS[button][0 if is_down else 1]
