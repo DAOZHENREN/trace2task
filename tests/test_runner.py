@@ -1,9 +1,11 @@
 import pygame
 
+from trace2task import runner
 from trace2task.runner import (
     HUMAN_KEY_ACTIONS,
     create_reference_trace,
     human_action_for_event,
+    interaction_key_is_pressed,
     replay_trace,
     run_visual_agent,
 )
@@ -27,6 +29,13 @@ def test_interact_accepts_physical_text_and_ime_events() -> None:
     assert human_action_for_event(physical) == "interact"
     assert human_action_for_event(unicode_fallback) == "interact"
     assert human_action_for_event(text_input) == "interact"
+
+
+def test_win32_polling_detects_e_when_pygame_event_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(runner, "_pygame_interaction_key_is_pressed", lambda: False)
+    monkeypatch.setattr(runner, "_win32_key_was_pressed", lambda key: key == 0x45)
+
+    assert interaction_key_is_pressed()
 
 
 def test_visual_agent_completes_after_target_relocation(tmp_path) -> None:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pygame
 
+from trace2task import __version__
 from trace2task.agent import VisualReplanningAgent
 from trace2task.game import WINDOW_SIZE, GameRenderer, GameState
 from trace2task.planner import a_star, path_to_actions
@@ -45,7 +47,7 @@ def _prepare_pygame(show: bool) -> pygame.Surface:
             pygame.init()
         if not pygame.display.get_init():
             pygame.display.init()
-        pygame.display.set_caption("Trace2Task - Daily Reward")
+        pygame.display.set_caption(f"Trace2Task {__version__} - Daily Reward")
         return pygame.display.set_mode(WINDOW_SIZE)
     if not pygame.font.get_init():
         pygame.font.init()
@@ -80,6 +82,29 @@ def human_action_for_event(event: pygame.event.Event) -> str | None:
     return None
 
 
+def _pygame_interaction_key_is_pressed() -> bool:
+    pressed = pygame.key.get_pressed()
+    return bool(pressed[pygame.K_e] or pressed[pygame.K_RETURN] or pressed[pygame.K_SPACE])
+
+
+def _win32_key_was_pressed(virtual_key: int) -> bool:
+    """Read a physical key outside the IME/Pygame text event path."""
+    try:
+        state = ctypes.windll.user32.GetAsyncKeyState(virtual_key)
+    except (AttributeError, OSError):
+        return False
+    # The high bit means currently down. The low bit means it was pressed
+    # since the previous call, which catches short taps between frames.
+    return bool(state & 0x8001)
+
+
+def interaction_key_is_pressed() -> bool:
+    if _pygame_interaction_key_is_pressed():
+        return True
+    # Windows virtual-key codes: E, Enter, Space.
+    return any(_win32_key_was_pressed(key) for key in (0x45, 0x0D, 0x20))
+
+
 def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     surface = _prepare_pygame(show=True)
     state = GameState.reset(seed)
@@ -87,7 +112,6 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     renderer.render(surface, state, mode="record")
     pygame.display.flip()
     pygame.key.set_repeat(180, 90)
-    pygame.key.start_text_input()
 
     run_dir = make_run_dir(output_root, "human")
     writer = TraceWriter(run_dir, task_id="daily-reward", seed=seed, source="human")
@@ -95,7 +119,7 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     clock = pygame.time.Clock()
     running = True
     action_count = 0
-    e_was_pressed = False
+    interact_was_pressed = False
 
     def apply_human_action(action: str, key_label: str, source: str) -> None:
         nonlocal action_count
@@ -130,18 +154,21 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
                     apply_human_action(action, key_label, "event")
                     interaction_handled = action == "interact"
 
-        pressed = pygame.key.get_pressed()
-        e_is_pressed = bool(pressed[pygame.K_e])
-        if not state.completed and e_is_pressed and not e_was_pressed and not interaction_handled:
-            apply_human_action("interact", "e", "polled_state")
-        e_was_pressed = e_is_pressed
+        interact_is_pressed = interaction_key_is_pressed()
+        if (
+            not state.completed
+            and interact_is_pressed
+            and not interact_was_pressed
+            and not interaction_handled
+        ):
+            apply_human_action("interact", "e/enter/space", "physical_key_poll")
+        interact_was_pressed = interact_is_pressed
 
         renderer.render(surface, state, mode="record")
         pygame.display.flip()
         clock.tick(fps)
 
     trace = writer.finish(success=state.completed)
-    pygame.key.stop_text_input()
     pygame.key.set_repeat()
     pygame.display.quit()
     return RunResult(
