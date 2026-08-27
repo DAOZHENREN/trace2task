@@ -5,8 +5,10 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from trace2task import __version__
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
+from trace2task.windows_control import list_window_records
 
 
 def _print_result(result: object) -> None:
@@ -20,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="trace2task",
         description="Record a small game task, replay it, or solve it with a visual replanning agent.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     record = subparsers.add_parser("record", help="Record a human demonstration.")
@@ -49,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark a reviewed compiler-generated task pack as executable.",
     )
     confirm.add_argument("task", type=Path)
+
+    windows = subparsers.add_parser(
+        "windows",
+        help="Inspect Windows targets for the desktop control adapter.",
+    )
+    windows_subparsers = windows.add_subparsers(dest="windows_command", required=True)
+    windows_list = windows_subparsers.add_parser("list", help="List visible top-level windows.")
+    windows_list.add_argument("--title", help="Keep windows whose title contains this text.")
+    windows_list.add_argument("--process", help="Keep windows with this executable name.")
 
     agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
@@ -105,6 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         result = compile_trace(args.trace, args.output)
     elif args.command == "confirm":
         result = confirm_taskpack(args.task)
+    elif args.command == "windows":
+        result = list_window_records(
+            title_contains=args.title,
+            process_name=args.process,
+        )
     elif args.command == "agent":
         result = run_agent(
             args.seed,

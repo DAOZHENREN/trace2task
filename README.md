@@ -19,6 +19,7 @@ The task is simple: move a blue player to a gold daily-task marker and press `E`
 - `record` captures each human input, timestamp, screenshot, and final outcome.
 - `compile` validates a successful trace and turns it into a self-contained draft task pack.
 - `confirm` marks a reviewed generated task pack as executable.
+- `windows list` discovers real Windows targets without sending input.
 - `replay` applies the same input sequence to another seeded layout.
 - `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
 - `agent --provider codex` sends the current screenshot and task contract to a general multimodal
@@ -116,6 +117,47 @@ uv run trace2task agent --task taskpacks\generated\<generated-taskpack>\task.yam
 uv run trace2task agent --task taskpacks\generated\<generated-taskpack>\task.yaml --provider codex --seed 19
 ```
 
+## Windows motor foundation (v0.5.1)
+
+Version 0.5.1 introduces the safe execution foundation for controlling an external Windows app.
+List visible top-level windows without changing focus or sending input:
+
+```powershell
+uv run trace2task windows list
+uv run trace2task windows list --title "part of the window title"
+uv run trace2task windows list --process "game.exe"
+```
+
+Each result includes the stable window handle, process ID/name, client-area bounds, DPI, visibility,
+minimized state, and foreground state. A selector must resolve to exactly one window; ambiguous or
+missing targets fail closed.
+
+The new parameterized action contract supports:
+
+- `focus_window`
+- `click` and `double_click` with normalized client coordinates
+- `press_key` and bounded `hold_key`
+- two-to-four-key `hotkey`
+- bounded `wait`
+
+For example, a future compiled Windows task can request:
+
+```json
+{
+  "skill": "hold_key",
+  "args": {"key": "w", "duration_ms": 420}
+}
+```
+
+The Windows motor executor validates the payload, requires the selected target to be visible,
+unminimized, and foreground, maps normalized coordinates into its current client area, then uses
+Win32 `SendInput`. Key-up and mouse-up events are sent from `finally` blocks so an interrupted skill
+does not intentionally leave a key or button held.
+
+The existing mini-game agent is not wired to this executor yet. Version 0.5.2 will add target-window
+screenshots and keyboard/mouse recording; until then, `windows list` is the only new user-facing
+Windows command and is read-only.
+
 Run the visual agent on that layout and move the target after four actions:
 
 ```bash
@@ -196,6 +238,7 @@ uv run ruff check .
 
 ## Next milestones
 
+- Record target-window screenshots and keyboard/mouse events through the Windows adapter.
 - Add compiler profiles beyond the built-in mini-game and introduce model-assisted semantic labels.
 - Infer reusable motor-skill boundaries from longer demonstrations.
 - Add pop-up recovery and changed-obstacle scenarios.
