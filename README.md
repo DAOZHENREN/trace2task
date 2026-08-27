@@ -20,7 +20,7 @@ The task is simple: move a blue player to a gold daily-task marker and press `E`
 - `replay` applies the same input sequence to another seeded layout.
 - `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
 - `agent --provider codex` sends the current screenshot and task contract to a general multimodal
-  model, then executes only actions allowed by the task pack.
+  model in one persistent session, then executes only actions allowed by the task pack.
 - `verifier` checks the rendered success state rather than trusting the action sequence.
 - `reset` creates deterministic but different layouts from integer seeds.
 
@@ -95,6 +95,11 @@ If needed, run `codex login` and complete the browser sign-in. Then start the mu
 uv run trace2task agent --provider codex --model gpt-5.6-terra --seed 19 --relocate-after 4
 ```
 
+Each command starts one local Codex App Server process and one ephemeral conversation thread.
+Every later replan sends a new screenshot into that same thread, so the model retains task context
+without paying process and conversation startup cost again. The process is closed automatically
+when the run finishes.
+
 On Windows, Trace2Task also discovers the versioned `codex.exe` bundled inside the ChatGPT/Codex
 desktop app, so an older terminal `PATH` does not break after an app update. If Codex is installed
 somewhere else, pass it explicitly:
@@ -103,15 +108,28 @@ somewhere else, pass it explicitly:
 uv run trace2task agent --provider codex --codex-bin "C:\path\to\codex.exe" --seed 19
 ```
 
-The adapter attaches the current screenshot to an ephemeral, read-only `codex exec` run. Its final
-response must match a JSON Schema generated from the task pack, so the model can only return one of
-the declared actions. It plans at most four actions per model call and discards the cached plan when
-an action is blocked or the environment changes.
+The App Server thread is ephemeral and read-only. The planner prompt forbids tool use, and the
+client rejects model-initiated approval/tool requests. Every final response must match a JSON Schema
+generated from the task pack, so the model can only return one of the declared actions. By default,
+the model plans up to 12 actions and the local motor controller executes them at 20 FPS. A blocked
+action or environment change immediately discards the remaining batch and requests a fresh
+screenshot-based plan.
 
-This bridge uses ChatGPT/Codex subscription limits rather than API billing. It is suitable for the
-prototype and low-frequency decision points, but not for frame-by-frame realtime control: each
-fresh model decision can take several seconds. A later API or local-model adapter can implement the
-same `AgentAdapter` contract without changing the recorder, executor, task pack, or verifier.
+Tune the planning/execution split if a later task needs shorter cautious plans or faster animation:
+
+```bash
+uv run trace2task agent --provider codex --plan-horizon 8 --motor-fps 30 --seed 19
+```
+
+On the seed-19 relocation scenario, the persistent implementation completed in 23.3 seconds with
+2 model replans in one reference run. The earlier fresh-process implementation took about 93 seconds
+and 5 replans on the same scenario. Model latency varies, so treat this as a local reference rather
+than a fixed benchmark.
+
+This bridge uses ChatGPT/Codex subscription limits rather than API billing. It deliberately keeps
+the model at low-frequency decision points; frame-by-frame movement stays local because even a
+persistent model turn can take several seconds. A later API or local-model adapter can implement
+the same `AgentAdapter` contract without changing the recorder, executor, task pack, or verifier.
 
 ## Task pack
 
@@ -139,5 +157,5 @@ uv run ruff check .
 - Compile raw demonstrations into candidate goals and verifiers with user confirmation.
 - Move the Codex prompt inputs entirely into compiler-generated task packs.
 - Add pop-up recovery and changed-obstacle scenarios.
-- Separate reusable motor skills from model-driven high-level decisions.
+- Extend the local motor layer from grid moves to reusable desktop/game skills.
 - Add adapters for desktop applications, browser tasks, and real game test environments.

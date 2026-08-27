@@ -31,6 +31,8 @@ class AgentAdapter(Protocol):
 
     def invalidate_plan(self, reason: str) -> None: ...
 
+    def close(self) -> None: ...
+
 
 class VisualReplanningAgent:
     """A small hybrid agent: pixel perception plus deterministic motor planning."""
@@ -83,3 +85,6 @@ class VisualReplanningAgent:
 
     def invalidate_plan(self, reason: str) -> None:
         """No cache to clear: the deterministic agent observes every frame."""
+
+    def close(self) -> None:
+        """No external resources are held by the deterministic agent."""

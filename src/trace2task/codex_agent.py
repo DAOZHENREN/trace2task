@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -12,10 +11,11 @@ from typing import Any
 import pygame
 
 from trace2task.agent import AgentDecision
+from trace2task.codex_app_server import CodexAppServerSession
 from trace2task.taskpack import TaskPack
 
-CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 BinaryResolver = Callable[[str], str]
+SessionFactory = Callable[..., CodexAppServerSession]
 
 
 def resolve_codex_binary(requested: str = "codex") -> str:
@@ -51,7 +51,7 @@ def resolve_codex_binary(requested: str = "codex") -> str:
 
 
 class CodexMultimodalAgent:
-    """Use Codex CLI's saved ChatGPT login as a multimodal decision provider."""
+    """Use one persistent Codex conversation as a multimodal route planner."""
 
     def __init__(
         self,
@@ -59,10 +59,10 @@ class CodexMultimodalAgent:
         *,
         model: str | None = "gpt-5.6-terra",
         codex_bin: str = "codex",
-        plan_horizon: int = 4,
+        plan_horizon: int = 12,
         timeout_seconds: float = 120,
-        command_runner: CommandRunner = subprocess.run,
         binary_resolver: BinaryResolver = resolve_codex_binary,
+        session_factory: SessionFactory = CodexAppServerSession,
     ) -> None:
         if plan_horizon <= 0:
             raise ValueError("plan_horizon must be positive")
@@ -71,14 +71,16 @@ class CodexMultimodalAgent:
         self.codex_bin = codex_bin
         self.plan_horizon = plan_horizon
         self.timeout_seconds = timeout_seconds
-        self.command_runner = command_runner
         self.binary_resolver = binary_resolver
+        self.session_factory = session_factory
         self.replans = 0
         self.goal_changes = 0
         self._pending_actions: list[str] = []
         self._pending_reason = ""
         self._pending_confidence = 0.0
         self._history: list[str] = []
+        self._session: CodexAppServerSession | None = None
+        self._turn_index = 0
 
     def decide(self, surface: pygame.Surface) -> AgentDecision:
         if not self._pending_actions:
@@ -93,10 +95,12 @@ class CodexMultimodalAgent:
             action=action,
             reason=self._pending_reason,
             details={
-                "provider": "codex_cli",
+                "provider": "codex_app_server",
                 "model": self.model or "configured_default",
                 "confidence": self._pending_confidence,
                 "cached_actions_remaining": len(self._pending_actions),
+                "plan_horizon": self.plan_horizon,
+                "session_mode": "persistent",
             },
         )
 
@@ -113,74 +117,56 @@ class CodexMultimodalAgent:
         self.goal_changes += 1
 
     def _request_plan(self, surface: pygame.Surface) -> dict[str, Any]:
-        codex_executable = self.binary_resolver(self.codex_bin)
         with tempfile.TemporaryDirectory(prefix="trace2task-codex-") as directory:
             temp_dir = Path(directory)
             frame_path = temp_dir / "observation.png"
-            schema_path = temp_dir / "action.schema.json"
             pygame.image.save(surface, frame_path)
-            schema_path.write_text(
-                json.dumps(self._output_schema(), ensure_ascii=False),
-                encoding="utf-8",
+            output = self._get_session().run_turn(
+                prompt=self._prompt(),
+                image_path=frame_path,
+                output_schema=self._output_schema(),
             )
+        self._turn_index += 1
+        return self._parse_payload(output)
 
-            command = [
+    def _get_session(self) -> CodexAppServerSession:
+        if self._session is None:
+            codex_executable = self.binary_resolver(self.codex_bin)
+            self._session = self.session_factory(
                 codex_executable,
-                "exec",
-                "--ephemeral",
-                "--ignore-user-config",
-                "--ignore-rules",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "--output-schema",
-                str(schema_path),
-                "--image",
-                str(frame_path),
-            ]
-            if self.model:
-                command.extend(["--model", self.model])
-            command.append(self._prompt())
-
-            try:
-                completed = self.command_runner(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self.timeout_seconds,
-                    check=False,
-                )
-            except FileNotFoundError as error:
-                raise RuntimeError(
-                    f"The resolved Codex CLI no longer exists: {codex_executable}"
-                ) from error
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(
-                    f"Codex did not return a decision within {self.timeout_seconds:g} seconds"
-                ) from error
-
-        if completed.returncode != 0:
-            message = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(f"Codex decision failed: {message or 'unknown CLI error'}")
-        return self._parse_payload(completed.stdout)
+                model=self.model,
+                cwd=Path.cwd(),
+                timeout_seconds=self.timeout_seconds,
+            )
+        return self._session
 
     def _prompt(self) -> str:
         history = ", ".join(self._history) if self._history else "none"
         actions = ", ".join(self.task.actions)
+        session_context = (
+            "This is the first observation in a new task run. "
+            if self._turn_index == 0
+            else "Continue the same task using this new authoritative screenshot. "
+        )
         return (
-            "You are the visual decision component of a constrained desktop agent. "
+            session_context
+            + "You are the visual route planner of a constrained desktop agent. "
             "Inspect only the attached current screenshot. Do not run commands, read files, "
-            "or use tools. Choose a short safe action plan for the current visible state.\n\n"
+            "or use tools. The local motor controller will execute your returned actions quickly.\n\n"
             f"Task: {self.task.instruction}\n"
             f"Success condition: {self.task.expected_result}\n"
             f"Allowed actions: {actions}\n"
-            f"Recent executed actions: {history}\n\n"
-            f"Return 1 to {self.plan_horizon} actions. Prefer fewer actions when uncertain or "
-            "near an obstacle, and use interact only when the screenshot indicates the target "
-            "is within interaction range. The response must match the supplied JSON schema."
+            f"Recent locally executed actions: {history}\n\n"
+            f"Return 1 to {self.plan_horizon} actions. Plan a longer collision-free route when "
+            "the board is clear. Prefer fewer actions near ambiguous obstacles. Use interact "
+            "only when the target is within interaction range. The response must match the "
+            "supplied JSON schema."
         )
+
+    def close(self) -> None:
+        if self._session is not None:
+            self._session.close()
+            self._session = None
 
     def _output_schema(self) -> dict[str, Any]:
         return {

@@ -47,6 +47,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent.add_argument("--task", type=Path, default=DEFAULT_TASK_PATH)
     agent.add_argument("--relocate-after", type=int, default=4)
+    agent.add_argument(
+        "--plan-horizon",
+        type=int,
+        default=12,
+        help="Maximum local action batch returned by each model turn.",
+    )
+    agent.add_argument(
+        "--motor-fps",
+        type=int,
+        default=20,
+        help="Visible local action execution speed.",
+    )
     agent.add_argument("--output", type=Path, default=Path("runs"))
     agent.add_argument("--headless", action="store_true")
 
@@ -78,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
             codex_bin=args.codex_bin,
             task_path=args.task,
             relocate_after=args.relocate_after,
+            plan_horizon=args.plan_horizon,
+            fps=args.motor_fps,
             show=not args.headless,
             output_root=args.output,
         )

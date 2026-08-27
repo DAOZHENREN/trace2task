@@ -296,7 +296,8 @@ def run_agent(
     task_path: Path = DEFAULT_TASK_PATH,
     relocate_after: int | None = None,
     show: bool = False,
-    fps: int = 10,
+    fps: int = 20,
+    plan_horizon: int = 12,
     max_actions: int | None = None,
     output_root: Path | None = None,
 ) -> RunResult:
@@ -312,7 +313,12 @@ def run_agent(
     elif provider == "codex":
         task = load_taskpack(task_path)
         task_id = task.task_id
-        agent = CodexMultimodalAgent(task, model=model, codex_bin=codex_bin)
+        agent = CodexMultimodalAgent(
+            task,
+            model=model,
+            codex_bin=codex_bin,
+            plan_horizon=plan_horizon,
+        )
         action_limit = max_actions if max_actions is not None else task.max_actions
     else:
         raise ValueError(f"Unknown agent provider: {provider}")
@@ -374,6 +380,7 @@ def run_agent(
     finally:
         if executor is not None:
             executor.shutdown(wait=True)
+        agent.close()
 
     success = verifier.completed(surface)
     recorded = (
