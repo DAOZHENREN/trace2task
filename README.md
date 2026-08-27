@@ -52,6 +52,10 @@ uv run trace2task record --seed 7
 
 Use `WASD` or the arrow keys to move. Stand on the gold marker or in an adjacent cell and press `E`. If the player is too far away, the status bar turns red and explains why the interaction failed. The command prints the generated `trace.jsonl` path.
 
+After a successful interaction, a large `TASK COMPLETE` panel remains visible so you can confirm
+that the demonstration was recorded. Press `Enter` or `Esc` to close the window and print the trace
+path in the terminal.
+
 You can tap a movement key for one grid cell or hold it for continuous movement. Every seeded
 recording starts with all four neighboring cells clear, so each WASD direction gives immediate
 feedback.

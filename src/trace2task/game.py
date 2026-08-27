@@ -25,6 +25,8 @@ PLAYER_COLOR = (40, 117, 230)
 TARGET_COLOR = (244, 180, 0)
 OBSTACLE_COLOR = (74, 82, 98)
 TEXT_COLOR = (250, 251, 252)
+PANEL_BG = (255, 255, 255)
+PANEL_TEXT = (31, 36, 48)
 
 ACTION_DELTAS: dict[str, Cell] = {
     "move_up": (0, -1),
@@ -155,6 +157,7 @@ class GameRenderer:
             pygame.font.init()
         self.font = pygame.font.Font(None, 27)
         self.small_font = pygame.font.Font(None, 20)
+        self.title_font = pygame.font.Font(None, 44)
 
     def render(self, surface: pygame.Surface, state: GameState, *, mode: str = "record") -> None:
         surface.fill(BACKGROUND)
@@ -211,3 +214,30 @@ class GameRenderer:
             CELL_SIZE - 16,
         )
         pygame.draw.rect(surface, PLAYER_COLOR, player_rect, border_radius=6)
+
+        if state.completed:
+            self._render_completion(surface, mode)
+
+    def _render_completion(self, surface: pygame.Surface, mode: str) -> None:
+        dimmer = pygame.Surface((BOARD_WIDTH, BOARD_HEIGHT), pygame.SRCALPHA)
+        dimmer.fill((18, 24, 34, 105))
+        surface.blit(dimmer, (0, STATUS_HEIGHT))
+
+        panel = pygame.Rect(170, STATUS_HEIGHT + 175, 460, 210)
+        pygame.draw.rect(surface, PANEL_BG, panel, border_radius=14)
+        pygame.draw.rect(surface, SUCCESS_BG, panel, width=4, border_radius=14)
+
+        if mode == "agent":
+            subtitle = "The visual agent reached and verified the goal."
+        elif mode == "replay":
+            subtitle = "The recorded actions reached the goal."
+        else:
+            subtitle = "Your demonstration and final frame were saved."
+
+        title = self.title_font.render("TASK COMPLETE", True, SUCCESS_BG)
+        detail = self.small_font.render(subtitle, True, PANEL_TEXT)
+        surface.blit(title, title.get_rect(center=(panel.centerx, panel.top + 58)))
+        surface.blit(detail, detail.get_rect(center=(panel.centerx, panel.top + 112)))
+        if mode == "record":
+            dismiss = self.small_font.render("Press ENTER or ESC to close", True, PANEL_TEXT)
+            surface.blit(dismiss, dismiss.get_rect(center=(panel.centerx, panel.top + 157)))

@@ -2,7 +2,7 @@ import pygame
 
 from trace2task.game import ACTION_DELTAS, WINDOW_SIZE, GameRenderer, GameState
 from trace2task.planner import a_star, path_to_actions
-from trace2task.vision import VisualObserver
+from trace2task.vision import VisualObserver, VisualVerifier
 
 
 def test_seeded_games_are_solvable() -> None:
@@ -60,3 +60,13 @@ def test_failed_interaction_explains_that_player_is_too_far() -> None:
     assert not state.apply("interact")
     assert state.feedback is not None
     assert "TOO FAR" in state.feedback
+
+
+def test_completed_frame_has_visible_verifier_signal() -> None:
+    pygame.init()
+    state = GameState(seed=0, player=(2, 2), target=(3, 2))
+    state.apply("interact")
+    surface = pygame.Surface(WINDOW_SIZE)
+    GameRenderer().render(surface, state, mode="record")
+
+    assert VisualVerifier().completed(surface)

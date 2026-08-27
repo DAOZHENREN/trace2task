@@ -79,12 +79,17 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     writer.record("start", surface)
     clock = pygame.time.Clock()
     running = True
-    success_at: int | None = None
     action_count = 0
     while running:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT or (
-                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+            if (
+                event.type == pygame.QUIT
+                or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE)
+                or (
+                    state.completed
+                    and event.type == pygame.KEYDOWN
+                    and event.key in {pygame.K_RETURN, pygame.K_SPACE}
+                )
             ):
                 running = False
             elif (
@@ -102,12 +107,8 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
                     action=action,
                     details={"key": pygame.key.name(event.key), "applied": applied},
                 )
-                if state.completed:
-                    success_at = pygame.time.get_ticks()
         renderer.render(surface, state, mode="record")
         pygame.display.flip()
-        if success_at is not None and pygame.time.get_ticks() - success_at >= 900:
-            running = False
         clock.tick(fps)
 
     trace = writer.finish(success=state.completed)
