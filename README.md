@@ -17,6 +17,8 @@ human demonstration -> recorded trace -> changed environment
 The task is simple: move a blue player to a gold daily-task marker and press `E`.
 
 - `record` captures each human input, timestamp, screenshot, and final outcome.
+- `compile` validates a successful trace and turns it into a self-contained draft task pack.
+- `confirm` marks a reviewed generated task pack as executable.
 - `replay` applies the same input sequence to another seeded layout.
 - `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
 - `agent --provider codex` sends the current screenshot and task contract to a general multimodal
@@ -72,6 +74,46 @@ Replay the exact recorded actions on a different layout:
 
 ```bash
 uv run trace2task replay runs/<run>/trace.jsonl --seed 19
+```
+
+## Compile a recording into a task pack
+
+Compile one successful recording instead of writing `task.yaml` by hand:
+
+```powershell
+uv run trace2task compile runs\<successful-human-run>\trace.jsonl
+```
+
+The compiler validates both `metadata.success` and the final screenshot's visual success signal.
+It then creates a self-contained directory under `taskpacks/generated/` containing:
+
+```text
+<generated-taskpack>/
+├── task.yaml
+├── compiler-report.json
+└── reference/
+    ├── metadata.json
+    ├── trace.jsonl
+    └── frames/*.png
+```
+
+Version 0.4 supports the built-in mini-game adapter. It segments the demonstration into
+`navigate`, `interact`, and `verify` stages. The complete movement vocabulary comes from the
+adapter rather than only the demonstrated directions, so the resulting agent can solve changed
+layouts.
+
+Generated packs start as drafts and cannot execute accidentally. Review the instruction, declared
+actions, compiler report, and final reference frame, then confirm the exact printed task path:
+
+```powershell
+uv run trace2task confirm taskpacks\generated\<generated-taskpack>\task.yaml
+```
+
+The confirmed artifact can now drive either agent implementation:
+
+```powershell
+uv run trace2task agent --task taskpacks\generated\<generated-taskpack>\task.yaml --seed 19
+uv run trace2task agent --task taskpacks\generated\<generated-taskpack>\task.yaml --provider codex --seed 19
 ```
 
 Run the visual agent on that layout and move the target after four actions:
@@ -154,8 +196,8 @@ uv run ruff check .
 
 ## Next milestones
 
-- Compile raw demonstrations into candidate goals and verifiers with user confirmation.
-- Move the Codex prompt inputs entirely into compiler-generated task packs.
+- Add compiler profiles beyond the built-in mini-game and introduce model-assisted semantic labels.
+- Infer reusable motor-skill boundaries from longer demonstrations.
 - Add pop-up recovery and changed-obstacle scenarios.
 - Extend the local motor layer from grid moves to reusable desktop/game skills.
 - Add adapters for desktop applications, browser tasks, and real game test environments.

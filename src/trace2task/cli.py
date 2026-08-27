@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
 
 
@@ -30,6 +31,24 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--seed", type=int, default=19)
     replay.add_argument("--output", type=Path, default=Path("runs"))
     replay.add_argument("--headless", action="store_true")
+
+    compile_command = subparsers.add_parser(
+        "compile",
+        help="Compile a successful recorded trace into a draft task pack.",
+    )
+    compile_command.add_argument("trace", type=Path)
+    compile_command.add_argument(
+        "--output",
+        type=Path,
+        default=Path("taskpacks/generated"),
+        help="Root directory for generated task packs.",
+    )
+
+    confirm = subparsers.add_parser(
+        "confirm",
+        help="Mark a reviewed compiler-generated task pack as executable.",
+    )
+    confirm.add_argument("task", type=Path)
 
     agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
@@ -82,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
             show=not args.headless,
             output_root=args.output,
         )
+    elif args.command == "compile":
+        result = compile_trace(args.trace, args.output)
+    elif args.command == "confirm":
+        result = confirm_taskpack(args.task)
     elif args.command == "agent":
         result = run_agent(
             args.seed,

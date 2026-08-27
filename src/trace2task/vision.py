@@ -13,6 +13,7 @@ from trace2task.game import (
     PLAYER_COLOR,
     STATUS_HEIGHT,
     SUCCESS_BG,
+    SUCCESS_TEXT,
     TARGET_COLOR,
     Cell,
 )
@@ -79,7 +80,16 @@ class VisualObserver:
 
 
 class VisualVerifier:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        verifier_type: str = "visual_status",
+        expected_result: str = SUCCESS_TEXT,
+    ) -> None:
+        if verifier_type != "visual_status":
+            raise ValueError(f"Unsupported verifier type: {verifier_type}")
+        if expected_result != SUCCESS_TEXT:
+            raise ValueError(f"Unsupported visual status result: {expected_result}")
         self.observer = VisualObserver()
 
     def completed(self, surface: pygame.Surface) -> bool:

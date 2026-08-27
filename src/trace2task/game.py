@@ -27,6 +27,7 @@ OBSTACLE_COLOR = (74, 82, 98)
 TEXT_COLOR = (250, 251, 252)
 PANEL_BG = (255, 255, 255)
 PANEL_TEXT = (31, 36, 48)
+SUCCESS_TEXT = "DAILY TASK COMPLETE"
 
 ACTION_DELTAS: dict[str, Cell] = {
     "move_up": (0, -1),
@@ -169,7 +170,7 @@ class GameRenderer:
             status_color = STATUS_BG
         pygame.draw.rect(surface, status_color, (0, 0, BOARD_WIDTH, STATUS_HEIGHT))
         if state.completed:
-            status = "DAILY TASK COMPLETE"
+            status = SUCCESS_TEXT
         elif state.feedback:
             status = state.feedback
         elif mode == "replay":

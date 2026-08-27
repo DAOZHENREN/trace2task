@@ -12,8 +12,12 @@ class TaskPack:
     task_id: str
     instruction: str
     actions: tuple[str, ...]
+    environment_adapter: str
+    verifier_type: str
     expected_result: str
     max_actions: int
+    review_status: str
+    requires_confirmation: bool
     source_path: Path
 
 
@@ -33,10 +37,21 @@ def load_taskpack(path: Path) -> TaskPack:
     task_id = root.get("id")
     instruction = root.get("instruction")
     actions = root.get("actions")
+    environment = _require_mapping(root.get("environment"), "environment")
     verifier = _require_mapping(root.get("verifier"), "verifier")
     limits = _require_mapping(root.get("limits"), "limits")
+    environment_adapter = environment.get("adapter")
+    verifier_type = verifier.get("type")
     expected_result = verifier.get("expected")
     max_actions = limits.get("max_actions")
+    review = root.get("review")
+    if review is None:
+        review_status = "confirmed"
+        requires_confirmation = False
+    else:
+        review_mapping = _require_mapping(review, "review")
+        review_status = review_mapping.get("status")
+        requires_confirmation = review_mapping.get("requires_confirmation")
 
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("Task pack must define a non-empty string 'id'")
@@ -50,16 +65,30 @@ def load_taskpack(path: Path) -> TaskPack:
         raise ValueError("Task pack must define a non-empty string list 'actions'")
     if len(set(actions)) != len(actions):
         raise ValueError("Task pack actions must be unique")
+    if not isinstance(environment_adapter, str) or not environment_adapter.strip():
+        raise ValueError("Task pack environment must define a non-empty string 'adapter'")
+    if not isinstance(verifier_type, str) or not verifier_type.strip():
+        raise ValueError("Task pack verifier must define a non-empty string 'type'")
     if not isinstance(expected_result, str) or not expected_result.strip():
         raise ValueError("Task pack verifier must define a non-empty string 'expected'")
     if not isinstance(max_actions, int) or isinstance(max_actions, bool) or max_actions <= 0:
         raise ValueError("Task pack limits.max_actions must be a positive integer")
+    if review_status not in {"draft", "confirmed"}:
+        raise ValueError("Task pack review.status must be 'draft' or 'confirmed'")
+    if not isinstance(requires_confirmation, bool):
+        raise TypeError("Task pack review.requires_confirmation must be a boolean")
+    if (review_status == "draft") != requires_confirmation:
+        raise ValueError("Draft task packs must require confirmation, and confirmed packs must not")
 
     return TaskPack(
         task_id=task_id.strip(),
         instruction=" ".join(instruction.split()),
         actions=tuple(actions),
+        environment_adapter=environment_adapter.strip(),
+        verifier_type=verifier_type.strip(),
         expected_result=expected_result.strip(),
         max_actions=max_actions,
+        review_status=review_status,
+        requires_confirmation=requires_confirmation,
         source_path=source_path,
     )

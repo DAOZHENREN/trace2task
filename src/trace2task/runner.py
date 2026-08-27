@@ -301,18 +301,24 @@ def run_agent(
     max_actions: int | None = None,
     output_root: Path | None = None,
 ) -> RunResult:
+    task = load_taskpack(task_path)
+    if task.environment_adapter != "trace2task.mini_game":
+        raise ValueError(f"Unsupported environment adapter: {task.environment_adapter}")
+    if task.requires_confirmation:
+        raise RuntimeError(
+            "This compiled task is still a draft. Review it, then run "
+            f"'trace2task confirm {task.source_path}' before execution."
+        )
     surface = _prepare_pygame(show=show)
     state = GameState.reset(seed)
     renderer = GameRenderer()
     renderer.render(surface, state, mode="agent")
     agent: AgentAdapter
-    task_id = "daily-reward"
+    task_id = task.task_id
     if provider == "visual":
         agent = VisualReplanningAgent()
-        action_limit = max_actions if max_actions is not None else 300
+        action_limit = max_actions if max_actions is not None else task.max_actions
     elif provider == "codex":
-        task = load_taskpack(task_path)
-        task_id = task.task_id
         agent = CodexMultimodalAgent(
             task,
             model=model,
@@ -322,7 +328,10 @@ def run_agent(
         action_limit = max_actions if max_actions is not None else task.max_actions
     else:
         raise ValueError(f"Unknown agent provider: {provider}")
-    verifier = VisualVerifier()
+    verifier = VisualVerifier(
+        verifier_type=task.verifier_type,
+        expected_result=task.expected_result,
+    )
     clock = pygame.time.Clock()
     executor = ThreadPoolExecutor(max_workers=1) if show and provider == "codex" else None
     relocated = False
