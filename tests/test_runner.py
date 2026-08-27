@@ -1,4 +1,20 @@
-from trace2task.runner import create_reference_trace, replay_trace, run_visual_agent
+import pygame
+
+from trace2task.runner import (
+    HUMAN_KEY_ACTIONS,
+    create_reference_trace,
+    replay_trace,
+    run_visual_agent,
+)
+
+
+def test_wasd_and_arrow_keys_map_to_movement() -> None:
+    assert HUMAN_KEY_ACTIONS[pygame.K_w] == "move_up"
+    assert HUMAN_KEY_ACTIONS[pygame.K_a] == "move_left"
+    assert HUMAN_KEY_ACTIONS[pygame.K_s] == "move_down"
+    assert HUMAN_KEY_ACTIONS[pygame.K_d] == "move_right"
+    assert HUMAN_KEY_ACTIONS[pygame.K_UP] == "move_up"
+    assert HUMAN_KEY_ACTIONS[pygame.K_e] == "interact"
 
 
 def test_visual_agent_completes_after_target_relocation(tmp_path) -> None:

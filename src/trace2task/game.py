@@ -73,7 +73,8 @@ class GameState:
     def reset(cls, seed: int, obstacle_ratio: float = 0.12) -> GameState:
         rng = random.Random(seed)
         cells = [(x, y) for y in range(GRID_ROWS) for x in range(GRID_COLS)]
-        player = rng.choice(cells)
+        interior_cells = [(x, y) for y in range(1, GRID_ROWS - 1) for x in range(1, GRID_COLS - 1)]
+        player = rng.choice(interior_cells)
 
         distant = [
             cell
@@ -82,7 +83,10 @@ class GameState:
         ]
         target = rng.choice(distant)
 
-        candidates = [cell for cell in cells if cell not in {player, target}]
+        # Keep the four cells around the initial spawn clear. A fresh manual
+        # recording should always provide immediate visual feedback for WASD.
+        protected_spawn = {player, *neighbors(player)}
+        candidates = [cell for cell in cells if cell not in protected_spawn | {target}]
         rng.shuffle(candidates)
         desired = int(len(cells) * obstacle_ratio)
         obstacles: set[Cell] = set()
@@ -146,15 +150,18 @@ class GameRenderer:
         self.font = pygame.font.Font(None, 27)
         self.small_font = pygame.font.Font(None, 20)
 
-    def render(self, surface: pygame.Surface, state: GameState) -> None:
+    def render(self, surface: pygame.Surface, state: GameState, *, mode: str = "record") -> None:
         surface.fill(BACKGROUND)
         status_color = SUCCESS_BG if state.completed else STATUS_BG
         pygame.draw.rect(surface, status_color, (0, 0, BOARD_WIDTH, STATUS_HEIGHT))
-        status = (
-            "DAILY TASK COMPLETE"
-            if state.completed
-            else "Reach the gold marker, then press E   |   Move: WASD / arrows"
-        )
+        if state.completed:
+            status = "DAILY TASK COMPLETE"
+        elif mode == "replay":
+            status = "FIXED REPLAY   |   Input is automatic"
+        elif mode == "agent":
+            status = "AGENT MODE   |   Observing and replanning automatically"
+        else:
+            status = "RECORD MODE   |   Move: WASD / arrows   |   Interact: E"
         surface.blit(self.font.render(status, True, TEXT_COLOR), (18, 17))
 
         board = pygame.Rect(0, STATUS_HEIGHT, BOARD_WIDTH, BOARD_HEIGHT)

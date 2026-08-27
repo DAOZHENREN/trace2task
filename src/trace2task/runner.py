@@ -12,6 +12,19 @@ from trace2task.planner import a_star, path_to_actions
 from trace2task.recording import RecordedTrace, TraceWriter, load_actions, make_run_dir
 from trace2task.vision import VisualVerifier
 
+HUMAN_KEY_ACTIONS = {
+    pygame.K_w: "move_up",
+    pygame.K_UP: "move_up",
+    pygame.K_s: "move_down",
+    pygame.K_DOWN: "move_down",
+    pygame.K_a: "move_left",
+    pygame.K_LEFT: "move_left",
+    pygame.K_d: "move_right",
+    pygame.K_RIGHT: "move_right",
+    pygame.K_e: "interact",
+    pygame.K_RETURN: "interact",
+}
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -57,25 +70,14 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     surface = _prepare_pygame(show=True)
     state = GameState.reset(seed)
     renderer = GameRenderer()
-    renderer.render(surface, state)
+    renderer.render(surface, state, mode="record")
     pygame.display.flip()
+    pygame.key.set_repeat(180, 90)
 
     run_dir = make_run_dir(output_root, "human")
     writer = TraceWriter(run_dir, task_id="daily-reward", seed=seed, source="human")
     writer.record("start", surface)
     clock = pygame.time.Clock()
-    key_actions = {
-        pygame.K_w: "move_up",
-        pygame.K_UP: "move_up",
-        pygame.K_s: "move_down",
-        pygame.K_DOWN: "move_down",
-        pygame.K_a: "move_left",
-        pygame.K_LEFT: "move_left",
-        pygame.K_d: "move_right",
-        pygame.K_RIGHT: "move_right",
-        pygame.K_e: "interact",
-        pygame.K_RETURN: "interact",
-    }
     running = True
     success_at: int | None = None
     action_count = 0
@@ -85,11 +87,15 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
                 event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
             ):
                 running = False
-            elif event.type == pygame.KEYDOWN and event.key in key_actions and not state.completed:
-                action = key_actions[event.key]
+            elif (
+                event.type == pygame.KEYDOWN
+                and event.key in HUMAN_KEY_ACTIONS
+                and not state.completed
+            ):
+                action = HUMAN_KEY_ACTIONS[event.key]
                 applied = state.apply(action)
                 action_count += 1
-                renderer.render(surface, state)
+                renderer.render(surface, state, mode="record")
                 writer.record(
                     "human_input",
                     surface,
@@ -98,13 +104,14 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
                 )
                 if state.completed:
                     success_at = pygame.time.get_ticks()
-        renderer.render(surface, state)
+        renderer.render(surface, state, mode="record")
         pygame.display.flip()
         if success_at is not None and pygame.time.get_ticks() - success_at >= 900:
             running = False
         clock.tick(fps)
 
     trace = writer.finish(success=state.completed)
+    pygame.key.set_repeat()
     pygame.display.quit()
     return RunResult(
         mode="record",
@@ -119,14 +126,14 @@ def create_reference_trace(seed: int, output_root: Path) -> RecordedTrace:
     surface = _prepare_pygame(show=False)
     state = GameState.reset(seed)
     renderer = GameRenderer()
-    renderer.render(surface, state)
+    renderer.render(surface, state, mode="record")
     run_dir = make_run_dir(output_root, "reference")
     writer = TraceWriter(run_dir, task_id="daily-reward", seed=seed, source="reference")
     writer.record("start", surface)
     path = a_star(state.player, state.target, state.obstacles)
     for action in path_to_actions(path):
         state.apply(action)
-        renderer.render(surface, state)
+        renderer.render(surface, state, mode="record")
         writer.record("human_input", surface, action=action, details={"generated": True})
     return writer.finish(success=state.completed)
 
@@ -142,7 +149,7 @@ def replay_trace(
     surface = _prepare_pygame(show=show)
     state = GameState.reset(seed)
     renderer = GameRenderer()
-    renderer.render(surface, state)
+    renderer.render(surface, state, mode="replay")
     verifier = VisualVerifier()
     clock = pygame.time.Clock()
     actions = load_actions(trace_path)
@@ -160,7 +167,7 @@ def replay_trace(
     for action in actions:
         state.apply(action)
         applied_actions += 1
-        renderer.render(surface, state)
+        renderer.render(surface, state, mode="replay")
         if writer:
             writer.record("replay_action", surface, action=action)
         if not _present(show, fps, clock):
@@ -192,7 +199,7 @@ def run_visual_agent(
     surface = _prepare_pygame(show=show)
     state = GameState.reset(seed)
     renderer = GameRenderer()
-    renderer.render(surface, state)
+    renderer.render(surface, state, mode="agent")
     agent = VisualReplanningAgent()
     verifier = VisualVerifier()
     clock = pygame.time.Clock()
@@ -222,7 +229,7 @@ def run_visual_agent(
         ):
             state.relocate_target()
             relocated = True
-        renderer.render(surface, state)
+        renderer.render(surface, state, mode="agent")
         if writer:
             writer.record(
                 "agent_action",

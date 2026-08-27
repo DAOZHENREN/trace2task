@@ -41,6 +41,9 @@ To watch the comparison:
 uv run trace2task demo --show
 ```
 
+`demo --show` is an automatic comparison; it intentionally ignores manual WASD input. Use
+the `record` command below for keyboard control.
+
 ## Record your own demonstration
 
 ```bash
@@ -48,6 +51,10 @@ uv run trace2task record --seed 7
 ```
 
 Use `WASD` or the arrow keys to move. Stand on the gold marker and press `E`. The command prints the generated `trace.jsonl` path.
+
+You can tap a movement key for one grid cell or hold it for continuous movement. Every seeded
+recording starts with all four neighboring cells clear, so each WASD direction gives immediate
+feedback.
 
 Replay the exact recorded actions on a different layout:
 
