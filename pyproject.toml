@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trace2task"
+version = "0.1.0"
+description = "Record a workflow and turn it into a resettable, verifiable agent task."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "DAOZHENREN" }]
+dependencies = [
+  "numpy>=2.0",
+  "pygame>=2.6,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "ruff>=0.12",
+]
+
+[project.scripts]
+trace2task = "trace2task.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trace2task"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

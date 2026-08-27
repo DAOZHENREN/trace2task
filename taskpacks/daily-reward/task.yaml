@@ -1,0 +1,29 @@
+schema_version: "0.1"
+id: daily-reward
+instruction: >
+  Move the blue player to the gold daily-task marker and interact with it.
+
+environment:
+  adapter: trace2task.mini_game
+  reset:
+    type: seeded
+    default_seed: 19
+
+observation:
+  type: rgb_frame
+  width: 800
+  height: 656
+
+actions:
+  - move_up
+  - move_down
+  - move_left
+  - move_right
+  - interact
+
+verifier:
+  type: visual_status
+  expected: DAILY TASK COMPLETE
+
+limits:
+  max_actions: 300
