@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pygame
 import pytest
 
-from trace2task.codex_agent import CodexMultimodalAgent
+from trace2task import codex_agent
+from trace2task.codex_agent import CodexMultimodalAgent, resolve_codex_binary
 from trace2task.game import WINDOW_SIZE, GameRenderer, GameState
 from trace2task.taskpack import load_taskpack
 
@@ -63,6 +65,7 @@ def test_codex_agent_uses_saved_cli_bridge_and_caches_short_plan() -> None:
     agent = CodexMultimodalAgent(
         load_taskpack(TASK_PATH),
         command_runner=fake_run,
+        binary_resolver=lambda requested: requested,
     )
     first = agent.decide(rendered_state())
     agent.observe_transition(first.action, True)
@@ -97,7 +100,11 @@ def test_codex_agent_rejects_actions_outside_taskpack() -> None:
             stderr="",
         )
 
-    agent = CodexMultimodalAgent(load_taskpack(TASK_PATH), command_runner=fake_run)
+    agent = CodexMultimodalAgent(
+        load_taskpack(TASK_PATH),
+        command_runner=fake_run,
+        binary_resolver=lambda requested: requested,
+    )
 
     with pytest.raises(RuntimeError, match="disallowed action"):
         agent.decide(rendered_state())
@@ -127,7 +134,11 @@ def test_failed_action_discards_cached_plan() -> None:
             stderr="",
         )
 
-    agent = CodexMultimodalAgent(load_taskpack(TASK_PATH), command_runner=fake_run)
+    agent = CodexMultimodalAgent(
+        load_taskpack(TASK_PATH),
+        command_runner=fake_run,
+        binary_resolver=lambda requested: requested,
+    )
     first = agent.decide(rendered_state())
     agent.observe_transition(first.action, False)
     second = agent.decide(rendered_state())
@@ -135,3 +146,15 @@ def test_failed_action_discards_cached_plan() -> None:
     assert first.action == "move_left"
     assert second.action == "move_up"
     assert agent.replans == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows desktop bundle discovery")
+def test_windows_desktop_codex_is_found_without_path(tmp_path, monkeypatch) -> None:
+    bundled = tmp_path / "OpenAI" / "Codex" / "bin" / "version-hash" / "codex.exe"
+    bundled.parent.mkdir(parents=True)
+    bundled.write_bytes(b"test executable placeholder")
+    monkeypatch.setattr(codex_agent.shutil, "which", lambda command: None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.delenv("ProgramFiles", raising=False)
+
+    assert resolve_codex_binary() == str(bundled.resolve())

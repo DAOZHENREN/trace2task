@@ -95,6 +95,14 @@ If needed, run `codex login` and complete the browser sign-in. Then start the mu
 uv run trace2task agent --provider codex --model gpt-5.6-terra --seed 19 --relocate-after 4
 ```
 
+On Windows, Trace2Task also discovers the versioned `codex.exe` bundled inside the ChatGPT/Codex
+desktop app, so an older terminal `PATH` does not break after an app update. If Codex is installed
+somewhere else, pass it explicitly:
+
+```powershell
+uv run trace2task agent --provider codex --codex-bin "C:\path\to\codex.exe" --seed 19
+```
+
 The adapter attaches the current screenshot to an ephemeral, read-only `codex exec` run. Its final
 response must match a JSON Schema generated from the task pack, so the model can only return one of
 the declared actions. It plans at most four actions per model call and discards the cached plan when

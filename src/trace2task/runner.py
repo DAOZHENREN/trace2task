@@ -292,6 +292,7 @@ def run_agent(
     *,
     provider: str,
     model: str | None = "gpt-5.6-terra",
+    codex_bin: str = "codex",
     task_path: Path = DEFAULT_TASK_PATH,
     relocate_after: int | None = None,
     show: bool = False,
@@ -311,7 +312,7 @@ def run_agent(
     elif provider == "codex":
         task = load_taskpack(task_path)
         task_id = task.task_id
-        agent = CodexMultimodalAgent(task, model=model)
+        agent = CodexMultimodalAgent(task, model=model, codex_bin=codex_bin)
         action_limit = max_actions if max_actions is not None else task.max_actions
     else:
         raise ValueError(f"Unknown agent provider: {provider}")

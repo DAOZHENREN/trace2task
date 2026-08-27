@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -13,6 +15,39 @@ from trace2task.agent import AgentDecision
 from trace2task.taskpack import TaskPack
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+BinaryResolver = Callable[[str], str]
+
+
+def resolve_codex_binary(requested: str = "codex") -> str:
+    """Resolve Codex CLI, including the versioned Windows desktop-app bundle."""
+
+    explicit = Path(requested).expanduser()
+    if explicit.is_file():
+        return str(explicit.resolve())
+
+    discovered = shutil.which(requested)
+    if discovered:
+        return discovered
+
+    searched_roots: list[Path] = []
+    if os.name == "nt" and requested.casefold() in {"codex", "codex.exe"}:
+        for environment_variable in ("LOCALAPPDATA", "ProgramFiles"):
+            base = os.environ.get(environment_variable)
+            if not base:
+                continue
+            root = Path(base) / "OpenAI" / "Codex" / "bin"
+            searched_roots.append(root)
+            candidates = [root / "codex.exe", *root.glob("*/codex.exe")]
+            existing = [candidate for candidate in candidates if candidate.is_file()]
+            if existing:
+                newest = max(existing, key=lambda candidate: candidate.stat().st_mtime_ns)
+                return str(newest.resolve())
+
+    searched = ", ".join(str(root) for root in searched_roots) or "the system PATH"
+    raise RuntimeError(
+        "Codex CLI was not found. Run 'codex login' if it is installed, restart the terminal "
+        f"after a Codex app update, or pass --codex-bin with its full path. Searched: {searched}"
+    )
 
 
 class CodexMultimodalAgent:
@@ -27,6 +62,7 @@ class CodexMultimodalAgent:
         plan_horizon: int = 4,
         timeout_seconds: float = 120,
         command_runner: CommandRunner = subprocess.run,
+        binary_resolver: BinaryResolver = resolve_codex_binary,
     ) -> None:
         if plan_horizon <= 0:
             raise ValueError("plan_horizon must be positive")
@@ -36,6 +72,7 @@ class CodexMultimodalAgent:
         self.plan_horizon = plan_horizon
         self.timeout_seconds = timeout_seconds
         self.command_runner = command_runner
+        self.binary_resolver = binary_resolver
         self.replans = 0
         self.goal_changes = 0
         self._pending_actions: list[str] = []
@@ -76,6 +113,7 @@ class CodexMultimodalAgent:
         self.goal_changes += 1
 
     def _request_plan(self, surface: pygame.Surface) -> dict[str, Any]:
+        codex_executable = self.binary_resolver(self.codex_bin)
         with tempfile.TemporaryDirectory(prefix="trace2task-codex-") as directory:
             temp_dir = Path(directory)
             frame_path = temp_dir / "observation.png"
@@ -87,7 +125,7 @@ class CodexMultimodalAgent:
             )
 
             command = [
-                self.codex_bin,
+                codex_executable,
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
@@ -116,7 +154,7 @@ class CodexMultimodalAgent:
                 )
             except FileNotFoundError as error:
                 raise RuntimeError(
-                    "Codex CLI was not found. Install it and run 'codex login' first."
+                    f"The resolved Codex CLI no longer exists: {codex_executable}"
                 ) from error
             except subprocess.TimeoutExpired as error:
                 raise RuntimeError(

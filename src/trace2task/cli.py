@@ -40,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="'codex' reuses the Codex CLI's saved ChatGPT subscription login.",
     )
     agent.add_argument("--model", default="gpt-5.6-terra")
+    agent.add_argument(
+        "--codex-bin",
+        default="codex",
+        help="Codex CLI name or full path; Windows desktop bundles are auto-discovered.",
+    )
     agent.add_argument("--task", type=Path, default=DEFAULT_TASK_PATH)
     agent.add_argument("--relocate-after", type=int, default=4)
     agent.add_argument("--output", type=Path, default=Path("runs"))
@@ -70,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
             args.seed,
             provider=args.provider,
             model=args.model,
+            codex_bin=args.codex_bin,
             task_path=args.task,
             relocate_after=args.relocate_after,
             show=not args.headless,
