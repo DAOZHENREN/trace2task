@@ -345,10 +345,10 @@ class WindowSession:
 
     def focus(self) -> WindowInfo:
         window = self._require_available(self.resolve())
-        if not self.backend.focus_window(window.handle):
-            raise WindowSafetyError(f"Windows refused to focus target window {window.handle}")
+        focus_requested = self.backend.focus_window(window.handle)
         if self.backend.foreground_handle() != window.handle:
-            raise WindowSafetyError(f"Target window {window.handle} did not become foreground")
+            reason = "Windows refused to focus" if not focus_requested else "Could not foreground"
+            raise WindowSafetyError(f"{reason} target window {window.handle}")
         refreshed = self.backend.get_window(window.handle)
         return self._require_available(refreshed or window)
 

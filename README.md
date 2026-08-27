@@ -19,7 +19,7 @@ The task is simple: move a blue player to a gold daily-task marker and press `E`
 - `record` captures each human input, timestamp, screenshot, and final outcome.
 - `compile` validates a successful trace and turns it into a self-contained draft task pack.
 - `confirm` marks a reviewed generated task pack as executable.
-- `windows list` discovers real Windows targets without sending input.
+- `windows list/capture/record` discovers and records real Windows targets without sending input.
 - `replay` applies the same input sequence to another seeded layout.
 - `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
 - `agent --provider codex` sends the current screenshot and task contract to a general multimodal
@@ -154,9 +154,55 @@ unminimized, and foreground, maps normalized coordinates into its current client
 Win32 `SendInput`. Key-up and mouse-up events are sent from `finally` blocks so an interrupted skill
 does not intentionally leave a key or button held.
 
-The existing mini-game agent is not wired to this executor yet. Version 0.5.2 will add target-window
-screenshots and keyboard/mouse recording; until then, `windows list` is the only new user-facing
-Windows command and is read-only.
+The existing mini-game agent is not wired to this executor yet. Version 0.5.2 records the raw
+Windows evidence needed for the compiler that will connect them in v0.5.3.
+
+## Windows target recording (v0.5.2)
+
+After finding an unambiguous target, capture its client area without changing focus:
+
+```powershell
+uv run trace2task windows capture --handle 123456 --output runs\target.png
+```
+
+The capture backend asks the selected process to render its client area through `PrintWindow`, so a
+covered window does not leak pixels from the app placed over it. If an app cannot render that way,
+screen-pixel fallback is permitted only while that exact target is foreground; otherwise capture
+fails closed. Some GPU-rendered games may still return a black `PrintWindow` image and will require
+foreground capture in a later adapter.
+
+Record raw keyboard/mouse transitions and a target screenshot after every event:
+
+```powershell
+uv run trace2task windows record --handle 123456 --task-id external-daily
+```
+
+The recorder first tries the normal Windows focus request. If Windows declines it, switch to the
+target window yourself; recording begins only after the selected handle becomes visible,
+unminimized, and foreground.
+
+- Press `F8` to save a final success frame and finish successfully.
+- Press `F9` to cancel the recording.
+- Input is polled but never injected by the recorder.
+- Input from another foreground app is discarded while recording is paused.
+- Mouse events include screen coordinates and target-client normalized coordinates.
+- Window movement, resizing, and DPI changes are recorded as `window_changed` events.
+
+A Windows recording contains raw `down/up` transitions rather than prematurely guessed motor
+skills:
+
+```json
+{
+  "type": "windows_input",
+  "details": {
+    "raw_input": {"device": "keyboard", "event": "down", "key": "w"}
+  }
+}
+```
+
+Version 0.5.3 will pair these transitions, measure hold durations, recognize clicks/hotkeys, and
+compile them into the parameterized actions introduced in v0.5.1. The v0.4 mini-game compiler
+therefore intentionally rejects Windows recordings for now.
 
 Run the visual agent on that layout and move the target after four actions:
 
@@ -238,8 +284,8 @@ uv run ruff check .
 
 ## Next milestones
 
-- Record target-window screenshots and keyboard/mouse events through the Windows adapter.
-- Add compiler profiles beyond the built-in mini-game and introduce model-assisted semantic labels.
+- Compile Windows raw input into parameterized skills and add model-assisted semantic labels.
+- Add reference-region verification for generated Windows task packs.
 - Infer reusable motor-skill boundaries from longer demonstrations.
 - Add pop-up recovery and changed-obstacle scenarios.
 - Extend the local motor layer from grid moves to reusable desktop/game skills.

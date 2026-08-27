@@ -8,13 +8,33 @@ from pathlib import Path
 from trace2task import __version__
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
-from trace2task.windows_control import list_window_records
+from trace2task.windows_capture import GdiWindowCapture, capture_window_once
+from trace2task.windows_control import (
+    Win32Backend,
+    WindowSelector,
+    list_window_records,
+)
+from trace2task.windows_recording import Win32InputMonitor, record_window_trace
 
 
 def _print_result(result: object) -> None:
     if hasattr(result, "__dataclass_fields__"):
         result = asdict(result)  # type: ignore[arg-type]
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def _add_window_selector(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--handle", type=int, help="Exact window handle from 'windows list'.")
+    parser.add_argument("--title", help="Require the window title to contain this text.")
+    parser.add_argument("--process", help="Require this executable name.")
+
+
+def _window_selector_from_args(args: argparse.Namespace) -> WindowSelector:
+    return WindowSelector(
+        handle=args.handle,
+        title_contains=args.title,
+        process_name=args.process,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +81,25 @@ def build_parser() -> argparse.ArgumentParser:
     windows_list = windows_subparsers.add_parser("list", help="List visible top-level windows.")
     windows_list.add_argument("--title", help="Keep windows whose title contains this text.")
     windows_list.add_argument("--process", help="Keep windows with this executable name.")
+    windows_capture = windows_subparsers.add_parser(
+        "capture",
+        help="Capture one visible target client area without changing focus.",
+    )
+    _add_window_selector(windows_capture)
+    windows_capture.add_argument(
+        "--output",
+        type=Path,
+        default=Path("runs/window-capture.png"),
+    )
+    windows_record = windows_subparsers.add_parser(
+        "record",
+        help="Record raw target-window keyboard/mouse transitions and screenshots.",
+    )
+    _add_window_selector(windows_record)
+    windows_record.add_argument("--task-id", default="windows-task")
+    windows_record.add_argument("--output", type=Path, default=Path("runs"))
+    windows_record.add_argument("--poll-hz", type=int, default=120)
+    windows_record.add_argument("--max-seconds", type=float, default=300)
 
     agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
@@ -118,10 +157,31 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "confirm":
         result = confirm_taskpack(args.task)
     elif args.command == "windows":
-        result = list_window_records(
-            title_contains=args.title,
-            process_name=args.process,
-        )
+        if args.windows_command == "list":
+            result = list_window_records(
+                title_contains=args.title,
+                process_name=args.process,
+            )
+        elif args.windows_command == "capture":
+            backend = Win32Backend()
+            result = capture_window_once(
+                _window_selector_from_args(args),
+                args.output,
+                backend=backend,
+                capture=GdiWindowCapture(),
+            )
+        else:
+            backend = Win32Backend()
+            result = record_window_trace(
+                _window_selector_from_args(args),
+                task_id=args.task_id,
+                output_root=args.output,
+                poll_hz=args.poll_hz,
+                max_seconds=args.max_seconds,
+                backend=backend,
+                capture=GdiWindowCapture(),
+                monitor=Win32InputMonitor(),
+            )
     elif args.command == "agent":
         result = run_agent(
             args.seed,
