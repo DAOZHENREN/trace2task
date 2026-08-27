@@ -43,3 +43,20 @@ def test_shortest_path_actions_complete_task() -> None:
     for action in path_to_actions(path):
         state.apply(action)
     assert state.completed
+
+
+def test_interaction_works_on_or_next_to_target() -> None:
+    adjacent = GameState(seed=0, player=(2, 2), target=(3, 2))
+    assert adjacent.apply("interact")
+    assert adjacent.completed
+
+    on_target = GameState(seed=0, player=(3, 2), target=(3, 2))
+    assert on_target.apply("interact")
+    assert on_target.completed
+
+
+def test_failed_interaction_explains_that_player_is_too_far() -> None:
+    state = GameState(seed=0, player=(1, 1), target=(5, 5))
+    assert not state.apply("interact")
+    assert state.feedback is not None
+    assert "TOO FAR" in state.feedback

@@ -1,7 +1,7 @@
 schema_version: "0.1"
 id: daily-reward
 instruction: >
-  Move the blue player to the gold daily-task marker and interact with it.
+  Move the blue player onto or next to the gold daily-task marker and interact with it.
 
 environment:
   adapter: trace2task.mini_game

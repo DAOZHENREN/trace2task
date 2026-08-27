@@ -20,6 +20,7 @@ BACKGROUND = (246, 248, 252)
 GRID_LINE = (222, 226, 234)
 STATUS_BG = (31, 36, 48)
 SUCCESS_BG = (35, 134, 88)
+WARNING_BG = (178, 63, 68)
 PLAYER_COLOR = (40, 117, 230)
 TARGET_COLOR = (244, 180, 0)
 OBSTACLE_COLOR = (74, 82, 98)
@@ -68,6 +69,7 @@ class GameState:
     successful_moves: int = 0
     interactions: int = 0
     relocations: int = 0
+    feedback: str | None = None
 
     @classmethod
     def reset(cls, seed: int, obstacle_ratio: float = 0.12) -> GameState:
@@ -104,13 +106,17 @@ class GameState:
             return False
         if action == "interact":
             self.interactions += 1
-            if self.player == self.target:
+            distance = abs(self.player[0] - self.target[0]) + abs(self.player[1] - self.target[1])
+            if distance <= 1:
                 self.completed = True
+                self.feedback = None
                 return True
+            self.feedback = "TOO FAR   |   Move onto or next to the gold marker, then press E"
             return False
         if action not in ACTION_DELTAS:
             return False
 
+        self.feedback = None
         self.move_attempts += 1
         dx, dy = ACTION_DELTAS[action]
         candidate = (self.player[0] + dx, self.player[1] + dy)
@@ -152,16 +158,23 @@ class GameRenderer:
 
     def render(self, surface: pygame.Surface, state: GameState, *, mode: str = "record") -> None:
         surface.fill(BACKGROUND)
-        status_color = SUCCESS_BG if state.completed else STATUS_BG
+        if state.completed:
+            status_color = SUCCESS_BG
+        elif state.feedback:
+            status_color = WARNING_BG
+        else:
+            status_color = STATUS_BG
         pygame.draw.rect(surface, status_color, (0, 0, BOARD_WIDTH, STATUS_HEIGHT))
         if state.completed:
             status = "DAILY TASK COMPLETE"
+        elif state.feedback:
+            status = state.feedback
         elif mode == "replay":
             status = "FIXED REPLAY   |   Input is automatic"
         elif mode == "agent":
             status = "AGENT MODE   |   Observing and replanning automatically"
         else:
-            status = "RECORD MODE   |   Move: WASD / arrows   |   Interact: E"
+            status = "RECORD MODE   |   WASD / arrows   |   Press E when touching gold"
         surface.blit(self.font.render(status, True, TEXT_COLOR), (18, 17))
 
         board = pygame.Rect(0, STATUS_HEIGHT, BOARD_WIDTH, BOARD_HEIGHT)
