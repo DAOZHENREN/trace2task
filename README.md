@@ -56,6 +56,9 @@ After a successful interaction, a large `TASK COMPLETE` panel remains visible so
 that the demonstration was recorded. Press `Enter` or `Esc` to close the window and print the trace
 path in the terminal.
 
+The interaction is detected from physical `E` key events, text/IME input, and the live keyboard
+state. `Enter` or `Space` can also trigger the interaction if needed.
+
 You can tap a movement key for one grid cell or hold it for continuous movement. Every seeded
 recording starts with all four neighboring cells clear, so each WASD direction gives immediate
 feedback.

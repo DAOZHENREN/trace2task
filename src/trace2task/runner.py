@@ -23,6 +23,7 @@ HUMAN_KEY_ACTIONS = {
     pygame.K_RIGHT: "move_right",
     pygame.K_e: "interact",
     pygame.K_RETURN: "interact",
+    pygame.K_SPACE: "interact",
 }
 
 
@@ -66,6 +67,19 @@ def _record_decision_details(decision_path: list[tuple[int, int]], reason: str) 
     return {"reason": reason, "path": [list(cell) for cell in decision_path]}
 
 
+def human_action_for_event(event: pygame.event.Event) -> str | None:
+    """Resolve physical keys and text/IME events to one task action."""
+    if event.type == pygame.KEYDOWN:
+        action = HUMAN_KEY_ACTIONS.get(event.key)
+        if action is not None:
+            return action
+        if getattr(event, "unicode", "").casefold() == "e":
+            return "interact"
+    if event.type == pygame.TEXTINPUT and getattr(event, "text", "").casefold() == "e":
+        return "interact"
+    return None
+
+
 def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     surface = _prepare_pygame(show=True)
     state = GameState.reset(seed)
@@ -73,6 +87,7 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     renderer.render(surface, state, mode="record")
     pygame.display.flip()
     pygame.key.set_repeat(180, 90)
+    pygame.key.start_text_input()
 
     run_dir = make_run_dir(output_root, "human")
     writer = TraceWriter(run_dir, task_id="daily-reward", seed=seed, source="human")
@@ -80,7 +95,22 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
     clock = pygame.time.Clock()
     running = True
     action_count = 0
+    e_was_pressed = False
+
+    def apply_human_action(action: str, key_label: str, source: str) -> None:
+        nonlocal action_count
+        applied = state.apply(action)
+        action_count += 1
+        renderer.render(surface, state, mode="record")
+        writer.record(
+            "human_input",
+            surface,
+            action=action,
+            details={"key": key_label, "source": source, "applied": applied},
+        )
+
     while running:
+        interaction_handled = False
         for event in pygame.event.get():
             if (
                 event.type == pygame.QUIT
@@ -92,26 +122,26 @@ def record_human(seed: int, output_root: Path, fps: int = 30) -> RunResult:
                 )
             ):
                 running = False
-            elif (
-                event.type == pygame.KEYDOWN
-                and event.key in HUMAN_KEY_ACTIONS
-                and not state.completed
-            ):
-                action = HUMAN_KEY_ACTIONS[event.key]
-                applied = state.apply(action)
-                action_count += 1
-                renderer.render(surface, state, mode="record")
-                writer.record(
-                    "human_input",
-                    surface,
-                    action=action,
-                    details={"key": pygame.key.name(event.key), "applied": applied},
-                )
+            elif not state.completed:
+                action = human_action_for_event(event)
+                if action is not None:
+                    key = getattr(event, "key", None)
+                    key_label = pygame.key.name(key) if isinstance(key, int) else "text:e"
+                    apply_human_action(action, key_label, "event")
+                    interaction_handled = action == "interact"
+
+        pressed = pygame.key.get_pressed()
+        e_is_pressed = bool(pressed[pygame.K_e])
+        if not state.completed and e_is_pressed and not e_was_pressed and not interaction_handled:
+            apply_human_action("interact", "e", "polled_state")
+        e_was_pressed = e_is_pressed
+
         renderer.render(surface, state, mode="record")
         pygame.display.flip()
         clock.tick(fps)
 
     trace = writer.finish(success=state.completed)
+    pygame.key.stop_text_input()
     pygame.key.set_repeat()
     pygame.display.quit()
     return RunResult(
