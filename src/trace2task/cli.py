@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from trace2task.runner import record_human, replay_trace, run_demo, run_visual_agent
+from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
 
 
 def _print_result(result: object) -> None:
@@ -31,8 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--output", type=Path, default=Path("runs"))
     replay.add_argument("--headless", action="store_true")
 
-    agent = subparsers.add_parser("agent", help="Run the visual replanning agent.")
+    agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
+    agent.add_argument(
+        "--provider",
+        choices=("visual", "codex"),
+        default="visual",
+        help="'codex' reuses the Codex CLI's saved ChatGPT subscription login.",
+    )
+    agent.add_argument("--model", default="gpt-5.6-terra")
+    agent.add_argument("--task", type=Path, default=DEFAULT_TASK_PATH)
     agent.add_argument("--relocate-after", type=int, default=4)
     agent.add_argument("--output", type=Path, default=Path("runs"))
     agent.add_argument("--headless", action="store_true")
@@ -58,8 +66,11 @@ def main(argv: list[str] | None = None) -> int:
             output_root=args.output,
         )
     elif args.command == "agent":
-        result = run_visual_agent(
+        result = run_agent(
             args.seed,
+            provider=args.provider,
+            model=args.model,
+            task_path=args.task,
             relocate_after=args.relocate_after,
             show=not args.headless,
             output_root=args.output,

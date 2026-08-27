@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import ctypes
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pygame
 
 from trace2task import __version__
-from trace2task.agent import VisualReplanningAgent
+from trace2task.agent import AgentAdapter, AgentDecision, VisualReplanningAgent
+from trace2task.codex_agent import CodexMultimodalAgent
 from trace2task.game import WINDOW_SIZE, GameRenderer, GameState
 from trace2task.planner import a_star, path_to_actions
 from trace2task.recording import RecordedTrace, TraceWriter, load_actions, make_run_dir
+from trace2task.taskpack import load_taskpack
 from trace2task.vision import VisualVerifier
+
+DEFAULT_TASK_PATH = Path("taskpacks/daily-reward/task.yaml")
 
 HUMAN_KEY_ACTIONS = {
     pygame.K_w: "move_up",
@@ -65,8 +70,45 @@ def _present(show: bool, fps: int, clock: pygame.time.Clock) -> bool:
     return True
 
 
-def _record_decision_details(decision_path: list[tuple[int, int]], reason: str) -> dict:
-    return {"reason": reason, "path": [list(cell) for cell in decision_path]}
+def _record_decision_details(
+    decision_path: list[tuple[int, int]],
+    reason: str,
+    extra: dict | None = None,
+) -> dict:
+    details = {"reason": reason, "path": [list(cell) for cell in decision_path]}
+    if extra:
+        details.update(extra)
+    return details
+
+
+def _decide_while_pumping_events(
+    agent: AgentAdapter,
+    surface: pygame.Surface,
+    *,
+    show: bool,
+    renderer: GameRenderer,
+    state: GameState,
+    clock: pygame.time.Clock,
+    executor: ThreadPoolExecutor | None,
+) -> tuple[AgentDecision | None, bool]:
+    if not show or executor is None:
+        return agent.decide(surface), True
+
+    observation = surface.copy()
+    renderer.render(surface, state, mode="thinking")
+    pygame.display.flip()
+    future = executor.submit(agent.decide, observation)
+    keep_running = True
+    while not future.done():
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (
+                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+            ):
+                keep_running = False
+        pygame.display.flip()
+        clock.tick(30)
+    renderer.render(surface, state, mode="agent")
+    return future.result(), keep_running
 
 
 def human_action_for_event(event: pygame.event.Event) -> str | None:
@@ -245,58 +287,92 @@ def replay_trace(
     )
 
 
-def run_visual_agent(
+def run_agent(
     seed: int,
     *,
+    provider: str,
+    model: str | None = "gpt-5.6-terra",
+    task_path: Path = DEFAULT_TASK_PATH,
     relocate_after: int | None = None,
     show: bool = False,
     fps: int = 10,
-    max_actions: int = 300,
+    max_actions: int | None = None,
     output_root: Path | None = None,
 ) -> RunResult:
     surface = _prepare_pygame(show=show)
     state = GameState.reset(seed)
     renderer = GameRenderer()
     renderer.render(surface, state, mode="agent")
-    agent = VisualReplanningAgent()
+    agent: AgentAdapter
+    task_id = "daily-reward"
+    if provider == "visual":
+        agent = VisualReplanningAgent()
+        action_limit = max_actions if max_actions is not None else 300
+    elif provider == "codex":
+        task = load_taskpack(task_path)
+        task_id = task.task_id
+        agent = CodexMultimodalAgent(task, model=model)
+        action_limit = max_actions if max_actions is not None else task.max_actions
+    else:
+        raise ValueError(f"Unknown agent provider: {provider}")
     verifier = VisualVerifier()
     clock = pygame.time.Clock()
+    executor = ThreadPoolExecutor(max_workers=1) if show and provider == "codex" else None
     relocated = False
     writer: TraceWriter | None = None
     if output_root is not None:
         writer = TraceWriter(
             make_run_dir(output_root, "agent"),
-            task_id="daily-reward",
+            task_id=task_id,
             seed=seed,
-            source="visual_agent",
+            source=f"{provider}_agent",
         )
         writer.record("start", surface)
 
     action_count = 0
-    while action_count < max_actions and not verifier.completed(surface):
-        decision = agent.decide(surface)
-        if decision is None:
-            break
-        state.apply(decision.action)
-        action_count += 1
-        if (
-            relocate_after is not None
-            and not relocated
-            and action_count >= relocate_after
-            and not state.completed
-        ):
-            state.relocate_target()
-            relocated = True
-        renderer.render(surface, state, mode="agent")
-        if writer:
-            writer.record(
-                "agent_action",
+    try:
+        while action_count < action_limit and not verifier.completed(surface):
+            raw_decision, keep_running = _decide_while_pumping_events(
+                agent,
                 surface,
-                action=decision.action,
-                details=_record_decision_details(decision.path, decision.reason),
+                show=show,
+                renderer=renderer,
+                state=state,
+                clock=clock,
+                executor=executor,
             )
-        if not _present(show, fps, clock):
-            break
+            if not keep_running or raw_decision is None:
+                break
+            decision = raw_decision
+            applied = state.apply(decision.action)
+            agent.observe_transition(decision.action, applied)
+            action_count += 1
+            if (
+                relocate_after is not None
+                and not relocated
+                and action_count >= relocate_after
+                and not state.completed
+            ):
+                state.relocate_target()
+                agent.invalidate_plan("target_relocated")
+                relocated = True
+            renderer.render(surface, state, mode="agent")
+            if writer:
+                writer.record(
+                    "agent_action",
+                    surface,
+                    action=decision.action,
+                    details=_record_decision_details(
+                        decision.path,
+                        decision.reason,
+                        decision.details,
+                    ),
+                )
+            if not _present(show, fps, clock):
+                break
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     success = verifier.completed(surface)
     recorded = (
@@ -315,7 +391,7 @@ def run_visual_agent(
         pygame.time.wait(700)
         pygame.display.quit()
     return RunResult(
-        mode="agent",
+        mode=f"{provider}_agent",
         seed=seed,
         success=success,
         actions=action_count,
@@ -323,6 +399,28 @@ def run_visual_agent(
         goal_changes=agent.goal_changes,
         relocations=state.relocations,
         trace_path=str(recorded.trace_path) if recorded else None,
+    )
+
+
+def run_visual_agent(
+    seed: int,
+    *,
+    relocate_after: int | None = None,
+    show: bool = False,
+    fps: int = 10,
+    max_actions: int = 300,
+    output_root: Path | None = None,
+) -> RunResult:
+    """Backward-compatible entry point for the original deterministic agent."""
+
+    return run_agent(
+        seed,
+        provider="visual",
+        relocate_after=relocate_after,
+        show=show,
+        fps=fps,
+        max_actions=max_actions,
+        output_root=output_root,
     )
 
 

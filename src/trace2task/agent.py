@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import pygame
 
@@ -13,8 +14,22 @@ from trace2task.vision import VisualObservation, VisualObserver
 class AgentDecision:
     action: str
     reason: str
-    path: list[Cell]
-    observation: VisualObservation
+    path: list[Cell] = field(default_factory=list)
+    observation: VisualObservation | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+class AgentAdapter(Protocol):
+    """Small interface shared by deterministic and model-backed agents."""
+
+    replans: int
+    goal_changes: int
+
+    def decide(self, surface: pygame.Surface) -> AgentDecision | None: ...
+
+    def observe_transition(self, action: str, applied: bool) -> None: ...
+
+    def invalidate_plan(self, reason: str) -> None: ...
 
 
 class VisualReplanningAgent:
@@ -62,3 +77,9 @@ class VisualReplanningAgent:
             path=path,
             observation=observation,
         )
+
+    def observe_transition(self, action: str, applied: bool) -> None:
+        """The deterministic observer replans from pixels on every step."""
+
+    def invalidate_plan(self, reason: str) -> None:
+        """No cache to clear: the deterministic agent observes every frame."""

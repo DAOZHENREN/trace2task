@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trace2task"
-version = "0.1.1"
+version = "0.2.0"
 description = "Record a workflow and turn it into a resettable, verifiable agent task."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ authors = [{ name = "DAOZHENREN" }]
 dependencies = [
   "numpy>=2.0",
   "pygame>=2.6,<3",
+  "pyyaml>=6.0,<7",
 ]
 
 [project.optional-dependencies]

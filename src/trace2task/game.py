@@ -174,6 +174,8 @@ class GameRenderer:
             status = state.feedback
         elif mode == "replay":
             status = "FIXED REPLAY   |   Input is automatic"
+        elif mode == "thinking":
+            status = "MULTIMODAL AGENT   |   Waiting for the model..."
         elif mode == "agent":
             status = "AGENT MODE   |   Observing and replanning automatically"
         else:

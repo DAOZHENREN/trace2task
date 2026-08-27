@@ -18,11 +18,15 @@ The task is simple: move a blue player to a gold daily-task marker and press `E`
 
 - `record` captures each human input, timestamp, screenshot, and final outcome.
 - `replay` applies the same input sequence to another seeded layout.
-- `agent` observes rendered pixels, detects the player, goal, and obstacles, then replans after every action.
+- `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
+- `agent --provider codex` sends the current screenshot and task contract to a general multimodal
+  model, then executes only actions allowed by the task pack.
 - `verifier` checks the rendered success state rather than trusting the action sequence.
 - `reset` creates deterministic but different layouts from integer seeds.
 
-The visual agent is intentionally local and model-free for the first milestone. Pixel perception and A* provide a fast, reproducible motor layer; a multimodal model can later replace or augment perception and high-level planning without changing the task format.
+The original visual agent remains local and model-free. The Codex adapter is the first model-backed
+implementation of the same control loop and consumes the existing task pack rather than reading
+`GameState` or using the hard-coded color detector and A* planner.
 
 ## Quick start
 
@@ -76,6 +80,31 @@ Run the visual agent on that layout and move the target after four actions:
 uv run trace2task agent --seed 19 --relocate-after 4
 ```
 
+## Multimodal Agent with a ChatGPT subscription
+
+An API key is not required for the first model-backed adapter. It calls the installed Codex CLI,
+which can reuse a saved ChatGPT subscription login. Verify the local login first:
+
+```bash
+codex login status
+```
+
+If needed, run `codex login` and complete the browser sign-in. Then start the multimodal agent:
+
+```bash
+uv run trace2task agent --provider codex --model gpt-5.6-terra --seed 19 --relocate-after 4
+```
+
+The adapter attaches the current screenshot to an ephemeral, read-only `codex exec` run. Its final
+response must match a JSON Schema generated from the task pack, so the model can only return one of
+the declared actions. It plans at most four actions per model call and discards the cached plan when
+an action is blocked or the environment changes.
+
+This bridge uses ChatGPT/Codex subscription limits rather than API billing. It is suitable for the
+prototype and low-frequency decision points, but not for frame-by-frame realtime control: each
+fresh model decision can take several seconds. A later API or local-model adapter can implement the
+same `AgentAdapter` contract without changing the recorder, executor, task pack, or verifier.
+
 ## Task pack
 
 The first task definition lives in [`taskpacks/daily-reward/task.yaml`](taskpacks/daily-reward/task.yaml). A run produces:
@@ -100,6 +129,7 @@ uv run ruff check .
 ## Next milestones
 
 - Compile raw demonstrations into candidate goals and verifiers with user confirmation.
+- Move the Codex prompt inputs entirely into compiler-generated task packs.
 - Add pop-up recovery and changed-obstacle scenarios.
 - Separate reusable motor skills from model-driven high-level decisions.
 - Add adapters for desktop applications, browser tasks, and real game test environments.
