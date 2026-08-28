@@ -309,7 +309,18 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
                     ],
                     "reason": "Click the visible target.",
                     "confidence": 0.9,
-                }
+                },
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "click",
+                            "args": {"x": 0.5, "y": 0.5, "button": "left"},
+                        }
+                    ],
+                    "reason": "Continue from the new screenshot.",
+                    "confidence": 0.91,
+                },
             ],
             calls,
             sessions,
@@ -317,9 +328,14 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     )
 
     plan = agent.plan(pygame.Surface((100, 50)))
+    agent.observe_transition(plan.actions[0], True)
+    agent.plan(pygame.Surface((100, 50)))
 
     assert plan.actions == (ActionCall("click", {"x": 0.25, "y": 0.75}),)
     assert calls[0]["reference_paths"] == (contract.reference_frame,)
+    assert calls[1]["reference_paths"] == ()
+    assert "do not ask for them again" in calls[1]["prompt"]
+    assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
     assert "Recorded demonstration" in calls[0]["prompt"]
@@ -507,6 +523,7 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     assert result.input_mode == "foreground"
     assert result.model == "gpt-5.6-terra"
     assert result.reasoning_effort == "low"
+    assert result.planning_ms >= 0
 
 
 def test_windows_agent_dry_run_can_focus_for_gpu_capture(tmp_path: Path) -> None:
@@ -591,7 +608,9 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     assert agent.observations == [(click, True)]
     assert metadata["success"] is True
     assert metadata["parameterized_action_count"] == 1
+    assert metadata["planning_ms"] >= 0
     assert any("Requesting a multimodal decision" in status for status in statuses)
+    assert any("Received in" in status for status in statuses)
     assert any("click completed" in status for status in statuses)
 
 

@@ -141,6 +141,7 @@ class WindowsAgentResult:
     input_mode: str
     model: str | None
     reasoning_effort: str
+    planning_ms: float
 
 
 AgentFactory = Callable[[WindowsTaskContract], WindowsPlanningAgent]
@@ -201,10 +202,13 @@ def run_windows_agent(
             if not window.is_visible or window.is_minimized:
                 raise RuntimeError("Windows Agent target must be visible and unminimized")
             status_callback("Requesting a multimodal plan; this can take up to 120 seconds...")
+            planning_started = time.perf_counter()
             plan = agent.plan(active_capture.capture(window))
+            planning_ms = (time.perf_counter() - planning_started) * 1000
             proposed = ", ".join(action.skill for action in plan.actions) or "complete"
             status_callback(
-                f"Plan received: {proposed} (confidence {plan.confidence:.2f})."
+                f"Plan received in {planning_ms / 1000:.1f}s: {proposed} "
+                f"(confidence {plan.confidence:.2f})."
             )
             return WindowsAgentResult(
                 mode="windows_agent_dry_run",
@@ -219,6 +223,7 @@ def run_windows_agent(
                 input_mode="background" if background else "foreground",
                 model=model,
                 reasoning_effort=reasoning_effort,
+                planning_ms=planning_ms,
             )
         finally:
             agent.close()
@@ -229,6 +234,7 @@ def run_windows_agent(
     task_complete = False
     stop_reason = "action_limit"
     last_proposed: list[dict[str, object]] = []
+    total_planning_ms = 0.0
     executor = WindowsMotorExecutor(
         session,
         sleeper=active_emergency.sleep,
@@ -273,11 +279,14 @@ def run_windows_agent(
             status_callback(
                 f"[plan {agent.replans + 1}] Requesting a multimodal decision..."
             )
+            planning_started = time.perf_counter()
             plan = agent.plan(surface)
+            planning_ms = (time.perf_counter() - planning_started) * 1000
+            total_planning_ms += planning_ms
             last_proposed = [action.to_payload() for action in plan.actions]
             proposed = ", ".join(action.skill for action in plan.actions) or "complete"
             status_callback(
-                f"[plan {agent.replans}] Received: {proposed} "
+                f"[plan {agent.replans}] Received in {planning_ms / 1000:.1f}s: {proposed} "
                 f"(confidence {plan.confidence:.2f})."
             )
             if plan.task_complete:
@@ -288,6 +297,7 @@ def run_windows_agent(
                         "verifier": "model_reference_comparison",
                         "reason": plan.reason,
                         "confidence": plan.confidence,
+                        "planning_ms": planning_ms,
                     },
                 )
                 task_complete = True
@@ -324,6 +334,7 @@ def run_windows_agent(
                         "motor_result": asdict(motor_result),
                         "model_reason": plan.reason,
                         "model_confidence": plan.confidence,
+                        "planning_ms": planning_ms,
                     },
                 )
         if executed_actions >= action_limit and not task_complete:
@@ -341,6 +352,7 @@ def run_windows_agent(
                     "replans": agent.replans,
                     "stop_reason": stop_reason,
                     "failure_message": str(error),
+                    "planning_ms": total_planning_ms,
                 },
             )
             writer = None
@@ -363,6 +375,7 @@ def run_windows_agent(
             input_mode="background" if background else "foreground",
             model=model,
             reasoning_effort=reasoning_effort,
+            planning_ms=total_planning_ms,
         )
     if writer is None:
         raise RuntimeError("Windows Agent stopped before its execution trace was created")
@@ -373,6 +386,7 @@ def run_windows_agent(
             "replans": agent.replans,
             "stop_reason": stop_reason,
             "verification": "model_reference_comparison",
+            "planning_ms": total_planning_ms,
         },
     )
     return WindowsAgentResult(
@@ -388,4 +402,5 @@ def run_windows_agent(
         input_mode="background" if background else "foreground",
         model=model,
         reasoning_effort=reasoning_effort,
+        planning_ms=total_planning_ms,
     )

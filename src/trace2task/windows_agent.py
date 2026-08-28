@@ -70,10 +70,13 @@ class CodexWindowsAgent:
         with tempfile.TemporaryDirectory(prefix="trace2task-windows-agent-") as directory:
             current_frame = Path(directory) / "current.png"
             pygame.image.save(surface, current_frame)
+            reference_paths = (
+                (self.contract.reference_frame,) if self._turn_index == 0 else ()
+            )
             output = self._get_session().run_turn(
                 prompt=self._prompt(),
                 image_path=current_frame,
-                additional_image_paths=(self.contract.reference_frame,),
+                additional_image_paths=reference_paths,
                 output_schema=self._output_schema(),
             )
         self._turn_index += 1
@@ -100,14 +103,24 @@ class CodexWindowsAgent:
 
     def _prompt(self) -> str:
         task = self.contract.task
+        history = "\n".join(self._history) if self._history else "none"
+        if self._turn_index > 0:
+            return (
+                "Continue the same Windows task using this new authoritative screenshot as "
+                "Image 1. The reviewed reference frame and recorded demonstration from the first "
+                "turn remain the success template; do not ask for them again. Follow every prior "
+                "motor, coordinate, and safety constraint.\n"
+                f"Current run instruction: {self.contract.instruction}\n"
+                f"Recent execution history:\n{history}\n\n"
+                "For an external submission, verify both destination and content before returning "
+                "the send/submit action. If Image 1 now satisfies the analogous success condition, "
+                "return task_complete=true and no actions. Otherwise return a safe next batch of "
+                f"1 to {self.plan_horizon} actions and stop before an uncertain visual branch. "
+                "The response must match the supplied JSON schema."
+            )
+
         demonstration = [action.to_payload() for action in self.contract.demonstration]
         allowed_skills = self._allowed_skills()
-        history = "\n".join(self._history) if self._history else "none"
-        session_context = (
-            "This is the first observation in a new Windows task run."
-            if self._turn_index == 0
-            else "Continue the same Windows task from the new authoritative current screenshot."
-        )
         execution_context = (
             "Execution mode: background window messages. The target stays behind the user's "
             "foreground app. Never return focus_window.\n"
@@ -130,7 +143,7 @@ class CodexWindowsAgent:
                 f"Template success condition: {task.expected_result}\n"
             )
         return (
-            f"{session_context}\n"
+            "This is the first observation in a new Windows task run.\n"
             "You are the visual planner of a constrained Windows agent. Do not run commands, "
             "read files, or use tools. Image 1 is the current target client area. Image 2 is the "
             "human-reviewed successful reference frame. Compare them visually. The local motor "
