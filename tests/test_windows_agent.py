@@ -283,7 +283,7 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
 
     assert plan.actions == (ActionCall("click", {"x": 0.25, "y": 0.75}),)
     assert calls[0]["reference_paths"] == (contract.reference_frame,)
-    assert calls[0]["schema"]["properties"]["actions"]["items"]["oneOf"]
+    assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
     assert "Recorded demonstration" in calls[0]["prompt"]
     agent.close()

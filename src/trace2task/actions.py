@@ -171,7 +171,7 @@ def parameterized_action_schema(
         return {
             "type": "object",
             "properties": {
-                "skill": {"const": skill},
+                "skill": {"type": "string", "enum": [skill]},
                 "args": {**args_schema, "additionalProperties": False},
             },
             "required": ["skill", "args"],
@@ -195,7 +195,7 @@ def parameterized_action_schema(
                     "y": coordinate,
                     "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
                 },
-                "required": ["x", "y"],
+                "required": ["x", "y", "button"],
             },
         ),
         "double_click": action_schema(
@@ -207,7 +207,7 @@ def parameterized_action_schema(
                     "y": coordinate,
                     "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
                 },
-                "required": ["x", "y"],
+                "required": ["x", "y", "button"],
             },
         ),
         "press_key": action_schema(
@@ -235,7 +235,6 @@ def parameterized_action_schema(
                         "items": key,
                         "minItems": 2,
                         "maxItems": 4,
-                        "uniqueItems": True,
                     }
                 },
                 "required": ["keys"],
@@ -252,4 +251,4 @@ def parameterized_action_schema(
             },
         ),
     }
-    return {"oneOf": [definitions[skill] for skill in allowed_skills]}
+    return {"anyOf": [definitions[skill] for skill in allowed_skills]}

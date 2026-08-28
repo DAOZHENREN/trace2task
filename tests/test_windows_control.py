@@ -130,16 +130,17 @@ def test_parameterized_actions_are_normalized_and_strict() -> None:
 def test_action_schema_can_be_limited_to_task_allowed_skills() -> None:
     schema = parameterized_action_schema(("click", "wait"))
 
-    assert [entry["properties"]["skill"]["const"] for entry in schema["oneOf"]] == [
+    assert [entry["properties"]["skill"]["enum"][0] for entry in schema["anyOf"]] == [
         "click",
         "wait",
     ]
-    click_schema = schema["oneOf"][0]["properties"]["args"]
+    click_schema = schema["anyOf"][0]["properties"]["args"]
     assert click_schema["properties"]["x"] == {
         "type": "number",
         "minimum": 0,
         "maximum": 1,
     }
+    assert click_schema["required"] == ["x", "y", "button"]
     assert click_schema["additionalProperties"] is False
 
 
