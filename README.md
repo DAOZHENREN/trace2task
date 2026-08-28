@@ -229,6 +229,14 @@ skills:
 }
 ```
 
+## Game drag compilation (v0.5.7)
+
+Mouse movement between a recorded button-down and button-up is compiled as a bounded `drag`
+action. The action preserves normalized start/end coordinates, mouse button, and demonstrated
+duration. Foreground execution interpolates the physical cursor while holding the button;
+background execution sends held-button mouse-move messages directly to compatible windows. Both
+paths release the button in a `finally` guard if execution is interrupted.
+
 ## Windows trace compiler (v0.5.3)
 
 Compile the successful Windows recording with the same top-level command:

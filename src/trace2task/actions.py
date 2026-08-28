@@ -7,6 +7,7 @@ WINDOWS_MOTOR_SKILLS = (
     "focus_window",
     "click",
     "double_click",
+    "drag",
     "press_key",
     "hold_key",
     "hotkey",
@@ -132,6 +133,24 @@ class ActionCall:
                 "y": _normalized_coordinate(args["y"], "y"),
                 "button": button.casefold(),
             }
+        if self.skill == "drag":
+            _require_exact_args(
+                self.skill,
+                args,
+                required={"start_x", "start_y", "end_x", "end_y", "duration_ms"},
+                optional={"button"},
+            )
+            button = args.get("button", "left")
+            if not isinstance(button, str) or button.casefold() not in MOUSE_BUTTONS:
+                raise ActionValidationError(f"Unsupported mouse button: {button!r}")
+            return {
+                "start_x": _normalized_coordinate(args["start_x"], "start_x"),
+                "start_y": _normalized_coordinate(args["start_y"], "start_y"),
+                "end_x": _normalized_coordinate(args["end_x"], "end_x"),
+                "end_y": _normalized_coordinate(args["end_y"], "end_y"),
+                "duration_ms": _duration(args["duration_ms"], maximum=5_000, skill=self.skill),
+                "button": button.casefold(),
+            }
         if self.skill == "press_key":
             _require_exact_args(self.skill, args, required={"key"})
             return {"key": normalize_key(args["key"])}
@@ -208,6 +227,28 @@ def parameterized_action_schema(
                     "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
                 },
                 "required": ["x", "y", "button"],
+            },
+        ),
+        "drag": action_schema(
+            "drag",
+            {
+                "type": "object",
+                "properties": {
+                    "start_x": coordinate,
+                    "start_y": coordinate,
+                    "end_x": coordinate,
+                    "end_y": coordinate,
+                    "duration_ms": {"type": "integer", "minimum": 1, "maximum": 5_000},
+                    "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
+                },
+                "required": [
+                    "start_x",
+                    "start_y",
+                    "end_x",
+                    "end_y",
+                    "duration_ms",
+                    "button",
+                ],
             },
         ),
         "press_key": action_schema(

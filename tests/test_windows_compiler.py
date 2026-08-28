@@ -220,13 +220,28 @@ def test_windows_compiler_ignores_unmatched_release_at_focus_boundary(
     ]
 
 
-def test_windows_compiler_rejects_drag_without_motor_skill(tmp_path: Path) -> None:
+def test_windows_compiler_infers_bounded_drag_motor_skill(tmp_path: Path) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
     events[8]["details"]["raw_input"]["normalized_position"] = [0.8, 0.8]
     _rewrite_bundle(trace_path, events, metadata)
 
-    with pytest.raises(ValueError, match="drag detected"):
-        compile_trace(trace_path, tmp_path / "compiled")
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    demonstration = json.loads(
+        (Path(result.task_path).parent / "demonstration.json").read_text(encoding="utf-8")
+    )
+    actions = [item["action"] for item in demonstration["actions"]]
+
+    assert {
+        "skill": "drag",
+        "args": {
+            "start_x": 0.4,
+            "start_y": 0.5,
+            "end_x": 0.8,
+            "end_y": 0.8,
+            "duration_ms": 50,
+            "button": "left",
+        },
+    } in actions
 
 
 def test_windows_compiler_rejects_concurrent_non_modifier_holds(tmp_path: Path) -> None:

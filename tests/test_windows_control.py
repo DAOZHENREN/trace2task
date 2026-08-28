@@ -91,6 +91,15 @@ class FakeWindowsBackend:
             ("window_mouse", handle, client_x, client_y, button, is_down, double)
         )
 
+    def post_window_mouse_move(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+    ) -> None:
+        self.events.append(("window_mouse_move", handle, client_x, client_y, button))
+
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
         self.events.append(("window_key", handle, virtual_key, is_down))
 
@@ -125,12 +134,23 @@ def test_parameterized_actions_are_normalized_and_strict() -> None:
         {"skill": "hold_key", "args": {"key": "W", "duration_ms": 420}}
     )
     click = ActionCall("click", {"x": 1, "y": 0.25})
+    drag = ActionCall(
+        "drag",
+        {
+            "start_x": 0.1,
+            "start_y": 0.2,
+            "end_x": 0.8,
+            "end_y": 0.9,
+            "duration_ms": 650,
+        },
+    )
 
     assert hold.to_payload() == {
         "skill": "hold_key",
         "args": {"key": "w", "duration_ms": 420},
     }
     assert click.args == {"x": 1.0, "y": 0.25, "button": "left"}
+    assert drag.args["button"] == "left"
 
     with pytest.raises(ActionValidationError, match="exactly"):
         ActionCall.from_payload({"skill": "wait", "args": {}, "reason": "extra"})
@@ -142,6 +162,17 @@ def test_parameterized_actions_are_normalized_and_strict() -> None:
         ActionCall("hotkey", {"keys": ["ctrl", "CTRL"]})
     with pytest.raises(ActionValidationError, match="Unsupported keyboard key"):
         ActionCall("press_key", {"key": "volume_up"})
+    with pytest.raises(ActionValidationError, match="between 1 and 5000"):
+        ActionCall(
+            "drag",
+            {
+                "start_x": 0.1,
+                "start_y": 0.2,
+                "end_x": 0.8,
+                "end_y": 0.9,
+                "duration_ms": 5_001,
+            },
+        )
 
 
 def test_action_schema_can_be_limited_to_task_allowed_skills() -> None:
@@ -328,6 +359,95 @@ def test_double_click_and_wait_use_bounded_local_timing() -> None:
         ("mouse", "right", False),
     ]
     assert sleeps == [0.02, 0.08, 0.02, 0.3]
+
+
+def test_drag_interpolates_pointer_and_always_releases_button() -> None:
+    backend = FakeWindowsBackend([window()], foreground=7)
+    sleeps: list[float] = []
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=sleeps.append,
+    )
+
+    result = executor.execute(
+        ActionCall(
+            "drag",
+            {
+                "start_x": 0.25,
+                "start_y": 0.25,
+                "end_x": 0.75,
+                "end_y": 0.75,
+                "duration_ms": 48,
+                "button": "left",
+            },
+        )
+    )
+
+    assert result.screen_position == (400, 350)
+    assert backend.events[0:2] == [("cursor", 200, 250), ("mouse", "left", True)]
+    assert backend.events[-2:] == [("cursor", 400, 350), ("mouse", "left", False)]
+    assert len([event for event in backend.events if event[0] == "cursor"]) == 4
+    assert sleeps == [0.016, 0.016, 0.016]
+
+
+def test_background_drag_posts_held_mouse_moves_to_target() -> None:
+    backend = FakeWindowsBackend([window()], foreground=99)
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=lambda _: None,
+        background=True,
+    )
+
+    executor.execute(
+        ActionCall(
+            "drag",
+            {
+                "start_x": 0.25,
+                "start_y": 0.25,
+                "end_x": 0.75,
+                "end_y": 0.75,
+                "duration_ms": 16,
+            },
+        )
+    )
+
+    assert backend.events == [
+        ("window_mouse", 7, 100, 50, "left", True, False),
+        ("window_mouse_move", 7, 300, 150, "left"),
+        ("window_mouse", 7, 300, 150, "left", False, False),
+    ]
+
+
+def test_interrupted_drag_still_releases_mouse_button() -> None:
+    backend = FakeWindowsBackend([window()], foreground=7)
+
+    def interrupt(_: float) -> None:
+        raise RuntimeError("interrupted")
+
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=interrupt,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        executor.execute(
+            ActionCall(
+                "drag",
+                {
+                    "start_x": 0.25,
+                    "start_y": 0.25,
+                    "end_x": 0.75,
+                    "end_y": 0.75,
+                    "duration_ms": 100,
+                },
+            )
+        )
+
+    assert backend.events == [
+        ("cursor", 200, 250),
+        ("mouse", "left", True),
+        ("mouse", "left", False),
+    ]
 
 
 def test_interrupted_hold_still_releases_key() -> None:

@@ -25,6 +25,7 @@ WAIT_THRESHOLD_MS = 500
 MAX_COMPILED_WAIT_MS = 10_000
 MAX_KEY_HOLD_MS = 5_000
 MAX_MOUSE_CLICK_MS = 1_000
+MAX_MOUSE_DRAG_MS = 5_000
 DOUBLE_CLICK_GAP_MS = 500
 POINTER_JITTER_TOLERANCE = 0.02
 MODIFIER_KEYS = {"alt", "ctrl", "shift"}
@@ -102,7 +103,7 @@ def _validate_windows_trace(
     if metadata.get("source") != "windows_human":
         raise ValueError("Windows compiler requires a windows_human recording")
     if metadata.get("success") is not True or metadata.get("stop_reason") != "success_marked":
-        raise ValueError("Only a Windows trace completed with the F8 success marker can compile")
+        raise ValueError("Only a Windows trace completed with a human success marker can compile")
     if metadata.get("coordinate_space") != "physical_pixels":
         raise ValueError(
             "Windows trace does not use physical-pixel coordinates; re-record it with the "
@@ -314,32 +315,49 @@ def _reject_unsupported_concurrency(
 
 
 def _compile_mouse(intervals: list[_InputInterval]) -> list[_TimedAction]:
-    clicks: list[_TimedAction] = []
+    actions: list[_TimedAction] = []
     for interval in intervals:
         duration_ms = _duration(interval)
-        if duration_ms > MAX_MOUSE_CLICK_MS:
-            raise ValueError(
-                f"Mouse button {interval.name!r} was held too long to infer a safe click"
-            )
         down_position = _normalized_position(interval.start)
         up_position = _normalized_position(interval.end)
         if _distance(down_position, up_position) > POINTER_JITTER_TOLERANCE:
-            raise ValueError("Mouse drag detected, but v0.5.3 has no drag motor skill")
-        action = ActionCall(
-            "click",
-            {"x": down_position[0], "y": down_position[1], "button": interval.name},
-        )
-        clicks.append(
+            if duration_ms > MAX_MOUSE_DRAG_MS:
+                raise ValueError(
+                    f"Mouse drag exceeds the safe {MAX_MOUSE_DRAG_MS}ms limit"
+                )
+            action = ActionCall(
+                "drag",
+                {
+                    "start_x": down_position[0],
+                    "start_y": down_position[1],
+                    "end_x": up_position[0],
+                    "end_y": up_position[1],
+                    "duration_ms": duration_ms,
+                    "button": interval.name,
+                },
+            )
+            inference = "paired_mouse_button_with_pointer_displacement"
+        else:
+            if duration_ms > MAX_MOUSE_CLICK_MS:
+                raise ValueError(
+                    f"Mouse button {interval.name!r} was held too long to infer a safe click"
+                )
+            action = ActionCall(
+                "click",
+                {"x": down_position[0], "y": down_position[1], "button": interval.name},
+            )
+            inference = "paired_mouse_button_without_drag"
+        actions.append(
             _TimedAction(
                 action=action,
                 start_ms=interval.start.elapsed_ms,
                 end_ms=interval.end.elapsed_ms,
                 source_seqs=(interval.start.seq, interval.end.seq),
                 evidence_frame=interval.end.frame,
-                inference="paired_mouse_button_without_drag",
+                inference=inference,
             )
         )
-    return clicks
+    return actions
 
 
 def _merge_double_clicks(actions: list[_TimedAction]) -> list[_TimedAction]:
@@ -445,6 +463,7 @@ def compile_windows_trace(
     if not inferred:
         raise ValueError("Windows trace did not produce any supported motor actions")
     task_id = str(metadata["task_id"]).strip()
+    success_hotkey = str(metadata.get("success_hotkey") or "f8").upper()
     initial_window = metadata.get("initial_window")
     if not isinstance(initial_window, dict):
         raise TypeError("Windows trace metadata has no initial_window object")
@@ -608,6 +627,7 @@ def compile_windows_trace(
                 "wait": WAIT_THRESHOLD_MS,
                 "double_click_gap": DOUBLE_CLICK_GAP_MS,
                 "max_mouse_click": MAX_MOUSE_CLICK_MS,
+                "max_mouse_drag": MAX_MOUSE_DRAG_MS,
             },
             "pointer_jitter_tolerance": POINTER_JITTER_TOLERANCE,
             "ignored_unmatched_releases": [
@@ -623,7 +643,7 @@ def compile_windows_trace(
             "verifier": {
                 "type": "reviewed_reference_frame",
                 "evidence_frame": final_frame,
-                "success_source": "human F8 marker",
+                "success_source": f"human {success_hotkey} marker",
             },
             "stages": stages,
         },
@@ -632,12 +652,13 @@ def compile_windows_trace(
             "Short key intervals are presses and longer intervals are bounded holds.",
             "Ctrl, Alt, or Shift intervals containing another key interval form a hotkey.",
             "Two adjacent same-position clicks within the time window form a double click.",
+            "Mouse intervals with pointer displacement compile to bounded drag actions.",
             "Idle gaps above the threshold are waits capped at ten seconds.",
-            "The F8 success marker is human evidence and still requires visual review.",
+            f"The {success_hotkey} success marker is human evidence and still requires visual review.",
             "Unmatched release events are ignored and listed in the compiler report.",
             (
-                "Drag, unsupported concurrent input, outside-target click, unreleased input, and "
-                "excessive holds fail closed."
+                "Unsupported concurrent input, outside-target mouse input, unreleased input, and "
+                "excessive holds or drags fail closed."
             ),
         ],
     }

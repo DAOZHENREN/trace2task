@@ -191,6 +191,15 @@ class FakeBackend:
             ("window_mouse", handle, client_x, client_y, button, is_down, double)
         )
 
+    def post_window_mouse_move(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+    ) -> None:
+        self.events.append(("window_mouse_move", handle, client_x, client_y, button))
+
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
         self.events.append(("window_key", handle, virtual_key, is_down))
 

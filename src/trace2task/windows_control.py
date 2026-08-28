@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import time
 from collections.abc import Callable, Iterator
@@ -218,6 +219,14 @@ class WindowsBackend(Protocol):
         is_down: bool,
         *,
         double: bool = False,
+    ) -> None: ...
+
+    def post_window_mouse_move(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
     ) -> None: ...
 
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None: ...
@@ -456,6 +465,31 @@ class Win32Backend:
         else:
             self._post_message(target, up_message, 0, packed_point)
 
+    def post_window_mouse_move(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+    ) -> None:
+        key = (handle, button)
+        stored = self._posted_mouse_targets.get(key)
+        if stored is None:
+            raise RuntimeError(f"Mouse button {button!r} is not held for target {handle}")
+        target, _ = stored
+        point = wintypes.POINT(client_x, client_y)
+        if target != handle:
+            self.user32.MapWindowPoints(
+                wintypes.HWND(handle),
+                wintypes.HWND(target),
+                ctypes.byref(point),
+                1,
+            )
+        packed_point = self._pack_client_point(point.x, point.y)
+        button_flag = WINDOW_MOUSE_MESSAGES[button][3]
+        self._post_message(target, WM_MOUSEMOVE, button_flag, packed_point)
+        self._posted_mouse_targets[key] = (target, packed_point)
+
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
         key = (handle, virtual_key)
         if is_down:
@@ -667,12 +701,14 @@ class WindowsMotorExecutor:
         *,
         sleeper: Callable[[float], None] = time.sleep,
         max_hold_ms: int = 5_000,
+        max_drag_ms: int = 5_000,
         max_wait_ms: int = 10_000,
         background: bool = False,
     ) -> None:
         self.session = session
         self.sleeper = sleeper
         self.max_hold_ms = max_hold_ms
+        self.max_drag_ms = max_drag_ms
         self.max_wait_ms = max_wait_ms
         self.background = background
 
@@ -709,6 +745,19 @@ class WindowsMotorExecutor:
                     )
                     if click_index + 1 < clicks:
                         self.sleeper(0.08)
+            elif call.skill == "drag":
+                duration = call.args["duration_ms"]
+                if duration > self.max_drag_ms:
+                    raise WindowSafetyError(
+                        f"Requested mouse drag {duration}ms exceeds executor limit "
+                        f"{self.max_drag_ms}ms"
+                    )
+                position = self.session.normalized_to_screen(
+                    window,
+                    call.args["end_x"],
+                    call.args["end_y"],
+                )
+                self._drag(window, call)
             elif call.skill == "press_key":
                 self._press(window, call.args["key"])
             elif call.skill == "hold_key":
@@ -763,6 +812,64 @@ class WindowsMotorExecutor:
             self.sleeper(0.02)
         finally:
             send(False)
+
+    def _drag(self, window: WindowInfo, call: ActionCall) -> None:
+        start_x = call.args["start_x"]
+        start_y = call.args["start_y"]
+        end_x = call.args["end_x"]
+        end_y = call.args["end_y"]
+        duration_ms = call.args["duration_ms"]
+        button = call.args["button"]
+        steps = max(1, math.ceil(duration_ms / 16))
+        step_seconds = duration_ms / steps / 1_000
+
+        if self.background:
+            client_x, client_y = self.session.normalized_to_client(window, start_x, start_y)
+            self.session.backend.post_window_mouse_button(
+                window.handle,
+                client_x,
+                client_y,
+                button,
+                True,
+            )
+        else:
+            start_position = self.session.normalized_to_screen(window, start_x, start_y)
+            self.session.backend.set_cursor_position(*start_position)
+            self.session.backend.send_mouse_button(button, True)
+        try:
+            for step in range(1, steps + 1):
+                self.sleeper(step_seconds)
+                progress = step / steps
+                x = start_x + (end_x - start_x) * progress
+                y = start_y + (end_y - start_y) * progress
+                current = (
+                    self.session.require_available()
+                    if self.background
+                    else self.session.require_foreground()
+                )
+                if self.background:
+                    client_x, client_y = self.session.normalized_to_client(current, x, y)
+                    self.session.backend.post_window_mouse_move(
+                        current.handle,
+                        client_x,
+                        client_y,
+                        button,
+                    )
+                else:
+                    position = self.session.normalized_to_screen(current, x, y)
+                    self.session.backend.set_cursor_position(*position)
+        finally:
+            if self.background:
+                client_x, client_y = self.session.normalized_to_client(window, end_x, end_y)
+                self.session.backend.post_window_mouse_button(
+                    window.handle,
+                    client_x,
+                    client_y,
+                    button,
+                    False,
+                )
+            else:
+                self.session.backend.send_mouse_button(button, False)
 
     def _press(self, window: WindowInfo, key: str) -> None:
         virtual_key = virtual_key_for(key)
