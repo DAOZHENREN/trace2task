@@ -37,6 +37,7 @@ class CodexWindowsAgent:
         codex_bin: str = "codex",
         plan_horizon: int = 1,
         timeout_seconds: float = 120,
+        background: bool = False,
         binary_resolver: BinaryResolver = resolve_codex_binary,
         session_factory: SessionFactory = CodexAppServerSession,
     ) -> None:
@@ -47,6 +48,7 @@ class CodexWindowsAgent:
         self.codex_bin = codex_bin
         self.plan_horizon = plan_horizon
         self.timeout_seconds = timeout_seconds
+        self.background = background
         self.binary_resolver = binary_resolver
         self.session_factory = session_factory
         self.replans = 0
@@ -88,11 +90,18 @@ class CodexWindowsAgent:
     def _prompt(self) -> str:
         task = self.contract.task
         demonstration = [action.to_payload() for action in self.contract.demonstration]
+        allowed_skills = self._allowed_skills()
         history = "\n".join(self._history) if self._history else "none"
         session_context = (
             "This is the first observation in a new Windows task run."
             if self._turn_index == 0
             else "Continue the same Windows task from the new authoritative current screenshot."
+        )
+        execution_context = (
+            "Execution mode: background window messages. The target stays behind the user's "
+            "foreground app. Never return focus_window.\n"
+            if self.background
+            else "Execution mode: guarded foreground input.\n"
         )
         return (
             f"{session_context}\n"
@@ -102,7 +111,8 @@ class CodexWindowsAgent:
             "controller alone will execute your structured actions.\n\n"
             f"Task: {task.instruction}\n"
             f"Success condition: {task.expected_result}\n"
-            f"Allowed motor skills: {', '.join(task.actions)}\n"
+            f"Allowed motor skills: {', '.join(allowed_skills)}\n"
+            f"{execution_context}"
             "Mouse x/y coordinates are normalized within Image 1: top-left is (0,0), "
             "bottom-right is (1,1).\n"
             f"Recorded demonstration (a hint, not a fixed script): "
@@ -122,7 +132,7 @@ class CodexWindowsAgent:
                 "task_complete": {"type": "boolean"},
                 "actions": {
                     "type": "array",
-                    "items": parameterized_action_schema(self.contract.task.actions),
+                    "items": parameterized_action_schema(self._allowed_skills()),
                     "minItems": 0,
                     "maxItems": self.plan_horizon,
                 },
@@ -132,6 +142,16 @@ class CodexWindowsAgent:
             "required": ["task_complete", "actions", "reason", "confidence"],
             "additionalProperties": False,
         }
+
+    def _allowed_skills(self) -> tuple[str, ...]:
+        if not self.background:
+            return self.contract.task.actions
+        skills = tuple(
+            skill for skill in self.contract.task.actions if skill != "focus_window"
+        )
+        if not skills:
+            raise RuntimeError("A background Windows task requires a non-focus motor skill")
+        return skills
 
     def _parse_payload(self, output: str) -> WindowsAgentPlan:
         try:
@@ -149,8 +169,10 @@ class CodexWindowsAgent:
         if not isinstance(raw_actions, list) or len(raw_actions) > self.plan_horizon:
             raise RuntimeError("Codex returned an invalid Windows action batch")
         actions = tuple(ActionCall.from_payload(raw_action) for raw_action in raw_actions)
-        if any(action.skill not in self.contract.task.actions for action in actions):
-            raise RuntimeError("Codex returned an action outside the Windows task pack")
+        if any(action.skill not in self._allowed_skills() for action in actions):
+            raise RuntimeError(
+                "Codex returned an action outside the Windows task pack or active execution mode"
+            )
         if task_complete and actions:
             raise RuntimeError("Codex marked the task complete while still returning actions")
         if not task_complete and not actions:

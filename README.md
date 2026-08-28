@@ -271,6 +271,31 @@ For v0.5.4, completion is a constrained model comparison between the live target
 human-reviewed final reference image. This is useful for the integration loop but is not yet a
 deterministic region verifier; keep action limits small and supervise the first executions.
 
+## Background Windows execution (v0.5.5)
+
+An unminimized target may now remain behind another app during execution. Add `--background` to a
+confirmed task-pack run:
+
+```powershell
+uv run trace2task windows agent `
+  --task taskpacks\generated\<pack>\task.yaml `
+  --execute `
+  --background
+```
+
+Background mode keeps the current foreground app active and does not move the physical cursor. It
+captures the target through `PrintWindow`, maps normalized mouse coordinates into the target client
+area, and posts paired mouse/keyboard messages to the target HWND (or the matching child control).
+The planner excludes `focus_window` from its active schema in this mode. Visibility, minimized
+state, task confirmation, action bounds, per-action replanning, trace recording, and the `F9`
+emergency stop remain enforced.
+
+This is a best-effort Windows compatibility path. Apps that consume normal `WM_MOUSE*` and
+`WM_KEY*` messages generally work; games using Raw Input, DirectInput, anti-cheat protection, an
+elevated integrity level, or GPU-only rendering may ignore directed input or return unusable
+`PrintWindow` frames. Run those targets in the default foreground mode. Minimized execution is not
+supported yet.
+
 Run the visual agent on that layout and move the target after four actions:
 
 ```bash

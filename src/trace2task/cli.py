@@ -116,6 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Inject the validated actions. Without this flag the command is read-only dry-run.",
     )
+    windows_agent.add_argument(
+        "--background",
+        action="store_true",
+        help=(
+            "Deliver execution input directly to a visible, unminimized target without focusing "
+            "it. The target app must accept Win32 window messages."
+        ),
+    )
 
     agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
@@ -207,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan_horizon=args.plan_horizon,
                 max_actions=args.max_actions,
                 output_root=args.output,
+                background=args.background,
             )
     elif args.command == "agent":
         result = run_agent(

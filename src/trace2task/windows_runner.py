@@ -134,6 +134,7 @@ class WindowsAgentResult:
     stop_reason: str
     proposed_actions: list[dict[str, object]]
     trace_path: str | None
+    input_mode: str
 
 
 AgentFactory = Callable[[WindowsTaskContract], WindowsPlanningAgent]
@@ -152,6 +153,7 @@ def run_windows_agent(
     capture: WindowFrameCapture | None = None,
     emergency_stop: EmergencyStop | None = None,
     agent_factory: AgentFactory | None = None,
+    background: bool = False,
 ) -> WindowsAgentResult:
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
@@ -174,6 +176,7 @@ def run_windows_agent(
             model=model,
             codex_bin=codex_bin,
             plan_horizon=plan_horizon,
+            background=background,
         )
     )
 
@@ -193,6 +196,7 @@ def run_windows_agent(
                 stop_reason="model_complete" if plan.task_complete else "dry_run_plan_only",
                 proposed_actions=[action.to_payload() for action in plan.actions],
                 trace_path=None,
+                input_mode="background" if background else "foreground",
             )
         finally:
             agent.close()
@@ -203,11 +207,15 @@ def run_windows_agent(
     task_complete = False
     stop_reason = "action_limit"
     last_proposed: list[dict[str, object]] = []
-    executor = WindowsMotorExecutor(session, sleeper=active_emergency.sleep)
+    executor = WindowsMotorExecutor(
+        session,
+        sleeper=active_emergency.sleep,
+        background=background,
+    )
     try:
         active_emergency.start()
         active_emergency.raise_if_requested()
-        window = session.focus()
+        window = session.require_available() if background else session.focus()
         surface = active_capture.capture(window)
         writer = TraceWriter(
             make_run_dir(output_root, "windows-agent"),
@@ -222,11 +230,12 @@ def run_windows_agent(
                 "window": asdict(window),
                 "task_path": str(contract.task.source_path),
                 "emergency_hotkey": "f9",
+                "input_mode": "background" if background else "foreground",
             },
         )
         while executed_actions < action_limit:
             active_emergency.raise_if_requested()
-            window = session.require_foreground()
+            window = session.require_available() if background else session.require_foreground()
             surface = active_capture.capture(window)
             plan = agent.plan(surface)
             last_proposed = [action.to_payload() for action in plan.actions]
@@ -255,7 +264,9 @@ def run_windows_agent(
                     raise
                 agent.observe_transition(action, True)
                 executed_actions += 1
-                window = session.require_foreground()
+                window = (
+                    session.require_available() if background else session.require_foreground()
+                )
                 surface = active_capture.capture(window)
                 writer.record(
                     "windows_action",
@@ -299,6 +310,7 @@ def run_windows_agent(
             stop_reason=stop_reason,
             proposed_actions=[],
             trace_path=None,
+            input_mode="background" if background else "foreground",
         )
     if writer is None:
         raise RuntimeError("Windows Agent stopped before its execution trace was created")
@@ -321,4 +333,5 @@ def run_windows_agent(
         stop_reason=stop_reason,
         proposed_actions=last_proposed,
         trace_path=str(trace.trace_path),
+        input_mode="background" if background else "foreground",
     )

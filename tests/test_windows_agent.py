@@ -177,6 +177,23 @@ class FakeBackend:
     def send_key(self, virtual_key: int, is_down: bool) -> None:
         self.events.append(("key", virtual_key, is_down))
 
+    def post_window_mouse_button(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+        is_down: bool,
+        *,
+        double: bool = False,
+    ) -> None:
+        self.events.append(
+            ("window_mouse", handle, client_x, client_y, button, is_down, double)
+        )
+
+    def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
+        self.events.append(("window_key", handle, virtual_key, is_down))
+
 
 class FakeCapture:
     def __init__(self) -> None:
@@ -314,6 +331,41 @@ def test_codex_windows_agent_rejects_skill_outside_taskpack(tmp_path: Path) -> N
     agent.close()
 
 
+def test_codex_windows_agent_excludes_focus_action_in_background(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(_write_taskpack(tmp_path))
+    agent = CodexWindowsAgent(
+        contract,
+        background=True,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "click",
+                            "args": {"x": 0.25, "y": 0.75, "button": "left"},
+                        }
+                    ],
+                    "reason": "Click without focusing.",
+                    "confidence": 0.9,
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+
+    variants = calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
+    skills = [variant["properties"]["skill"]["enum"][0] for variant in variants]
+    assert skills == ["click"]
+    assert "Never return focus_window" in calls[0]["prompt"]
+    agent.close()
+
+
 def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) -> None:
     task_path = _write_taskpack(tmp_path)
     backend = FakeBackend()
@@ -333,6 +385,7 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     ]
     assert backend.events == []
     assert agent.closed
+    assert result.input_mode == "foreground"
 
 
 def test_windows_agent_refuses_to_execute_draft_before_model_or_input(tmp_path: Path) -> None:
@@ -387,6 +440,35 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     assert agent.observations == [(click, True)]
     assert metadata["success"] is True
     assert metadata["parameterized_action_count"] == 1
+
+
+def test_confirmed_windows_agent_can_execute_in_background_without_focus(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    capture = FakeCapture()
+    emergency = FakeEmergencyStop()
+    click = ActionCall("click", {"x": 0.5, "y": 0.5})
+    agent = ScriptedAgent([_plan(click), _plan(complete=True)])
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        background=True,
+        output_root=tmp_path / "runs",
+        backend=backend,
+        capture=capture,
+        emergency_stop=emergency,
+        agent_factory=lambda contract: agent,
+    )
+
+    assert result.task_complete
+    assert result.input_mode == "background"
+    assert backend.foreground == 0
+    assert backend.events == [
+        ("window_mouse", 7, 50, 25, "left", True, False),
+        ("window_mouse", 7, 50, 25, "left", False, False),
+    ]
 
 
 def test_emergency_stop_before_action_prevents_injection(tmp_path: Path) -> None:

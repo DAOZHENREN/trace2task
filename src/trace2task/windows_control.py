@@ -18,10 +18,24 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_EXTENDEDKEY = 0x0001
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+WM_MOUSEMOVE = 0x0200
+CWP_SKIPINVISIBLE = 0x0001
+CWP_SKIPDISABLED = 0x0002
+CWP_SKIPTRANSPARENT = 0x0004
+MAPVK_VK_TO_VSC = 0
 MOUSE_FLAGS = {
     "left": (0x0002, 0x0004),
     "right": (0x0008, 0x0010),
     "middle": (0x0020, 0x0040),
+}
+WINDOW_MOUSE_MESSAGES = {
+    "left": (0x0201, 0x0202, 0x0203, 0x0001),
+    "right": (0x0204, 0x0205, 0x0206, 0x0002),
+    "middle": (0x0207, 0x0208, 0x0209, 0x0010),
 }
 VK_CODES = {
     "backspace": 0x08,
@@ -107,6 +121,20 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("payload", _InputUnion)]
 
 
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
 @dataclass(frozen=True)
 class WindowInfo:
     handle: int
@@ -181,9 +209,22 @@ class WindowsBackend(Protocol):
 
     def send_key(self, virtual_key: int, is_down: bool) -> None: ...
 
+    def post_window_mouse_button(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+        is_down: bool,
+        *,
+        double: bool = False,
+    ) -> None: ...
+
+    def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None: ...
+
 
 class Win32Backend:
-    """Small ctypes wrapper around read-only window APIs and SendInput."""
+    """Small ctypes wrapper around window APIs, SendInput, and directed messages."""
 
     def __init__(self) -> None:
         if os.name != "nt":
@@ -227,11 +268,43 @@ class Win32Backend:
             ctypes.c_int,
         ]
         self.user32.SendInput.restype = wintypes.UINT
+        self.user32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        self.user32.PostMessageW.restype = wintypes.BOOL
+        self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        self.user32.MapVirtualKeyW.restype = wintypes.UINT
+        self.user32.ChildWindowFromPointEx.argtypes = [
+            wintypes.HWND,
+            wintypes.POINT,
+            wintypes.UINT,
+        ]
+        self.user32.ChildWindowFromPointEx.restype = wintypes.HWND
+        self.user32.MapWindowPoints.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.POINT),
+            wintypes.UINT,
+        ]
+        self.user32.MapWindowPoints.restype = ctypes.c_int
+        self.user32.GetGUIThreadInfo.argtypes = [
+            wintypes.DWORD,
+            ctypes.POINTER(_GuiThreadInfo),
+        ]
+        self.user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        self.user32.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
+        self.user32.IsChild.restype = wintypes.BOOL
         get_dpi = getattr(self.user32, "GetDpiForWindow", None)
         if get_dpi:
             get_dpi.argtypes = [wintypes.HWND]
             get_dpi.restype = wintypes.UINT
         configure_physical_dpi_api(self.user32)
+        self._posted_key_targets: dict[tuple[int, int], int] = {}
+        self._posted_mouse_targets: dict[tuple[int, str], tuple[int, int]] = {}
+        self._posted_alt_handles: set[int] = set()
 
         self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self.kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -349,6 +422,145 @@ class Win32Backend:
         if sent != 1:
             raise ctypes.WinError(ctypes.get_last_error())
 
+    def post_window_mouse_button(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+        is_down: bool,
+        *,
+        double: bool = False,
+    ) -> None:
+        key = (handle, button)
+        if is_down:
+            target, point = self._deepest_child_at(handle, client_x, client_y)
+            packed_point = self._pack_client_point(point.x, point.y)
+            self._posted_mouse_targets[key] = (target, packed_point)
+        else:
+            stored = self._posted_mouse_targets.pop(key, None)
+            if stored is None:
+                target, point = self._deepest_child_at(handle, client_x, client_y)
+                packed_point = self._pack_client_point(point.x, point.y)
+            else:
+                target, packed_point = stored
+        down_message, up_message, double_message, button_flag = WINDOW_MOUSE_MESSAGES[button]
+        if is_down:
+            try:
+                self._post_message(target, WM_MOUSEMOVE, 0, packed_point)
+                message = double_message if double else down_message
+                self._post_message(target, message, button_flag, packed_point)
+            except Exception:
+                self._posted_mouse_targets.pop(key, None)
+                raise
+        else:
+            self._post_message(target, up_message, 0, packed_point)
+
+    def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
+        key = (handle, virtual_key)
+        if is_down:
+            target = self._keyboard_target(handle)
+            self._posted_key_targets[key] = target
+        else:
+            target = self._posted_key_targets.pop(key, None)
+            if target is None:
+                target = self._keyboard_target(handle)
+        scan_code = int(self.user32.MapVirtualKeyW(virtual_key, MAPVK_VK_TO_VSC))
+        flags = 1 | (scan_code << 16)
+        if virtual_key in EXTENDED_VIRTUAL_KEYS:
+            flags |= 1 << 24
+        is_alt = virtual_key == VK_CODES["alt"]
+        is_system = is_alt or handle in self._posted_alt_handles
+        if is_system:
+            flags |= 1 << 29
+        if not is_down:
+            flags |= (1 << 30) | (1 << 31)
+        message = (
+            WM_SYSKEYDOWN
+            if is_system and is_down
+            else WM_SYSKEYUP
+            if is_system
+            else WM_KEYDOWN
+            if is_down
+            else WM_KEYUP
+        )
+        try:
+            self._post_message(target, message, virtual_key, flags)
+        except Exception:
+            if is_down:
+                self._posted_key_targets.pop(key, None)
+            elif is_alt:
+                self._posted_alt_handles.discard(handle)
+            raise
+        if is_alt:
+            if is_down:
+                self._posted_alt_handles.add(handle)
+            else:
+                self._posted_alt_handles.discard(handle)
+
+    def _deepest_child_at(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+    ) -> tuple[int, wintypes.POINT]:
+        current = handle
+        point = wintypes.POINT(client_x, client_y)
+        skip_flags = CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT
+        for _ in range(32):
+            child = int(
+                self.user32.ChildWindowFromPointEx(
+                    wintypes.HWND(current),
+                    point,
+                    skip_flags,
+                )
+                or 0
+            )
+            if not child or child == current:
+                break
+            mapped = wintypes.POINT(point.x, point.y)
+            self.user32.MapWindowPoints(
+                wintypes.HWND(current),
+                wintypes.HWND(child),
+                ctypes.byref(mapped),
+                1,
+            )
+            current = child
+            point = mapped
+        return current, point
+
+    def _keyboard_target(self, handle: int) -> int:
+        thread_id = int(
+            self.user32.GetWindowThreadProcessId(wintypes.HWND(handle), None) or 0
+        )
+        info = _GuiThreadInfo(cbSize=ctypes.sizeof(_GuiThreadInfo))
+        if thread_id and self.user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)):
+            focused = int(info.hwndFocus or 0)
+            if focused and (
+                focused == handle
+                or self.user32.IsChild(wintypes.HWND(handle), wintypes.HWND(focused))
+            ):
+                return focused
+        return handle
+
+    def _post_message(self, handle: int, message: int, wparam: int, lparam: int) -> None:
+        ctypes.set_last_error(0)
+        if self.user32.PostMessageW(
+            wintypes.HWND(handle),
+            message,
+            wparam,
+            lparam,
+        ):
+            return
+        error = ctypes.get_last_error()
+        if error:
+            raise ctypes.WinError(error)
+        raise RuntimeError(f"Could not post Windows message 0x{message:04x} to {handle}")
+
+    @staticmethod
+    def _pack_client_point(x: int, y: int) -> int:
+        return (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+
 
 class WindowSession:
     """Resolve a stable selector and guard every coordinate/input operation."""
@@ -388,20 +600,29 @@ class WindowSession:
         return self._require_available(refreshed or window)
 
     def require_foreground(self) -> WindowInfo:
-        window = self._require_available(self.resolve())
+        window = self.require_available()
         if self.backend.foreground_handle() != window.handle:
             raise WindowSafetyError(
                 f"Target window {window.handle} lost focus; input was not sent"
             )
         return window
 
-    def normalized_to_screen(self, window: WindowInfo, x: float, y: float) -> tuple[int, int]:
+    def require_available(self) -> WindowInfo:
+        return self._require_available(self.resolve())
+
+    def normalized_to_client(self, window: WindowInfo, x: float, y: float) -> tuple[int, int]:
         if not 0 <= x <= 1 or not 0 <= y <= 1:
             raise WindowSafetyError("Normalized mouse coordinates must stay between 0 and 1")
         if window.client_width <= 0 or window.client_height <= 0:
             raise WindowSafetyError("Target window has no usable client area")
-        screen_x = window.client_left + min(window.client_width - 1, int(x * window.client_width))
-        screen_y = window.client_top + min(window.client_height - 1, int(y * window.client_height))
+        client_x = min(window.client_width - 1, int(x * window.client_width))
+        client_y = min(window.client_height - 1, int(y * window.client_height))
+        return client_x, client_y
+
+    def normalized_to_screen(self, window: WindowInfo, x: float, y: float) -> tuple[int, int]:
+        client_x, client_y = self.normalized_to_client(window, x, y)
+        screen_x = window.client_left + client_x
+        screen_y = window.client_top + client_y
         return screen_x, screen_y
 
     @staticmethod
@@ -419,10 +640,11 @@ class MotorResult:
     window_handle: int
     elapsed_ms: float
     screen_position: tuple[int, int] | None = None
+    input_mode: str = "foreground"
 
 
 class WindowsMotorExecutor:
-    """Execute validated skills only while the selected window owns foreground focus."""
+    """Execute validated skills through foreground input or directed window messages."""
 
     def __init__(
         self,
@@ -431,43 +653,58 @@ class WindowsMotorExecutor:
         sleeper: Callable[[float], None] = time.sleep,
         max_hold_ms: int = 5_000,
         max_wait_ms: int = 10_000,
+        background: bool = False,
     ) -> None:
         self.session = session
         self.sleeper = sleeper
         self.max_hold_ms = max_hold_ms
         self.max_wait_ms = max_wait_ms
+        self.background = background
 
     def execute(self, action: ActionCall | dict[str, Any]) -> MotorResult:
         call = action if isinstance(action, ActionCall) else ActionCall.from_payload(action)
         started = time.perf_counter()
         position: tuple[int, int] | None = None
-        if call.skill == "focus_window":
+        if call.skill == "focus_window" and not self.background:
             window = self.session.focus()
         else:
-            window = self.session.require_foreground()
-            if call.skill in {"click", "double_click"}:
+            window = (
+                self.session.require_available()
+                if self.background
+                else self.session.require_foreground()
+            )
+            if call.skill == "focus_window":
+                pass
+            elif call.skill in {"click", "double_click"}:
                 position = self.session.normalized_to_screen(
                     window,
                     call.args["x"],
                     call.args["y"],
                 )
-                self.session.backend.set_cursor_position(*position)
+                if not self.background:
+                    self.session.backend.set_cursor_position(*position)
                 clicks = 2 if call.skill == "double_click" else 1
                 for click_index in range(clicks):
-                    self._click(call.args["button"])
+                    self._click(
+                        window,
+                        call.args["x"],
+                        call.args["y"],
+                        call.args["button"],
+                        double=call.skill == "double_click" and click_index == 1,
+                    )
                     if click_index + 1 < clicks:
                         self.sleeper(0.08)
             elif call.skill == "press_key":
-                self._press(call.args["key"])
+                self._press(window, call.args["key"])
             elif call.skill == "hold_key":
                 duration = call.args["duration_ms"]
                 if duration > self.max_hold_ms:
                     raise WindowSafetyError(
                         f"Requested key hold {duration}ms exceeds executor limit {self.max_hold_ms}ms"
                     )
-                self._hold(call.args["key"], duration)
+                self._hold(window, call.args["key"], duration)
             elif call.skill == "hotkey":
-                self._hotkey(call.args["keys"])
+                self._hotkey(window, call.args["keys"])
             elif call.skill == "wait":
                 duration = call.args["duration_ms"]
                 if duration > self.max_wait_ms:
@@ -482,41 +719,74 @@ class WindowsMotorExecutor:
             window_handle=window.handle,
             elapsed_ms=round((time.perf_counter() - started) * 1_000, 3),
             screen_position=position,
+            input_mode="background" if self.background else "foreground",
         )
 
-    def _click(self, button: str) -> None:
-        self.session.backend.send_mouse_button(button, True)
+    def _click(
+        self,
+        window: WindowInfo,
+        x: float,
+        y: float,
+        button: str,
+        *,
+        double: bool = False,
+    ) -> None:
+        if self.background:
+            client_x, client_y = self.session.normalized_to_client(window, x, y)
+            send = lambda is_down: self.session.backend.post_window_mouse_button(
+                window.handle,
+                client_x,
+                client_y,
+                button,
+                is_down,
+                double=double and is_down,
+            )
+        else:
+            send = lambda is_down: self.session.backend.send_mouse_button(button, is_down)
+        send(True)
         try:
             self.sleeper(0.02)
         finally:
-            self.session.backend.send_mouse_button(button, False)
+            send(False)
 
-    def _press(self, key: str) -> None:
+    def _press(self, window: WindowInfo, key: str) -> None:
         virtual_key = virtual_key_for(key)
-        self.session.backend.send_key(virtual_key, True)
+        send = self._key_sender(window)
+        send(virtual_key, True)
         try:
             self.sleeper(0.02)
         finally:
-            self.session.backend.send_key(virtual_key, False)
+            send(virtual_key, False)
 
-    def _hold(self, key: str, duration_ms: int) -> None:
+    def _hold(self, window: WindowInfo, key: str, duration_ms: int) -> None:
         virtual_key = virtual_key_for(key)
-        self.session.backend.send_key(virtual_key, True)
+        send = self._key_sender(window)
+        send(virtual_key, True)
         try:
             self.sleeper(duration_ms / 1_000)
         finally:
-            self.session.backend.send_key(virtual_key, False)
+            send(virtual_key, False)
 
-    def _hotkey(self, keys: list[str]) -> None:
+    def _hotkey(self, window: WindowInfo, keys: list[str]) -> None:
         virtual_keys = [virtual_key_for(key) for key in keys]
+        send = self._key_sender(window)
         pressed: list[int] = []
         try:
             for virtual_key in virtual_keys:
-                self.session.backend.send_key(virtual_key, True)
+                send(virtual_key, True)
                 pressed.append(virtual_key)
         finally:
             for virtual_key in reversed(pressed):
-                self.session.backend.send_key(virtual_key, False)
+                send(virtual_key, False)
+
+    def _key_sender(self, window: WindowInfo) -> Callable[[int, bool], None]:
+        if self.background:
+            return lambda virtual_key, is_down: self.session.backend.post_window_key(
+                window.handle,
+                virtual_key,
+                is_down,
+            )
+        return self.session.backend.send_key
 
 
 def virtual_key_for(key: str) -> int:

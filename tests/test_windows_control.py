@@ -77,6 +77,23 @@ class FakeWindowsBackend:
     def send_key(self, virtual_key: int, is_down: bool) -> None:
         self.events.append(("key", virtual_key, is_down))
 
+    def post_window_mouse_button(
+        self,
+        handle: int,
+        client_x: int,
+        client_y: int,
+        button: str,
+        is_down: bool,
+        *,
+        double: bool = False,
+    ) -> None:
+        self.events.append(
+            ("window_mouse", handle, client_x, client_y, button, is_down, double)
+        )
+
+    def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
+        self.events.append(("window_key", handle, virtual_key, is_down))
+
 
 class FakeDpiSetter:
     def __init__(self) -> None:
@@ -205,6 +222,44 @@ def test_lost_focus_or_minimized_window_blocks_input() -> None:
     backend.windows[7] = replace(window(), is_minimized=True)
     with pytest.raises(WindowSafetyError, match="minimized"):
         executor.execute(ActionCall("focus_window", {}))
+    assert backend.events == []
+
+
+def test_background_executor_targets_window_without_focus_or_cursor_movement() -> None:
+    backend = FakeWindowsBackend([window()], foreground=99)
+    sleeps: list[float] = []
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=sleeps.append,
+        background=True,
+    )
+
+    focus_result = executor.execute(ActionCall("focus_window", {}))
+    click_result = executor.execute(ActionCall("click", {"x": 0.5, "y": 0.25}))
+    executor.execute(ActionCall("press_key", {"key": "w"}))
+
+    assert focus_result.input_mode == "background"
+    assert click_result.screen_position == (300, 250)
+    assert click_result.input_mode == "background"
+    assert backend.foreground == 99
+    assert backend.events == [
+        ("window_mouse", 7, 200, 50, "left", True, False),
+        ("window_mouse", 7, 200, 50, "left", False, False),
+        ("window_key", 7, 0x57, True),
+        ("window_key", 7, 0x57, False),
+    ]
+    assert sleeps == [0.02, 0.02]
+
+
+def test_background_executor_still_rejects_minimized_target() -> None:
+    backend = FakeWindowsBackend([window(minimized=True)], foreground=99)
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        background=True,
+    )
+
+    with pytest.raises(WindowSafetyError, match="minimized"):
+        executor.execute(ActionCall("press_key", {"key": "w"}))
     assert backend.events == []
 
 
