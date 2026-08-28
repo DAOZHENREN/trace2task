@@ -9,7 +9,13 @@ import pygame
 
 from trace2task.windows_capture import capture_window_once
 from trace2task.windows_control import WindowInfo, WindowSelector, WindowSession
-from trace2task.windows_recording import InputSnapshot, WindowRecorder
+from trace2task.windows_recording import (
+    VK_F8,
+    VK_F9,
+    InputSnapshot,
+    Win32InputMonitor,
+    WindowRecorder,
+)
 
 
 def window(handle: int = 7) -> WindowInfo:
@@ -72,6 +78,22 @@ class FakeCapture:
         return surface
 
 
+class FakePollingUser32:
+    def __init__(self) -> None:
+        self.down: set[int] = set()
+
+    def PeekMessageW(self, *_: object) -> bool:
+        return False
+
+    def GetAsyncKeyState(self, virtual_key: int) -> int:
+        return 0x8000 if virtual_key in self.down else 0
+
+    def GetCursorPos(self, pointer: Any) -> bool:
+        pointer._obj.x = 20
+        pointer._obj.y = 30
+        return True
+
+
 class SequenceMonitor:
     def __init__(
         self,
@@ -97,6 +119,31 @@ class SequenceMonitor:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_win32_monitor_falls_back_to_physical_f8_f9_edges() -> None:
+    user32 = FakePollingUser32()
+    monitor = Win32InputMonitor.__new__(Win32InputMonitor)
+    monitor.user32 = user32
+    monitor._started = True
+    monitor._success_key_down = False
+    monitor._cancel_key_down = False
+
+    assert not monitor.poll().success_requested
+
+    user32.down.add(VK_F8)
+    assert monitor.poll().success_requested
+    assert not monitor.poll().success_requested
+
+    user32.down.clear()
+    assert not monitor.poll().success_requested
+    user32.down.add(VK_F8)
+    assert monitor.poll().success_requested
+
+    user32.down = {VK_F8, VK_F9}
+    snapshot = monitor.poll()
+    assert not snapshot.success_requested
+    assert snapshot.cancel_requested
 
 
 class StepClock:

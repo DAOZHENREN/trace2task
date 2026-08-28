@@ -199,6 +199,8 @@ unminimized, and foreground.
 
 - Press `F8` to save a final success frame and finish successfully.
 - Press `F9` to cancel the recording.
+- Recorder controls use both registered global hotkeys and physical key-state edges so GPU games
+  that suppress `WM_HOTKEY` can still finish or cancel a recording.
 - Input is polled but never injected by the recorder.
 - Input from another foreground app is discarded while recording is paused.
 - Mouse events include screen coordinates and target-client normalized coordinates.

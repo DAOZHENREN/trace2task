@@ -88,6 +88,8 @@ class Win32InputMonitor:
         self.user32.GetCursorPos.restype = wintypes.BOOL
         configure_physical_dpi_api(self.user32)
         self._started = False
+        self._success_key_down = False
+        self._cancel_key_down = False
 
     def start(self) -> None:
         if self._started:
@@ -97,6 +99,8 @@ class Win32InputMonitor:
         if not self.user32.RegisterHotKey(None, CANCEL_HOTKEY_ID, MOD_NOREPEAT, VK_F9):
             self.user32.UnregisterHotKey(None, SUCCESS_HOTKEY_ID)
             raise RuntimeError("Could not reserve F9 as the recording-cancel hotkey")
+        self._success_key_down = bool(self.user32.GetAsyncKeyState(VK_F8) & 0x8000)
+        self._cancel_key_down = bool(self.user32.GetAsyncKeyState(VK_F9) & 0x8000)
         self._started = True
 
     def poll(self) -> InputSnapshot:
@@ -116,6 +120,17 @@ class Win32InputMonitor:
                 success_requested = True
             elif message.wParam == CANCEL_HOTKEY_ID:
                 cancel_requested = True
+
+        success_key_down = bool(self.user32.GetAsyncKeyState(VK_F8) & 0x8000)
+        cancel_key_down = bool(self.user32.GetAsyncKeyState(VK_F9) & 0x8000)
+        success_requested = success_requested or (
+            success_key_down and not self._success_key_down
+        )
+        cancel_requested = cancel_requested or (
+            cancel_key_down and not self._cancel_key_down
+        )
+        self._success_key_down = success_key_down
+        self._cancel_key_down = cancel_key_down
 
         keys_down = frozenset(
             key
@@ -144,6 +159,8 @@ class Win32InputMonitor:
             return
         self.user32.UnregisterHotKey(None, SUCCESS_HOTKEY_ID)
         self.user32.UnregisterHotKey(None, CANCEL_HOTKEY_ID)
+        self._success_key_down = False
+        self._cancel_key_down = False
         self._started = False
 
 
