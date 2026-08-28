@@ -448,6 +448,7 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     emergency = FakeEmergencyStop()
     click = ActionCall("click", {"x": 0.5, "y": 0.5})
     agent = ScriptedAgent([_plan(click), _plan(complete=True)])
+    statuses: list[str] = []
 
     result = run_windows_agent(
         _write_taskpack(tmp_path, confirmed=True),
@@ -457,6 +458,7 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
         capture=capture,
         emergency_stop=emergency,
         agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
     )
     metadata = json.loads(
         (Path(result.trace_path).parent / "metadata.json").read_text(encoding="utf-8")
@@ -477,6 +479,8 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     assert agent.observations == [(click, True)]
     assert metadata["success"] is True
     assert metadata["parameterized_action_count"] == 1
+    assert any("Requesting a multimodal decision" in status for status in statuses)
+    assert any("click completed" in status for status in statuses)
 
 
 def test_confirmed_windows_agent_can_execute_in_background_without_focus(

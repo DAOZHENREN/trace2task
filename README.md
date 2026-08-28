@@ -237,6 +237,16 @@ duration. Foreground execution interpolates the physical cursor while holding th
 background execution sends held-button mouse-move messages directly to compatible windows. Both
 paths release the button in a `finally` guard if execution is interrupted.
 
+## Visible batched game execution (v0.5.8)
+
+Foreground keyboard actions use Windows scan-code `SendInput`, which is recognized by more game
+input stacks than virtual-key injection. Windows Agent execution now prints each model request,
+received batch, action start, action completion, and exact failure message as it happens. The
+default plan horizon is four actions so unambiguous adjacent steps can run locally after one model
+decision, while loading screens and uncertain branches still force a new screenshot and replan.
+
+Trace2Task does not attempt to bypass software that deliberately rejects synthetic input.
+
 ## Windows trace compiler (v0.5.3)
 
 Compile the successful Windows recording with the same top-level command:

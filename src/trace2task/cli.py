@@ -129,7 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     windows_agent.add_argument("--task", type=Path, required=True)
     windows_agent.add_argument("--model", default="gpt-5.6-terra")
     windows_agent.add_argument("--codex-bin", default="codex")
-    windows_agent.add_argument("--plan-horizon", type=int, default=1)
+    windows_agent.add_argument(
+        "--plan-horizon",
+        type=int,
+        default=4,
+        help="Maximum locally executed action batch per model decision (default: 4).",
+    )
     windows_agent.add_argument("--max-actions", type=int)
     windows_agent.add_argument("--output", type=Path, default=Path("runs"))
     windows_agent.add_argument(

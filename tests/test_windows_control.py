@@ -11,6 +11,10 @@ from trace2task.actions import (
     parameterized_action_schema,
 )
 from trace2task.windows_control import (
+    KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE,
+    MAPVK_VK_TO_VSC,
+    Win32Backend,
     WindowInfo,
     WindowLookupError,
     WindowSafetyError,
@@ -118,6 +122,12 @@ class FakeDpiApi:
         self.SetThreadDpiAwarenessContext = FakeDpiSetter()
 
 
+class FakeScanCodeApi:
+    def MapVirtualKeyW(self, virtual_key: int, mode: int) -> int:
+        assert mode == MAPVK_VK_TO_VSC
+        return {0x46: 0x21}[virtual_key]
+
+
 def test_physical_dpi_context_switches_and_restores_thread_coordinates() -> None:
     user32 = FakeDpiApi()
 
@@ -127,6 +137,21 @@ def test_physical_dpi_context_switches_and_restores_thread_coordinates() -> None
     calls = user32.SetThreadDpiAwarenessContext.calls
     assert calls[0].value is not None
     assert calls[1] == "previous-context"
+
+
+def test_foreground_keyboard_input_uses_scan_codes_for_game_compatibility() -> None:
+    backend = Win32Backend.__new__(Win32Backend)
+    backend.user32 = FakeScanCodeApi()
+    sent: list[Any] = []
+    backend._send_input = sent.append
+
+    backend.send_key(0x46, True)
+    backend.send_key(0x46, False)
+
+    assert [(item.ki.wVk, item.ki.wScan, item.ki.dwFlags) for item in sent] == [
+        (0, 0x21, KEYEVENTF_SCANCODE),
+        (0, 0x21, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP),
+    ]
 
 
 def test_parameterized_actions_are_normalized_and_strict() -> None:

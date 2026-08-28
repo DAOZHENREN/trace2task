@@ -35,7 +35,7 @@ class CodexWindowsAgent:
         *,
         model: str | None = "gpt-5.6-terra",
         codex_bin: str = "codex",
-        plan_horizon: int = 1,
+        plan_horizon: int = 4,
         timeout_seconds: float = 120,
         background: bool = False,
         binary_resolver: BinaryResolver = resolve_codex_binary,
@@ -119,8 +119,10 @@ class CodexWindowsAgent:
             f"{json.dumps(demonstration, ensure_ascii=False, separators=(',', ':'))}\n"
             f"Recent execution history:\n{history}\n\n"
             "If Image 1 already satisfies the success condition, return task_complete=true and "
-            "no actions. Otherwise return task_complete=false and the smallest safe next action "
-            f"batch, between 1 and {self.plan_horizon} actions. Replan from current pixels rather "
+            "no actions. Otherwise return task_complete=false and a safe next action batch "
+            f"between 1 and {self.plan_horizon} actions. Include multiple adjacent reviewed "
+            "actions when no intermediate visual choice is required, but stop before a loading "
+            "screen, uncertain branch, or state-dependent target. Replan from current pixels rather "
             "than blindly copying recorded coordinates. Never interact outside Image 1. The "
             "response must match the supplied JSON schema."
         )

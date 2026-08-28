@@ -18,6 +18,7 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_SCANCODE = 0x0008
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
@@ -419,11 +420,16 @@ class Win32Backend:
         self._send_input(item)
 
     def send_key(self, virtual_key: int, is_down: bool) -> None:
-        flags = KEYEVENTF_EXTENDEDKEY if virtual_key in EXTENDED_VIRTUAL_KEYS else 0
+        scan_code = int(self.user32.MapVirtualKeyW(virtual_key, MAPVK_VK_TO_VSC))
+        if not scan_code:
+            raise WindowSafetyError(f"Could not map virtual key 0x{virtual_key:02x} to a scan code")
+        flags = KEYEVENTF_SCANCODE
+        if virtual_key in EXTENDED_VIRTUAL_KEYS:
+            flags |= KEYEVENTF_EXTENDEDKEY
         if not is_down:
             flags |= KEYEVENTF_KEYUP
         item = _Input(type=INPUT_KEYBOARD)
-        item.ki = _KeybdInput(virtual_key, 0, flags, 0, 0)
+        item.ki = _KeybdInput(0, scan_code, flags, 0, 0)
         self._send_input(item)
 
     def _send_input(self, item: _Input) -> None:

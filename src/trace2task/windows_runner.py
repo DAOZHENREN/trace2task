@@ -146,7 +146,7 @@ def run_windows_agent(
     execute: bool = False,
     model: str | None = "gpt-5.6-terra",
     codex_bin: str = "codex",
-    plan_horizon: int = 1,
+    plan_horizon: int = 4,
     max_actions: int | None = None,
     output_root: Path = Path("runs"),
     backend: WindowsBackend | None = None,
@@ -155,6 +155,7 @@ def run_windows_agent(
     agent_factory: AgentFactory | None = None,
     background: bool = False,
     focus: bool = False,
+    status_callback: Callable[[str], None] = print,
 ) -> WindowsAgentResult:
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
@@ -188,7 +189,12 @@ def run_windows_agent(
             window = session.focus(timeout_seconds=10) if focus else session.resolve()
             if not window.is_visible or window.is_minimized:
                 raise RuntimeError("Windows Agent target must be visible and unminimized")
+            status_callback("Requesting a multimodal plan; this can take up to 120 seconds...")
             plan = agent.plan(active_capture.capture(window))
+            proposed = ", ".join(action.skill for action in plan.actions) or "complete"
+            status_callback(
+                f"Plan received: {proposed} (confidence {plan.confidence:.2f})."
+            )
             return WindowsAgentResult(
                 mode="windows_agent_dry_run",
                 task_id=contract.task.task_id,
@@ -240,12 +246,23 @@ def run_windows_agent(
                 "input_mode": "background" if background else "foreground",
             },
         )
+        status_callback(
+            "Execution started. Keep the target game in the foreground; press F9 to stop."
+        )
         while executed_actions < action_limit:
             active_emergency.raise_if_requested()
             window = session.require_available() if background else session.require_foreground()
             surface = active_capture.capture(window)
+            status_callback(
+                f"[plan {agent.replans + 1}] Requesting a multimodal decision..."
+            )
             plan = agent.plan(surface)
             last_proposed = [action.to_payload() for action in plan.actions]
+            proposed = ", ".join(action.skill for action in plan.actions) or "complete"
+            status_callback(
+                f"[plan {agent.replans}] Received: {proposed} "
+                f"(confidence {plan.confidence:.2f})."
+            )
             if plan.task_complete:
                 writer.record(
                     "success_marker",
@@ -264,6 +281,9 @@ def run_windows_agent(
                 if executed_actions >= action_limit:
                     break
                 active_emergency.raise_if_requested()
+                status_callback(
+                    f"[action {executed_actions + 1}/{action_limit}] Executing {action.skill}..."
+                )
                 try:
                     motor_result = executor.execute(action)
                 except Exception:
@@ -271,6 +291,10 @@ def run_windows_agent(
                     raise
                 agent.observe_transition(action, True)
                 executed_actions += 1
+                status_callback(
+                    f"[action {executed_actions}/{action_limit}] {action.skill} completed "
+                    f"in {motor_result.elapsed_ms:.0f}ms."
+                )
                 window = (
                     session.require_available() if background else session.require_foreground()
                 )
@@ -291,6 +315,7 @@ def run_windows_agent(
         stop_reason = "emergency_stop"
     except Exception as error:
         stop_reason = f"failed:{type(error).__name__}"
+        status_callback(f"Execution stopped: {type(error).__name__}: {error}")
         if writer is not None:
             writer.finish(
                 success=False,
@@ -298,6 +323,7 @@ def run_windows_agent(
                     "parameterized_action_count": executed_actions,
                     "replans": agent.replans,
                     "stop_reason": stop_reason,
+                    "failure_message": str(error),
                 },
             )
             writer = None
