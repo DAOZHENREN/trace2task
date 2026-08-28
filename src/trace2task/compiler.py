@@ -15,6 +15,7 @@ from trace2task.game import ACTION_DELTAS, SUCCESS_TEXT, WINDOW_SIZE
 from trace2task.recording import make_run_dir
 from trace2task.taskpack import load_taskpack
 from trace2task.vision import VisualVerifier
+from trace2task.windows_compiler import compile_windows_trace
 
 MINI_GAME_ADAPTER = "trace2task.mini_game"
 MINI_GAME_ACTIONS = (*ACTION_DELTAS.keys(), "interact")
@@ -181,7 +182,7 @@ def _copy_reference_bundle(
 
 
 def compile_trace(trace_path: Path, output_root: Path) -> CompileResult:
-    """Compile one verified mini-game demonstration into a reviewable task pack."""
+    """Compile one verified mini-game or Windows demonstration into a task pack."""
 
     source_trace = trace_path.expanduser().resolve()
     if not source_trace.is_file():
@@ -192,6 +193,25 @@ def compile_trace(trace_path: Path, output_root: Path) -> CompileResult:
 
     metadata = _load_mapping(metadata_path, "Trace metadata")
     events = _load_trace_events(source_trace)
+    if metadata.get("source") == "windows_human":
+        windows_result = compile_windows_trace(
+            source_trace,
+            metadata_path.resolve(),
+            metadata,
+            events,
+            output_root,
+        )
+        compiled_task = load_taskpack(windows_result.task_path)
+        return CompileResult(
+            task_id=compiled_task.task_id,
+            task_path=str(windows_result.task_path),
+            report_path=str(windows_result.report_path),
+            source_trace=str(windows_result.source_trace),
+            demonstration_actions=windows_result.demonstration_actions,
+            stages=windows_result.stages,
+            review_status=compiled_task.review_status,
+            requires_confirmation=compiled_task.requires_confirmation,
+        )
     frame_paths = _validate_trace_bundle(source_trace, metadata, events)
     actions = [event["action"] for event in events if isinstance(event.get("action"), str)]
     stages = _infer_stages(events)

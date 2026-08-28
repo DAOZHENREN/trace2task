@@ -85,13 +85,16 @@ Compile one successful recording instead of writing `task.yaml` by hand:
 uv run trace2task compile runs\<successful-human-run>\trace.jsonl
 ```
 
-The compiler validates both `metadata.success` and the final screenshot's visual success signal.
-It then creates a self-contained directory under `taskpacks/generated/` containing:
+The compiler dispatches from the trace source. Mini-game traces require both successful metadata
+and the rendered visual success signal; Windows traces require the human `F8` success marker,
+balanced raw input, and DPI-safe physical coordinates. It then creates a self-contained directory
+under `taskpacks/generated/` containing:
 
 ```text
 <generated-taskpack>/
 ├── task.yaml
 ├── compiler-report.json
+├── demonstration.json       # Windows task packs
 └── reference/
     ├── metadata.json
     ├── trace.jsonl
@@ -110,7 +113,7 @@ actions, compiler report, and final reference frame, then confirm the exact prin
 uv run trace2task confirm taskpacks\generated\<generated-taskpack>\task.yaml
 ```
 
-The confirmed artifact can now drive either agent implementation:
+For a mini-game pack, the confirmed artifact can drive either agent implementation:
 
 ```powershell
 uv run trace2task agent --task taskpacks\generated\<generated-taskpack>\task.yaml --seed 19
@@ -155,7 +158,7 @@ Win32 `SendInput`. Key-up and mouse-up events are sent from `finally` blocks so 
 does not intentionally leave a key or button held.
 
 The existing mini-game agent is not wired to this executor yet. Version 0.5.2 records the raw
-Windows evidence needed for the compiler that will connect them in v0.5.3.
+Windows evidence consumed by the deterministic compiler in v0.5.3.
 
 ## Windows target recording (v0.5.2)
 
@@ -202,9 +205,32 @@ skills:
 }
 ```
 
-Version 0.5.3 will pair these transitions, measure hold durations, recognize clicks/hotkeys, and
-compile them into the parameterized actions introduced in v0.5.1. The v0.4 mini-game compiler
-therefore intentionally rejects Windows recordings for now.
+## Windows trace compiler (v0.5.3)
+
+Compile the successful Windows recording with the same top-level command:
+
+```powershell
+uv run trace2task compile runs\<windows-human-run>\trace.jsonl
+```
+
+The deterministic compiler produces `demonstration.json` and a draft Windows task pack. It:
+
+- pairs every keyboard and mouse `down/up` transition;
+- turns key intervals below 300ms into `press_key` and longer intervals into `hold_key`;
+- recognizes Ctrl/Alt/Shift chords as `hotkey`;
+- recognizes two nearby clicks within 500ms as `double_click`;
+- inserts a bounded `wait` for observed idle gaps of at least 500ms;
+- rejects drags, outside-target clicks, unreleased input, excessive holds, and concurrent gestures
+  that the current motor vocabulary cannot reproduce safely.
+
+Every generated action points back to its source sequence numbers, elapsed-time range, inference
+rule, and evidence frame. The pack deliberately uses a generic instruction and a human-marked
+reference-frame verifier, so it remains a draft until you inspect `task.yaml`,
+`demonstration.json`, and `compiler-report.json`.
+
+Version 0.5.3 compiles and reviews the Windows workflow but does not yet run the general Windows
+Agent loop. External-app execution and reference-region verification are the next integration
+step.
 
 Run the visual agent on that layout and move the target after four actions:
 
@@ -286,8 +312,8 @@ uv run ruff check .
 
 ## Next milestones
 
-- Compile Windows raw input into parameterized skills and add model-assisted semantic labels.
-- Add reference-region verification for generated Windows task packs.
+- Execute confirmed Windows task packs with the multimodal Agent and guarded local motor layer.
+- Add reference-region verification and model-assisted semantic labels for Windows task packs.
 - Infer reusable motor-skill boundaries from longer demonstrations.
 - Add pop-up recovery and changed-obstacle scenarios.
 - Extend the local motor layer from grid moves to reusable desktop/game skills.
