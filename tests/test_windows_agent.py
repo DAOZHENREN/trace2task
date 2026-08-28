@@ -81,11 +81,14 @@ class FakeSession:
         responses: Iterator[dict[str, Any]],
         calls: list[dict[str, Any]],
         model: str | None,
+        reasoning_effort: str,
         cwd: Path,
         timeout_seconds: float,
     ) -> None:
         self.responses = responses
         self.calls = calls
+        self.model = model
+        self.reasoning_effort = reasoning_effort
         self.closed = False
 
     def run_turn(
@@ -177,6 +180,9 @@ class FakeBackend:
     def send_key(self, virtual_key: int, is_down: bool) -> None:
         self.events.append(("key", virtual_key, is_down))
 
+    def send_text(self, text: str) -> None:
+        self.events.append(("text", text))
+
     def post_window_mouse_button(
         self,
         handle: int,
@@ -202,6 +208,9 @@ class FakeBackend:
 
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None:
         self.events.append(("window_key", handle, virtual_key, is_down))
+
+    def post_window_text(self, handle: int, text: str) -> None:
+        self.events.append(("window_text", handle, text))
 
 
 class FakeCapture:
@@ -284,6 +293,8 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     contract = load_windows_task(_write_taskpack(tmp_path))
     agent = CodexWindowsAgent(
         contract,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
         plan_horizon=1,
         binary_resolver=lambda requested: requested,
         session_factory=_session_factory(
@@ -312,8 +323,107 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
     assert "Recorded demonstration" in calls[0]["prompt"]
+    assert sessions[0].model == "gpt-5.6-sol"
+    assert sessions[0].reasoning_effort == "high"
     agent.close()
     assert sessions[0].closed
+
+
+def test_runtime_instruction_treats_trace_as_structural_example(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(_write_taskpack(tmp_path)).with_instruction(
+        "给文件传输助手发送：Trace2Task 测试"
+    )
+    agent = CodexWindowsAgent(
+        contract,
+        plan_horizon=1,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "click",
+                            "args": {"x": 0.25, "y": 0.75, "button": "left"},
+                        }
+                    ],
+                    "reason": "Follow the runtime instruction.",
+                    "confidence": 0.9,
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+
+    prompt = calls[0]["prompt"]
+    assert "Task instruction for this run: 给文件传输助手发送：Trace2Task 测试" in prompt
+    assert "Original demonstration intent:" in prompt
+    assert "structural examples, not literal values to copy" in prompt
+    assert "<runtime-text-N> value is a reserved semantic marker" in prompt
+    agent.close()
+
+
+def test_codex_windows_agent_rejects_literal_runtime_text_marker(tmp_path: Path) -> None:
+    task_path = _write_taskpack(tmp_path)
+    root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    root["actions"].append("type_text")
+    root["demonstration"]["action_count"] = 3
+    task_path.write_text(
+        yaml.safe_dump(root, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    demonstration_path = task_path.parent / "demonstration.json"
+    demonstration = json.loads(demonstration_path.read_text(encoding="utf-8"))
+    demonstration["actions"].append(
+        {
+            "index": 2,
+            "action": {
+                "skill": "type_text",
+                "args": {"text": "<runtime-text-1>"},
+            },
+        }
+    )
+    demonstration_path.write_text(json.dumps(demonstration), encoding="utf-8")
+    agent = CodexWindowsAgent(
+        load_windows_task(task_path).with_instruction("给张三发送：测试"),
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "type_text",
+                            "args": {"text": "<runtime-text-1>"},
+                        }
+                    ],
+                    "reason": "Copied the marker.",
+                    "confidence": 0.5,
+                }
+            ],
+            [],
+            [],
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="reserved runtime-text"):
+        agent.plan(pygame.Surface((100, 50)))
+    agent.close()
+
+
+def test_runtime_instruction_is_single_normalized_parameter(tmp_path: Path) -> None:
+    contract = load_windows_task(_write_taskpack(tmp_path))
+
+    overridden = contract.with_instruction("  给 张三   发送 测试消息  ")
+
+    assert overridden.instruction == "给 张三 发送 测试消息"
+    assert overridden.task.instruction == contract.task.instruction
+    with pytest.raises(ValueError, match="must not be empty"):
+        contract.with_instruction("   ")
 
 
 def test_codex_windows_agent_rejects_skill_outside_taskpack(tmp_path: Path) -> None:
@@ -395,6 +505,8 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     assert backend.events == []
     assert agent.closed
     assert result.input_mode == "foreground"
+    assert result.model == "gpt-5.6-terra"
+    assert result.reasoning_effort == "low"
 
 
 def test_windows_agent_dry_run_can_focus_for_gpu_capture(tmp_path: Path) -> None:

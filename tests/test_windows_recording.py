@@ -67,6 +67,9 @@ class FakeBackend:
     def send_key(self, virtual_key: int, is_down: bool) -> None:
         raise AssertionError("recorder must not send keyboard input")
 
+    def send_text(self, text: str) -> None:
+        raise AssertionError("recorder must not send text input")
+
 
 class FakeCapture:
     def __init__(self) -> None:

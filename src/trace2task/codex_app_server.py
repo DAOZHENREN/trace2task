@@ -13,6 +13,15 @@ from typing import Any, Protocol, TextIO
 
 from trace2task import __version__
 
+CODEX_MODELS = (
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+)
+CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_REASONING_EFFORT = "low"
+
 
 class AppServerTransport(Protocol):
     """Minimal transport boundary used by the persistent Codex session."""
@@ -154,11 +163,18 @@ class CodexAppServerSession:
         codex_executable: str,
         *,
         model: str | None,
+        reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
         cwd: Path,
         timeout_seconds: float = 120,
         transport_factory: TransportFactory = StdioJsonTransport,
     ) -> None:
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(
+                "Codex reasoning effort must be one of "
+                f"{', '.join(CODEX_REASONING_EFFORTS)}"
+            )
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.cwd = cwd.resolve()
         self.timeout_seconds = timeout_seconds
         self._transport = transport_factory(codex_executable)
@@ -225,7 +241,7 @@ class CodexAppServerSession:
                     for current_path in image_paths
                 ),
             ],
-            "effort": "low",
+            "effort": self.reasoning_effort,
             "summary": "none",
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},

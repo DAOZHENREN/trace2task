@@ -11,20 +11,24 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from trace2task.actions import ActionCall, normalize_key
+from trace2task.actions import ActionCall, is_runtime_text_placeholder, normalize_key
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_SCANCODE = 0x0008
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = wintypes.HANDLE(-4)
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+WM_CHAR = 0x0102
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_MOUSEMOVE = 0x0200
+SMTO_BLOCK = 0x0001
+SMTO_ABORTIFHUNG = 0x0002
 CWP_SKIPINVISIBLE = 0x0001
 CWP_SKIPDISABLED = 0x0002
 CWP_SKIPTRANSPARENT = 0x0004
@@ -211,6 +215,10 @@ class WindowsBackend(Protocol):
 
     def send_key(self, virtual_key: int, is_down: bool) -> None: ...
 
+    def send_virtual_key(self, virtual_key: int, is_down: bool) -> None: ...
+
+    def send_text(self, text: str) -> None: ...
+
     def post_window_mouse_button(
         self,
         handle: int,
@@ -231,6 +239,17 @@ class WindowsBackend(Protocol):
     ) -> None: ...
 
     def post_window_key(self, handle: int, virtual_key: int, is_down: bool) -> None: ...
+
+    def post_window_text(self, handle: int, text: str) -> None: ...
+
+    def send_window_key(
+        self,
+        handle: int,
+        virtual_key: int,
+        is_down: bool,
+        *,
+        timeout_ms: int = 1_000,
+    ) -> int: ...
 
 
 class Win32Backend:
@@ -285,6 +304,16 @@ class Win32Backend:
             wintypes.LPARAM,
         ]
         self.user32.PostMessageW.restype = wintypes.BOOL
+        self.user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        self.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
         self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
         self.user32.MapVirtualKeyW.restype = wintypes.UINT
         self.user32.ChildWindowFromPointEx.argtypes = [
@@ -313,8 +342,10 @@ class Win32Backend:
             get_dpi.restype = wintypes.UINT
         configure_physical_dpi_api(self.user32)
         self._posted_key_targets: dict[tuple[int, int], int] = {}
+        self._sent_key_targets: dict[tuple[int, int], int] = {}
         self._posted_mouse_targets: dict[tuple[int, str], tuple[int, int]] = {}
         self._posted_alt_handles: set[int] = set()
+        self._sent_alt_handles: set[int] = set()
 
         self.kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         self.kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -432,6 +463,25 @@ class Win32Backend:
         item.ki = _KeybdInput(0, scan_code, flags, 0, 0)
         self._send_input(item)
 
+    def send_virtual_key(self, virtual_key: int, is_down: bool) -> None:
+        """Send the legacy virtual-key form of SendInput for compatibility probing."""
+        flags = KEYEVENTF_EXTENDEDKEY if virtual_key in EXTENDED_VIRTUAL_KEYS else 0
+        if not is_down:
+            flags |= KEYEVENTF_KEYUP
+        item = _Input(type=INPUT_KEYBOARD)
+        item.ki = _KeybdInput(virtual_key, 0, flags, 0, 0)
+        self._send_input(item)
+
+    def send_text(self, text: str) -> None:
+        """Type Unicode text through SendInput without depending on the active keyboard layout."""
+        for unit in self._utf16_units(text):
+            down = _Input(type=INPUT_KEYBOARD)
+            down.ki = _KeybdInput(0, unit, KEYEVENTF_UNICODE, 0, 0)
+            up = _Input(type=INPUT_KEYBOARD)
+            up.ki = _KeybdInput(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+            self._send_input(down)
+            self._send_input(up)
+
     def _send_input(self, item: _Input) -> None:
         sent = self.user32.SendInput(1, ctypes.byref(item), ctypes.sizeof(_Input))
         if sent != 1:
@@ -538,6 +588,65 @@ class Win32Backend:
             else:
                 self._posted_alt_handles.discard(handle)
 
+    def post_window_text(self, handle: int, text: str) -> None:
+        """Deliver Unicode text to the focused child of a background-compatible window."""
+        target = self._keyboard_target(handle)
+        for unit in self._utf16_units(text):
+            self._post_message(target, WM_CHAR, unit, 1)
+
+    def send_window_key(
+        self,
+        handle: int,
+        virtual_key: int,
+        is_down: bool,
+        *,
+        timeout_ms: int = 1_000,
+    ) -> int:
+        """Synchronously deliver one key transition to the focused target HWND."""
+        if not 1 <= timeout_ms <= 10_000:
+            raise ValueError("Window-message timeout must be between 1 and 10000ms")
+        key = (handle, virtual_key)
+        if is_down:
+            target = self._keyboard_target(handle)
+            self._sent_key_targets[key] = target
+        else:
+            target = self._sent_key_targets.pop(key, None)
+            if target is None:
+                target = self._keyboard_target(handle)
+        scan_code = int(self.user32.MapVirtualKeyW(virtual_key, MAPVK_VK_TO_VSC))
+        flags = 1 | (scan_code << 16)
+        if virtual_key in EXTENDED_VIRTUAL_KEYS:
+            flags |= 1 << 24
+        is_alt = virtual_key == VK_CODES["alt"]
+        is_system = is_alt or handle in self._sent_alt_handles
+        if is_system:
+            flags |= 1 << 29
+        if not is_down:
+            flags |= (1 << 30) | (1 << 31)
+        message = (
+            WM_SYSKEYDOWN
+            if is_system and is_down
+            else WM_SYSKEYUP
+            if is_system
+            else WM_KEYDOWN
+            if is_down
+            else WM_KEYUP
+        )
+        try:
+            self._send_message(target, message, virtual_key, flags, timeout_ms)
+        except Exception:
+            if is_down:
+                self._sent_key_targets.pop(key, None)
+            elif is_alt:
+                self._sent_alt_handles.discard(handle)
+            raise
+        if is_alt:
+            if is_down:
+                self._sent_alt_handles.add(handle)
+            else:
+                self._sent_alt_handles.discard(handle)
+        return target
+
     def _deepest_child_at(
         self,
         handle: int,
@@ -597,9 +706,45 @@ class Win32Backend:
             raise ctypes.WinError(error)
         raise RuntimeError(f"Could not post Windows message 0x{message:04x} to {handle}")
 
+    def _send_message(
+        self,
+        handle: int,
+        message: int,
+        wparam: int,
+        lparam: int,
+        timeout_ms: int,
+    ) -> int:
+        result = ctypes.c_size_t()
+        ctypes.set_last_error(0)
+        delivered = self.user32.SendMessageTimeoutW(
+            wintypes.HWND(handle),
+            message,
+            wparam,
+            lparam,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
+            timeout_ms,
+            ctypes.byref(result),
+        )
+        if delivered:
+            return int(result.value)
+        error = ctypes.get_last_error()
+        if error:
+            raise ctypes.WinError(error)
+        raise TimeoutError(
+            f"Window did not process message 0x{message:04x} within {timeout_ms}ms"
+        )
+
     @staticmethod
     def _pack_client_point(x: int, y: int) -> int:
         return (x & 0xFFFF) | ((y & 0xFFFF) << 16)
+
+    @staticmethod
+    def _utf16_units(text: str) -> tuple[int, ...]:
+        encoded = text.encode("utf-16-le")
+        return tuple(
+            int.from_bytes(encoded[index : index + 2], "little")
+            for index in range(0, len(encoded), 2)
+        )
 
 
 class WindowSession:
@@ -764,6 +909,15 @@ class WindowsMotorExecutor:
                     call.args["end_y"],
                 )
                 self._drag(window, call)
+            elif call.skill == "type_text":
+                if is_runtime_text_placeholder(call.args["text"]):
+                    raise WindowSafetyError(
+                        "A runtime-text demonstration marker must be resolved before execution"
+                    )
+                if self.background:
+                    self.session.backend.post_window_text(window.handle, call.args["text"])
+                else:
+                    self.session.backend.send_text(call.args["text"])
             elif call.skill == "press_key":
                 self._press(window, call.args["key"])
             elif call.skill == "hold_key":
@@ -939,3 +1093,109 @@ def list_window_records(
         )
         windows = [window for window in windows if selector.matches(window)]
     return {"count": len(windows), "windows": [asdict(window) for window in windows]}
+
+
+def probe_window_key(
+    selector: WindowSelector,
+    key: str,
+    *,
+    method: str = "send-message",
+    hold_ms: int = 500,
+    settle_seconds: float = 1.0,
+    timeout_ms: int = 1_000,
+    backend: WindowsBackend | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Test one keyboard delivery path without changing the Agent input path."""
+    if method not in {"send-message", "send-input-vk"}:
+        raise ValueError(f"Unsupported input probe method: {method}")
+    if not 1 <= hold_ms <= 5_000:
+        raise ValueError("Probe key hold must be between 1 and 5000ms")
+    if not 0 <= settle_seconds <= 10:
+        raise ValueError("Probe settle time must be between 0 and 10 seconds")
+    active_backend = backend or Win32Backend()
+    session = WindowSession(selector, active_backend)
+    window = session.focus(timeout_seconds=10, sleeper=sleeper)
+    if settle_seconds:
+        sleeper(settle_seconds)
+    window = session.require_foreground()
+    virtual_key = virtual_key_for(key)
+    if method == "send-message":
+        input_target = active_backend.send_window_key(
+            window.handle,
+            virtual_key,
+            True,
+            timeout_ms=timeout_ms,
+        )
+        try:
+            sleeper(hold_ms / 1_000)
+        finally:
+            active_backend.send_window_key(
+                window.handle,
+                virtual_key,
+                False,
+                timeout_ms=timeout_ms,
+            )
+        delivery_note = (
+            "Delivered means Windows processed both messages; the app may still ignore them."
+        )
+    else:
+        input_target = window.handle
+        active_backend.send_virtual_key(virtual_key, True)
+        try:
+            sleeper(hold_ms / 1_000)
+        finally:
+            active_backend.send_virtual_key(virtual_key, False)
+        delivery_note = (
+            "SendInput accepted both transitions; the app may still ignore synthetic input."
+        )
+    return {
+        "method": method,
+        "key": normalize_key(key),
+        "virtual_key": f"0x{virtual_key:02X}",
+        "hold_ms": hold_ms,
+        "message_timeout_ms": timeout_ms,
+        "window_handle": window.handle,
+        "input_target_handle": input_target,
+        "foreground_verified": True,
+        "delivered": True,
+        "note": delivery_note,
+    }
+
+
+def probe_window_mouse_button(
+    selector: WindowSelector,
+    button: str,
+    *,
+    hold_ms: int = 120,
+    settle_seconds: float = 1.0,
+    backend: WindowsBackend | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Test foreground SendInput mouse-button delivery without moving the cursor."""
+    if button not in MOUSE_FLAGS:
+        raise ValueError(f"Unsupported mouse probe button: {button}")
+    if not 1 <= hold_ms <= 5_000:
+        raise ValueError("Probe mouse hold must be between 1 and 5000ms")
+    if not 0 <= settle_seconds <= 10:
+        raise ValueError("Probe settle time must be between 0 and 10 seconds")
+    active_backend = backend or Win32Backend()
+    session = WindowSession(selector, active_backend)
+    window = session.focus(timeout_seconds=10, sleeper=sleeper)
+    if settle_seconds:
+        sleeper(settle_seconds)
+    window = session.require_foreground()
+    active_backend.send_mouse_button(button, True)
+    try:
+        sleeper(hold_ms / 1_000)
+    finally:
+        active_backend.send_mouse_button(button, False)
+    return {
+        "method": "send-input-mouse",
+        "button": button,
+        "hold_ms": hold_ms,
+        "input_target_handle": window.handle,
+        "foreground_verified": True,
+        "delivered": True,
+        "note": "SendInput accepted both transitions; verify the action inside the app.",
+    }

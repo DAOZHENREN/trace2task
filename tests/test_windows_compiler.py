@@ -166,6 +166,48 @@ def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
     assert len(list((task_path.parent / "reference" / "frames").glob("*.png"))) == 14
 
 
+def test_windows_compiler_declares_messaging_generalization_capabilities(
+    tmp_path: Path,
+) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    metadata["capability_profile"] = "messaging"
+    events[11]["elapsed_ms"] = 700
+    events[11]["details"]["raw_input"]["key"] = "e"
+    events[12]["elapsed_ms"] = 800
+    events[12]["details"]["raw_input"]["key"] = "e"
+    start, success = events[0], events[-1]
+    inputs = sorted(events[1:-1], key=lambda event: event["elapsed_ms"])
+    events = [start, *inputs, success]
+    for seq, event in enumerate(events):
+        event["seq"] = seq
+    _rewrite_bundle(trace_path, events, metadata)
+
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    task = load_taskpack(Path(result.task_path))
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    demonstration = json.loads(
+        (Path(result.task_path).parent / "demonstration.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    text_actions = [
+        item["action"]
+        for item in demonstration["actions"]
+        if item["action"]["skill"] == "type_text"
+    ]
+
+    assert {"type_text", "press_key", "hotkey"}.issubset(task.actions)
+    assert {"type_text", "press_key", "hotkey"}.issubset(
+        report["inference"]["declared_actions"]
+    )
+    assert report["inference"]["capability_profile"] == "messaging"
+    assert "type_text" in report["inference"]["observed_actions"]
+    assert report["inference"]["runtime_text_bursts"] == 1
+    assert text_actions == [
+        {"skill": "type_text", "args": {"text": "<runtime-text-1>"}}
+    ]
+
+
 def test_windows_compiler_rejects_pre_dpi_fix_recording(tmp_path: Path) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
     metadata.pop("coordinate_space")

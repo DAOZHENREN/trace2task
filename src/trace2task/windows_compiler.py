@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 from trace2task import __version__
-from trace2task.actions import ActionCall
+from trace2task.actions import ActionCall, runtime_text_placeholder
 from trace2task.recording import make_run_dir
 from trace2task.taskpack import load_taskpack
 
@@ -29,6 +29,12 @@ MAX_MOUSE_DRAG_MS = 5_000
 DOUBLE_CLICK_GAP_MS = 500
 POINTER_JITTER_TOLERANCE = 0.02
 MODIFIER_KEYS = {"alt", "ctrl", "shift"}
+COMMAND_MODIFIER_KEYS = {"alt", "ctrl"}
+MESSAGING_TEXT_KEYS = {
+    *"abcdefghijklmnopqrstuvwxyz0123456789",
+    "backspace",
+    "space",
+}
 
 
 @dataclass(frozen=True)
@@ -298,11 +304,20 @@ def _overlap(first: _InputInterval, second: _InputInterval) -> bool:
 def _reject_unsupported_concurrency(
     keys: list[_InputInterval],
     buttons: list[_InputInterval],
+    *,
+    allowed_non_modifier_overlap_ids: set[int] | None = None,
 ) -> None:
+    allowed_non_modifier_overlap_ids = allowed_non_modifier_overlap_ids or set()
     non_modifiers = [item for item in keys if item.name not in MODIFIER_KEYS]
     for index, first in enumerate(non_modifiers):
         for second in non_modifiers[index + 1 :]:
-            if _overlap(first, second):
+            if (
+                _overlap(first, second)
+                and not {
+                    id(first),
+                    id(second),
+                }.issubset(allowed_non_modifier_overlap_ids)
+            ):
                 raise ValueError(
                     "Concurrent non-modifier keys require a parallel-hold motor skill"
                 )
@@ -355,6 +370,101 @@ def _compile_mouse(intervals: list[_InputInterval]) -> list[_TimedAction]:
                 source_seqs=(interval.start.seq, interval.end.seq),
                 evidence_frame=interval.end.frame,
                 inference=inference,
+            )
+        )
+    return actions
+
+
+def _classify_messaging_keyboard(
+    intervals: list[_InputInterval],
+) -> tuple[list[_InputInterval], list[_InputInterval], list[_InputInterval]]:
+    command_modifiers = [
+        item for item in intervals if item.name in COMMAND_MODIFIER_KEYS
+    ]
+    text_intervals = [
+        item
+        for item in intervals
+        if item.name in MESSAGING_TEXT_KEYS
+        and not any(_overlap(item, modifier) for modifier in command_modifiers)
+    ]
+    text_ids = {id(item) for item in text_intervals}
+    text_shifts = [
+        item
+        for item in intervals
+        if item.name == "shift"
+        and any(_overlap(item, text) for text in text_intervals)
+    ]
+    consumed_ids = text_ids | {id(item) for item in text_shifts}
+    control_intervals = [item for item in intervals if id(item) not in consumed_ids]
+    return text_intervals, text_shifts, control_intervals
+
+
+def _compile_runtime_text_bursts(
+    text_intervals: list[_InputInterval],
+    text_shifts: list[_InputInterval],
+    boundary_actions: list[_TimedAction],
+) -> list[_TimedAction]:
+    ordered = sorted(
+        text_intervals,
+        key=lambda item: (item.start.elapsed_ms, item.start.seq),
+    )
+    if not ordered:
+        return []
+    boundary_starts = sorted(action.start_ms for action in boundary_actions)
+    groups: list[list[_InputInterval]] = []
+    current = [ordered[0]]
+    current_end = ordered[0].end.elapsed_ms
+    for interval in ordered[1:]:
+        has_boundary = any(
+            current_end <= boundary_start <= interval.start.elapsed_ms
+            for boundary_start in boundary_starts
+        )
+        if has_boundary:
+            groups.append(current)
+            current = [interval]
+        else:
+            current.append(interval)
+        current_end = max(current_end, interval.end.elapsed_ms)
+    groups.append(current)
+
+    actions: list[_TimedAction] = []
+    for index, group in enumerate(groups, start=1):
+        related_shifts = [
+            shift
+            for shift in text_shifts
+            if any(_overlap(shift, interval) for interval in group)
+        ]
+        evidence = max(
+            group,
+            key=lambda item: (item.end.elapsed_ms, item.end.seq),
+        ).end
+        source_seqs = tuple(
+            sorted(
+                {
+                    seq
+                    for interval in [*group, *related_shifts]
+                    for seq in (interval.start.seq, interval.end.seq)
+                }
+            )
+        )
+        actions.append(
+            _TimedAction(
+                action=ActionCall(
+                    "type_text",
+                    {"text": runtime_text_placeholder(index)},
+                ),
+                start_ms=min(
+                    interval.start.elapsed_ms for interval in [*group, *related_shifts]
+                ),
+                end_ms=max(
+                    interval.end.elapsed_ms for interval in [*group, *related_shifts]
+                ),
+                source_seqs=source_seqs,
+                evidence_frame=evidence.frame,
+                inference=(
+                    "messaging_keyboard_burst_with_runtime_instruction_value_"
+                    f"{index}"
+                ),
             )
         )
     return actions
@@ -426,10 +536,30 @@ def _insert_waits(actions: list[_TimedAction]) -> list[_TimedAction]:
 
 def _compile_actions(
     raw_events: list[_RawInputEvent],
+    *,
+    capability_profile: str | None = None,
 ) -> tuple[list[_TimedAction], list[_RawInputEvent]]:
     key_intervals, mouse_intervals, ignored_releases = _pair_input_intervals(raw_events)
-    _reject_unsupported_concurrency(key_intervals, mouse_intervals)
-    actions = [*_compile_keyboard(key_intervals), *_compile_mouse(mouse_intervals)]
+    mouse_actions = _compile_mouse(mouse_intervals)
+    if capability_profile == "messaging":
+        text_intervals, text_shifts, control_intervals = _classify_messaging_keyboard(
+            key_intervals
+        )
+        _reject_unsupported_concurrency(
+            key_intervals,
+            mouse_intervals,
+            allowed_non_modifier_overlap_ids={id(item) for item in text_intervals},
+        )
+        control_actions = _compile_keyboard(control_intervals)
+        text_actions = _compile_runtime_text_bursts(
+            text_intervals,
+            text_shifts,
+            [*control_actions, *mouse_actions],
+        )
+        actions = [*control_actions, *text_actions, *mouse_actions]
+    else:
+        _reject_unsupported_concurrency(key_intervals, mouse_intervals)
+        actions = [*_compile_keyboard(key_intervals), *mouse_actions]
     actions.sort(key=lambda item: (item.start_ms, item.source_seqs))
     return _insert_waits(_merge_double_clicks(actions)), ignored_releases
 
@@ -459,14 +589,27 @@ def compile_windows_trace(
     """Compile one successful Windows demonstration into deterministic motor skills."""
 
     frame_paths, raw_events = _validate_windows_trace(source_trace, metadata, events)
-    inferred, ignored_releases = _compile_actions(raw_events)
+    initial_window = metadata.get("initial_window")
+    if not isinstance(initial_window, dict):
+        raise TypeError("Windows trace metadata has no initial_window object")
+    process_hint = initial_window.get("process_name")
+    capability_profile = metadata.get("capability_profile")
+    if (
+        capability_profile is None
+        and isinstance(process_hint, str)
+        and process_hint.casefold() in {"weixin.exe", "wechat.exe"}
+    ):
+        capability_profile = "messaging"
+    if capability_profile not in {None, "messaging"}:
+        raise ValueError(f"Unsupported Windows capability profile: {capability_profile!r}")
+    inferred, ignored_releases = _compile_actions(
+        raw_events,
+        capability_profile=capability_profile,
+    )
     if not inferred:
         raise ValueError("Windows trace did not produce any supported motor actions")
     task_id = str(metadata["task_id"]).strip()
     success_hotkey = str(metadata.get("success_hotkey") or "f8").upper()
-    initial_window = metadata.get("initial_window")
-    if not isinstance(initial_window, dict):
-        raise TypeError("Windows trace metadata has no initial_window object")
     process_name = initial_window.get("process_name")
     title = initial_window.get("title")
     if not isinstance(process_name, str) or not process_name:
@@ -522,6 +665,14 @@ def compile_windows_trace(
     observed_skills = list(
         dict.fromkeys(item["action"]["skill"] for item in demonstration)
     )
+    declared_skills = list(observed_skills)
+    if capability_profile == "messaging" or process_name.casefold() in {
+        "weixin.exe",
+        "wechat.exe",
+    }:
+        for skill in ("type_text", "press_key", "hotkey"):
+            if skill not in declared_skills:
+                declared_skills.append(skill)
     final_frame = f"reference/{events[-1]['frame']}"
     stages = [
         {
@@ -565,7 +716,7 @@ def compile_windows_trace(
             "height": height,
             "coordinate_space": "physical_pixels",
         },
-        "actions": observed_skills,
+        "actions": declared_skills,
         "demonstration": {"path": "demonstration.json", "action_count": len(demonstration)},
         "verifier": {
             "type": "reviewed_reference_frame",
@@ -587,6 +738,10 @@ def compile_windows_trace(
                 "Confirm every compiled parameterized action and inferred wait.",
                 "Confirm that the final reference frame proves success.",
                 "Confirm that the process and title selector identify only the intended target.",
+                (
+                    "Resolve every <runtime-text-N> marker from the current run instruction; "
+                    "never type the marker literally."
+                ),
             ],
         },
     }
@@ -619,7 +774,14 @@ def compile_windows_trace(
             "instruction_source": "generic deterministic Windows template",
             "adapter": WINDOWS_ADAPTER,
             "target": task_data["environment"]["target"],
-            "declared_actions": observed_skills,
+            "declared_actions": declared_skills,
+            "observed_actions": observed_skills,
+            "capability_profile": capability_profile,
+            "runtime_text_bursts": sum(
+                1
+                for item in demonstration
+                if item["action"]["skill"] == "type_text"
+            ),
             "action_counts": counts,
             "demonstration": "demonstration.json",
             "thresholds_ms": {
@@ -656,6 +818,13 @@ def compile_windows_trace(
             "Idle gaps above the threshold are waits capped at ten seconds.",
             f"The {success_hotkey} success marker is human evidence and still requires visual review.",
             "Unmatched release events are ignored and listed in the compiler report.",
+            (
+                "Messaging keyboard bursts are structural text-entry evidence. Their literal IME "
+                "output is unavailable, so reserved placeholders must be resolved from the runtime "
+                "instruction and current field context."
+            )
+            if capability_profile == "messaging"
+            else "No messaging-specific text inference was requested.",
             (
                 "Unsupported concurrent input, outside-target mouse input, unreleased input, and "
                 "excessive holds or drags fail closed."

@@ -20,6 +20,25 @@ class WindowsTaskContract:
     selector: WindowSelector
     demonstration: tuple[ActionCall, ...]
     reference_frame: Path
+    runtime_instruction: str | None = None
+
+    @property
+    def instruction(self) -> str:
+        return self.runtime_instruction or self.task.instruction
+
+    def with_instruction(self, instruction: str) -> WindowsTaskContract:
+        normalized = " ".join(instruction.split())
+        if not normalized:
+            raise ValueError("Runtime instruction must not be empty")
+        if len(normalized) > 2_000:
+            raise ValueError("Runtime instruction must not exceed 2000 characters")
+        return WindowsTaskContract(
+            task=self.task,
+            selector=self.selector,
+            demonstration=self.demonstration,
+            reference_frame=self.reference_frame,
+            runtime_instruction=normalized,
+        )
 
 
 def _mapping(value: object, field: str) -> dict[str, Any]:

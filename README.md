@@ -49,6 +49,53 @@ To watch the comparison:
 uv run trace2task demo --show
 ```
 
+## Local web console (v0.5.9)
+
+Version 0.5.9 adds a loopback-only browser console for routine testing. Double-click
+`start-console.cmd`, or start it once from a terminal:
+
+```powershell
+uv run trace2task web
+```
+
+The console opens at `http://127.0.0.1:8765/`. Its only business input is one natural-language
+instruction, such as `给文件传输助手发送：Trace2Task 网页控制台测试`. The selected task pack remains
+the reviewed demonstration experience: its original wording, action sequence, and reference frame
+are structural hints rather than literal names, text, or coordinates to replay.
+
+- **只生成计划** captures the selected target and asks the Agent for a read-only plan.
+- **模型 / 思考强度** selects the Codex model and reasoning effort for this run. Terra + low
+  remains the default; Sol prioritizes capability, Luna prioritizes speed, and higher effort can
+  improve difficult visual planning at the cost of a longer wait.
+- **开始执行** requires a confirmed task pack, shows an explicit confirmation, and retains F9 as
+  the emergency stop.
+- **录制经验** lists visible local windows, starts a human demonstration, and uses `F8` to mark
+  success or `F9` to cancel. A successful trace is compiled automatically into a draft task pack.
+- **本地经验** lists both task packs and raw recordings. It can open their folders in Explorer,
+  confirm reviewed drafts, and upgrade legacy WeChat examples with reusable messaging actions.
+- Only one desktop-control job can run at a time. Job state and progress logs are polled in the
+  browser while the Python service owns execution.
+- The server always binds to `127.0.0.1`; it has no LAN-facing mode or remote authentication.
+
+The console detects legacy WeChat demonstrations that lack a text-entry motor skill. Those packs
+remain available for planning, but execution is disabled until the template is upgraded; this
+prevents a free-form message instruction from silently degrading into coordinate-only clicks.
+The added `type_text` motor skill accepts bounded Unicode text, including Chinese and emoji, and
+injects it independently of the active keyboard layout. It intentionally rejects newlines and does
+not press Enter: sending or submitting remains a separate, screenshot-verified Agent step.
+
+Messaging recordings are compiled semantically rather than as literal keyboard replay. Fast Pinyin
+typing often contains harmless key rollover, so the compiler groups each text-entry burst into a
+reserved `<runtime-text-N>` demonstration marker while preserving clicks, control keys, timing, and
+visual evidence. At run time the Agent must resolve each marker from the one natural-language
+instruction and the visibly focused field. Both the planner and motor executor reject an unresolved
+marker, so it can never be typed literally. A saved recording can also be retried from **本地经验 →
+编译为经验** without recording again.
+
+If recording succeeds but automatic compilation fails for another reason, the console now reports
+**录制成功** and keeps the raw trace, while showing the compilation error separately instead of
+mislabeling the entire recording as failed.
+
 `demo --show` is an automatic comparison; it intentionally ignores manual WASD input. Use
 the `record` command below for keyboard control.
 
@@ -246,6 +293,45 @@ default plan horizon is four actions so unambiguous adjacent steps can run local
 decision, while loading screens and uncertain branches still force a new screenshot and replan.
 
 Trace2Task does not attempt to bypass software that deliberately rejects synthetic input.
+
+### Synchronous window-message input probe
+
+When physical keyboard input works but the normal foreground scan-code path and background
+`PostMessage` path do not, test the remaining synchronous HWND-message variant in isolation:
+
+```powershell
+uv run trace2task windows input-probe `
+  --process "NRC-Win64-Shipping.exe" `
+  --key f `
+  --hold-ms 650
+```
+
+If keyboard synthesis is ignored but foreground mouse input works, temporarily bind the target
+game action to the middle mouse button and test that distinct input route:
+
+```powershell
+uv run trace2task windows input-probe `
+  --process "NRC-Win64-Shipping.exe" `
+  --method send-input-mouse `
+  --button middle `
+  --hold-ms 120
+```
+
+The command focuses the selected window, waits one second, resolves its focused child HWND, and
+sends paired `WM_KEYDOWN`/`WM_KEYUP` messages through `SendMessageTimeoutW`. A successful result
+means Windows processed the messages; it does not prove that a game accepted the action. This
+diagnostic does not change the Windows Agent's normal input method.
+
+The next low-cost compatibility probe uses the virtual-key form of foreground `SendInput`
+instead of scan codes:
+
+```powershell
+uv run trace2task windows input-probe `
+  --process "NRC-Win64-Shipping.exe" `
+  --method send-input-vk `
+  --key f `
+  --hold-ms 650
+```
 
 ## Windows trace compiler (v0.5.3)
 

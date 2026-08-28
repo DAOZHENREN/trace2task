@@ -6,13 +6,17 @@ from dataclasses import asdict
 from pathlib import Path
 
 from trace2task import __version__
+from trace2task.codex_app_server import CODEX_REASONING_EFFORTS
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
+from trace2task.web_console import serve_web_console
 from trace2task.windows_capture import GdiWindowCapture, capture_window_once
 from trace2task.windows_control import (
     Win32Backend,
     WindowSelector,
     list_window_records,
+    probe_window_key,
+    probe_window_mouse_button,
 )
 from trace2task.windows_recording import (
     CONTROL_KEY_CODES,
@@ -49,6 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    web_console = subparsers.add_parser(
+        "web",
+        help="Open the local browser control console.",
+    )
+    web_console.add_argument("--port", type=int, default=8765)
+    web_console.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Start the server without opening the default browser.",
+    )
 
     record = subparsers.add_parser("record", help="Record a human demonstration.")
     record.add_argument("--seed", type=int, default=7)
@@ -122,12 +137,54 @@ def build_parser() -> argparse.ArgumentParser:
         default="f9",
         help="Key that cancels recording (default: f9).",
     )
+    windows_probe = windows_subparsers.add_parser(
+        "input-probe",
+        help="Test one explicit Windows input delivery method against a target.",
+    )
+    _add_window_selector(windows_probe)
+    windows_probe.add_argument(
+        "--method",
+        choices=("send-message", "send-input-vk", "send-input-mouse"),
+        default="send-message",
+        help="Input delivery method to test.",
+    )
+    windows_probe.add_argument("--key", default="f", help="Keyboard key to test (default: f).")
+    windows_probe.add_argument(
+        "--button",
+        choices=("left", "right", "middle"),
+        default="middle",
+        help="Mouse button for send-input-mouse (default: middle).",
+    )
+    windows_probe.add_argument(
+        "--hold-ms",
+        type=int,
+        default=500,
+        help="How long to hold the test key or button (default: 500ms).",
+    )
+    windows_probe.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=1.0,
+        help="Delay after focusing the target before sending input (default: 1s).",
+    )
+    windows_probe.add_argument(
+        "--message-timeout-ms",
+        type=int,
+        default=1_000,
+        help="Per-message hang timeout (default: 1000ms).",
+    )
     windows_agent = windows_subparsers.add_parser(
         "agent",
         help="Plan or explicitly execute a confirmed Windows task pack.",
     )
     windows_agent.add_argument("--task", type=Path, required=True)
     windows_agent.add_argument("--model", default="gpt-5.6-terra")
+    windows_agent.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="low",
+        help="Model reasoning depth (default: low).",
+    )
     windows_agent.add_argument("--codex-bin", default="codex")
     windows_agent.add_argument(
         "--plan-horizon",
@@ -201,6 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "web":
+        serve_web_console(port=args.port, open_browser=not args.no_open)
+        return 0
     if args.command == "record":
         result = record_human(args.seed, args.output)
     elif args.command == "replay":
@@ -246,6 +306,28 @@ def main(argv: list[str] | None = None) -> int:
                     cancel_key=args.cancel_key,
                 ),
             )
+        elif args.windows_command == "input-probe":
+            print("Waiting up to 10 seconds for the target to become foreground...")
+            selector = _window_selector_from_args(args)
+            backend = Win32Backend()
+            if args.method == "send-input-mouse":
+                result = probe_window_mouse_button(
+                    selector,
+                    args.button,
+                    hold_ms=args.hold_ms,
+                    settle_seconds=args.settle_seconds,
+                    backend=backend,
+                )
+            else:
+                result = probe_window_key(
+                    selector,
+                    args.key,
+                    method=args.method,
+                    hold_ms=args.hold_ms,
+                    settle_seconds=args.settle_seconds,
+                    timeout_ms=args.message_timeout_ms,
+                    backend=backend,
+                )
         else:
             if args.focus or (args.execute and not args.background):
                 print("Waiting up to 10 seconds for the target to become foreground...")
@@ -253,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.task,
                 execute=args.execute,
                 model=args.model,
+                reasoning_effort=args.reasoning_effort,
                 codex_bin=args.codex_bin,
                 plan_horizon=args.plan_horizon,
                 max_actions=args.max_actions,

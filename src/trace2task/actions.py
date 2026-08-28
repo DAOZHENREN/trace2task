@@ -8,6 +8,7 @@ WINDOWS_MOTOR_SKILLS = (
     "click",
     "double_click",
     "drag",
+    "type_text",
     "press_key",
     "hold_key",
     "hotkey",
@@ -36,6 +37,23 @@ SPECIAL_KEYS = {
     *(f"f{number}" for number in range(1, 13)),
 }
 MOUSE_BUTTONS = {"left", "middle", "right"}
+MAX_TEXT_LENGTH = 500
+RUNTIME_TEXT_PLACEHOLDER_PREFIX = "<runtime-text-"
+
+
+def runtime_text_placeholder(index: int) -> str:
+    """Return a reserved demonstration-only marker for runtime instruction text."""
+
+    if not isinstance(index, int) or isinstance(index, bool) or index <= 0:
+        raise ValueError("Runtime text placeholder index must be a positive integer")
+    return f"{RUNTIME_TEXT_PLACEHOLDER_PREFIX}{index}>"
+
+
+def is_runtime_text_placeholder(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith(RUNTIME_TEXT_PLACEHOLDER_PREFIX):
+        return False
+    suffix = value.removeprefix(RUNTIME_TEXT_PLACEHOLDER_PREFIX)
+    return suffix.endswith(">") and suffix[:-1].isdigit() and int(suffix[:-1]) > 0
 
 
 class ActionValidationError(ValueError):
@@ -151,6 +169,20 @@ class ActionCall:
                 "duration_ms": _duration(args["duration_ms"], maximum=5_000, skill=self.skill),
                 "button": button.casefold(),
             }
+        if self.skill == "type_text":
+            _require_exact_args(self.skill, args, required={"text"})
+            text = args["text"]
+            if not isinstance(text, str) or not text.strip():
+                raise ActionValidationError("Skill 'type_text' requires non-empty text")
+            if len(text) > MAX_TEXT_LENGTH:
+                raise ActionValidationError(
+                    f"Skill 'type_text' text must not exceed {MAX_TEXT_LENGTH} characters"
+                )
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in text):
+                raise ActionValidationError(
+                    "Skill 'type_text' does not allow control characters or newlines"
+                )
+            return {"text": text}
         if self.skill == "press_key":
             _require_exact_args(self.skill, args, required={"key"})
             return {"key": normalize_key(args["key"])}
@@ -249,6 +281,16 @@ def parameterized_action_schema(
                     "duration_ms",
                     "button",
                 ],
+            },
+        ),
+        "type_text": action_schema(
+            "type_text",
+            {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH}
+                },
+                "required": ["text"],
             },
         ),
         "press_key": action_schema(

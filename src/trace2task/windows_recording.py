@@ -216,6 +216,7 @@ class WindowRecorder:
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         status_callback: Callable[[str], None] = print,
+        capability_profile: str | None = None,
     ) -> None:
         if poll_hz <= 0:
             raise ValueError("poll_hz must be positive")
@@ -229,6 +230,9 @@ class WindowRecorder:
         self.clock = clock
         self.sleeper = sleeper
         self.status_callback = status_callback
+        if capability_profile not in {None, "messaging"}:
+            raise ValueError(f"Unsupported recording capability profile: {capability_profile}")
+        self.capability_profile = capability_profile
 
     def record(self, *, task_id: str, output_root: Path) -> WindowRecordResult:
         if not task_id.strip():
@@ -360,6 +364,7 @@ class WindowRecorder:
                 "coordinate_space": "physical_pixels",
                 "success_hotkey": success_key,
                 "cancel_hotkey": cancel_key,
+                "capability_profile": self.capability_profile,
             },
         )
         return WindowRecordResult(
@@ -465,6 +470,8 @@ def record_window_trace(
     backend: WindowsBackend,
     capture: WindowFrameCapture,
     monitor: InputMonitor,
+    status_callback: Callable[[str], None] = print,
+    capability_profile: str | None = None,
 ) -> WindowRecordResult:
     session = WindowSession(selector, backend)
     return WindowRecorder(
@@ -473,4 +480,6 @@ def record_window_trace(
         monitor,
         poll_hz=poll_hz,
         max_seconds=max_seconds,
+        status_callback=status_callback,
+        capability_profile=capability_profile,
     ).record(task_id=task_id, output_root=output_root)

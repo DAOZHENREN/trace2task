@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trace2Task 控制台</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">T2</div>
+          <div>
+            <div class="brand-name">Trace2Task</div>
+            <div class="brand-subtitle">示范驱动的桌面 Agent</div>
+          </div>
+        </div>
+        <div class="local-badge"><span></span>仅本机</div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div>
+            <p class="eyebrow">AGENT CONSOLE</p>
+            <h1>用一句话，调用一次示范经验。</h1>
+            <p class="hero-copy">
+              Trace 提供操作经验；当前界面和你的指令决定 Agent 这一次该怎么做。
+            </p>
+          </div>
+          <div class="version" id="version">v—</div>
+        </section>
+
+        <nav class="view-tabs" aria-label="控制台功能">
+          <button class="view-tab active" data-view="execute" type="button">执行任务</button>
+          <button class="view-tab" data-view="record" type="button">录制经验</button>
+          <button class="view-tab" data-view="library" type="button">本地经验</button>
+        </nav>
+
+        <div class="workspace">
+          <section class="card command-card view-panel" id="execute-panel">
+            <div class="card-heading">
+              <div>
+                <p class="section-kicker">新任务</p>
+                <h2>输入指令</h2>
+              </div>
+              <span class="step">01</span>
+            </div>
+
+            <label class="field-label" for="taskpack">示范经验</label>
+            <div class="select-wrap">
+              <select id="taskpack" aria-describedby="task-meta"></select>
+            </div>
+            <div class="task-meta" id="task-meta">正在读取可用任务包…</div>
+
+            <div class="agent-settings">
+              <div>
+                <label class="field-label" for="model">模型</label>
+                <div class="select-wrap">
+                  <select id="model">
+                    <option value="gpt-5.6-terra" selected>Terra · 平衡</option>
+                    <option value="gpt-5.6-sol">Sol · 最强</option>
+                    <option value="gpt-5.6-luna">Luna · 更快</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label class="field-label" for="reasoning-effort">思考强度</label>
+                <div class="select-wrap">
+                  <select id="reasoning-effort">
+                    <option value="low" selected>Low · 快速</option>
+                    <option value="medium">Medium · 平衡</option>
+                    <option value="high">High · 深入</option>
+                    <option value="xhigh">XHigh · 更深入</option>
+                    <option value="max">Max · 最强</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div class="agent-settings-help">更强的模型和更高的思考强度通常会增加等待时间。</div>
+
+            <label class="field-label instruction-label" for="instruction">本次指令</label>
+            <textarea
+              id="instruction"
+              maxlength="2000"
+              rows="6"
+              placeholder="例如：给文件传输助手发送：Trace2Task 网页控制台测试"
+            ></textarea>
+            <div class="instruction-footer">
+              <span>联系人、内容和步骤都从这句话中理解</span>
+              <span id="char-count">0 / 2000</span>
+            </div>
+
+            <div class="capability-warning hidden" id="capability-warning"></div>
+            <div class="form-error hidden" id="form-error" role="alert"></div>
+
+            <div class="actions">
+              <button class="button secondary" id="plan-button" type="button">
+                <span class="button-icon">◎</span>
+                只生成计划
+              </button>
+              <button class="button primary" id="execute-button" type="button">
+                <span class="button-icon">▶</span>
+                开始执行
+              </button>
+            </div>
+
+            <div class="safety-note">
+              <span class="safety-icon">!</span>
+              <div>
+                <strong>执行前会再次确认</strong>
+                <p>执行会控制目标窗口。运行期间可按 F9 紧急停止。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="card record-card view-panel hidden" id="record-panel">
+            <div class="card-heading">
+              <div>
+                <p class="section-kicker">示范采集</p>
+                <h2>录制新经验</h2>
+              </div>
+              <span class="step">02</span>
+            </div>
+
+            <div class="field-row">
+              <label class="field-label" for="record-window">本地目标窗口</label>
+              <button class="text-button" id="refresh-windows" type="button">刷新窗口</button>
+            </div>
+            <div class="select-wrap">
+              <select id="record-window"></select>
+            </div>
+            <div class="task-meta" id="window-meta">选择要录制的应用窗口。</div>
+
+            <label class="field-label instruction-label" for="record-name">经验名称</label>
+            <input
+              class="text-input"
+              id="record-name"
+              maxlength="80"
+              placeholder="例如：wechat-send-message"
+            >
+
+            <div class="record-flow">
+              <div><span>1</span><p>点击开始后自动切换到目标窗口</p></div>
+              <div><span>2</span><p>正常完成一次人工示范</p></div>
+              <div><span>3</span><p>按 F8 成功并自动编译；F9 取消</p></div>
+            </div>
+
+            <div class="form-error hidden" id="record-error" role="alert"></div>
+            <button class="button primary full-button" id="record-button" type="button">
+              <span class="button-icon">●</span>
+              开始录制
+            </button>
+
+            <div class="safety-note">
+              <span class="safety-icon">i</span>
+              <div>
+                <strong>录制保存在本地</strong>
+                <p>截图、按键和鼠标轨迹写入 runs；成功后生成草稿任务包。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="card library-card view-panel hidden" id="library-panel">
+            <div class="card-heading">
+              <div>
+                <p class="section-kicker">本地资产</p>
+                <h2>经验与录制</h2>
+              </div>
+              <button class="text-button" id="refresh-library" type="button">刷新</button>
+            </div>
+
+            <div class="library-heading">
+              <h3>任务经验</h3>
+              <span id="taskpack-count">0 项</span>
+            </div>
+            <div class="library-list" id="taskpack-list"></div>
+
+            <div class="library-heading recordings-heading">
+              <h3>原始录制</h3>
+              <span id="recording-count">0 项</span>
+            </div>
+            <div class="library-list compact" id="recording-list"></div>
+          </section>
+
+          <section class="card activity-card">
+            <div class="card-heading">
+              <div>
+                <p class="section-kicker">运行状态</p>
+                <h2>Agent 活动</h2>
+              </div>
+              <span class="status-pill idle" id="status-pill">空闲</span>
+            </div>
+
+            <div class="empty-state" id="empty-state">
+              <div class="pulse-rings" aria-hidden="true"><span></span></div>
+              <h3>等待一条指令</h3>
+              <p>先用“只生成计划”检查 Agent 的理解，不会注入任何输入。</p>
+            </div>
+
+            <div class="job-view hidden" id="job-view">
+              <div class="job-summary">
+                <div>
+                  <span class="summary-label">模式</span>
+                  <strong id="job-mode">—</strong>
+                </div>
+                <div>
+                  <span class="summary-label">示范</span>
+                  <strong id="job-task">—</strong>
+                </div>
+                <div>
+                  <span class="summary-label">模型</span>
+                  <strong id="job-model">—</strong>
+                </div>
+                <div>
+                  <span class="summary-label">思考</span>
+                  <strong id="job-effort">—</strong>
+                </div>
+                <button class="stop-button hidden" id="stop-button" type="button">停止</button>
+              </div>
+              <div class="instruction-preview" id="job-instruction"></div>
+
+              <div class="log-heading">
+                <span>实时日志</span>
+                <span class="live-dot" id="live-dot"></span>
+              </div>
+              <div class="log" id="job-log" aria-live="polite"></div>
+
+              <div class="result-panel hidden" id="result-panel">
+                <div class="log-heading"><span>运行结果</span></div>
+                <pre id="job-result"></pre>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <footer>
+        <span>Trace 是经验，不是固定脚本。</span>
+        <span>127.0.0.1 · Local control surface</span>
+      </footer>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

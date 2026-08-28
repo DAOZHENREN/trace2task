@@ -12,6 +12,10 @@ from typing import Protocol
 import pygame
 
 from trace2task.actions import ActionCall
+from trace2task.codex_app_server import (
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_REASONING_EFFORT,
+)
 from trace2task.recording import TraceWriter, make_run_dir
 from trace2task.windows_agent import CodexWindowsAgent, WindowsAgentPlan
 from trace2task.windows_capture import GdiWindowCapture, WindowFrameCapture
@@ -135,6 +139,8 @@ class WindowsAgentResult:
     proposed_actions: list[dict[str, object]]
     trace_path: str | None
     input_mode: str
+    model: str | None
+    reasoning_effort: str
 
 
 AgentFactory = Callable[[WindowsTaskContract], WindowsPlanningAgent]
@@ -143,8 +149,10 @@ AgentFactory = Callable[[WindowsTaskContract], WindowsPlanningAgent]
 def run_windows_agent(
     task_path: Path,
     *,
+    instruction: str | None = None,
     execute: bool = False,
-    model: str | None = "gpt-5.6-terra",
+    model: str | None = DEFAULT_CODEX_MODEL,
+    reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
     codex_bin: str = "codex",
     plan_horizon: int = 4,
     max_actions: int | None = None,
@@ -160,6 +168,8 @@ def run_windows_agent(
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
     contract = load_windows_task(task_path)
+    if instruction is not None:
+        contract = contract.with_instruction(instruction)
     if execute and contract.task.requires_confirmation:
         raise RuntimeError(
             "This Windows task pack is still a draft. Review and confirm it before --execute."
@@ -178,6 +188,7 @@ def run_windows_agent(
         else CodexWindowsAgent(
             contract,
             model=model,
+            reasoning_effort=reasoning_effort,
             codex_bin=codex_bin,
             plan_horizon=plan_horizon,
             background=background,
@@ -206,6 +217,8 @@ def run_windows_agent(
                 proposed_actions=[action.to_payload() for action in plan.actions],
                 trace_path=None,
                 input_mode="background" if background else "foreground",
+                model=model,
+                reasoning_effort=reasoning_effort,
             )
         finally:
             agent.close()
@@ -242,8 +255,12 @@ def run_windows_agent(
             details={
                 "window": asdict(window),
                 "task_path": str(contract.task.source_path),
+                "instruction": contract.instruction,
+                "demonstration_instruction": contract.task.instruction,
                 "emergency_hotkey": "f9",
                 "input_mode": "background" if background else "foreground",
+                "model": model,
+                "reasoning_effort": reasoning_effort,
             },
         )
         status_callback(
@@ -344,6 +361,8 @@ def run_windows_agent(
             proposed_actions=[],
             trace_path=None,
             input_mode="background" if background else "foreground",
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
     if writer is None:
         raise RuntimeError("Windows Agent stopped before its execution trace was created")
@@ -367,4 +386,6 @@ def run_windows_agent(
         proposed_actions=last_proposed,
         trace_path=str(trace.trace_path),
         input_mode="background" if background else "foreground",
+        model=model,
+        reasoning_effort=reasoning_effort,
     )

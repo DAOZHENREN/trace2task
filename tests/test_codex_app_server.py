@@ -63,6 +63,7 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
     session = CodexAppServerSession(
         "codex",
         model="gpt-5.6-terra",
+        reasoning_effort="high",
         cwd=tmp_path,
         transport_factory=lambda executable: transport,
     )
@@ -110,11 +111,22 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
         "detail": "original",
     }
     assert first_turn["outputSchema"] == schema
+    assert first_turn["effort"] == "high"
     assert first_turn["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
 
     session.close()
     session.close()
     assert transport.closed
+
+
+def test_session_rejects_unknown_reasoning_effort(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="reasoning effort"):
+        CodexAppServerSession(
+            "codex",
+            model="gpt-5.6-terra",
+            reasoning_effort="extreme",
+            cwd=tmp_path,
+        )
 
 
 def test_session_reports_failed_turn(tmp_path: Path) -> None:
