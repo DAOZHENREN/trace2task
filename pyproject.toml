@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trace2task"
-version = "0.5.5"
+version = "0.5.6"
 description = "Record a workflow and turn it into a resettable, verifiable agent task."
 readme = "README.md"
 requires-python = ">=3.11"

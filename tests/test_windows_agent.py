@@ -388,6 +388,34 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     assert result.input_mode == "foreground"
 
 
+def test_windows_agent_dry_run_can_focus_for_gpu_capture(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    agent = ScriptedAgent([_plan(ActionCall("click", {"x": 0.5, "y": 0.5}))])
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path),
+        focus=True,
+        backend=backend,
+        capture=FakeCapture(),
+        agent_factory=lambda contract: agent,
+    )
+
+    assert result.mode == "windows_agent_dry_run"
+    assert backend.events == [("focus", 7)]
+
+
+def test_windows_agent_rejects_conflicting_focus_and_background(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        run_windows_agent(
+            _write_taskpack(tmp_path),
+            focus=True,
+            background=True,
+            backend=FakeBackend(),
+            capture=FakeCapture(),
+            agent_factory=lambda contract: pytest.fail("agent must not be created"),
+        )
+
+
 def test_windows_agent_refuses_to_execute_draft_before_model_or_input(tmp_path: Path) -> None:
     backend = FakeBackend()
 

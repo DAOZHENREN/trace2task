@@ -169,6 +169,18 @@ After finding an unambiguous target, capture its client area without changing fo
 uv run trace2task windows capture --handle 123456 --output runs\target.png
 ```
 
+GPU-rendered applications that reject `PrintWindow` can explicitly request foreground capture:
+
+```powershell
+uv run trace2task windows capture `
+  --process "game.exe" `
+  --focus `
+  --output runs\game.png
+```
+
+The command requests foreground focus and then waits up to ten seconds. If Windows blocks the focus
+request, switch to the target manually while it waits; only then may it fall back to screen pixels.
+
 The capture backend asks the selected process to render its client area through `PrintWindow`, so a
 covered window does not leak pixels from the app placed over it. If an app cannot render that way,
 screen-pixel fallback is permitted only while that exact target is foreground; otherwise capture
@@ -295,6 +307,21 @@ This is a best-effort Windows compatibility path. Apps that consume normal `WM_M
 elevated integrity level, or GPU-only rendering may ignore directed input or return unusable
 `PrintWindow` frames. Run those targets in the default foreground mode. Minimized execution is not
 supported yet.
+
+## Foreground game capture (v0.5.6)
+
+Games and other GPU-rendered targets often cannot render through `PrintWindow`. Use `--focus` on a
+read-only Agent dry-run so the safe screen-pixel fallback can observe the actual foreground game:
+
+```powershell
+uv run trace2task windows agent `
+  --task taskpacks\generated\<pack>\task.yaml `
+  --focus
+```
+
+`--focus` changes only window focus during dry-run and still injects no input. It cannot be combined
+with `--background`. Foreground `--execute` runs already request focus and now also wait up to ten
+seconds for a manual switch when Windows refuses the programmatic request.
 
 Run the visual agent on that layout and move the target after four actions:
 

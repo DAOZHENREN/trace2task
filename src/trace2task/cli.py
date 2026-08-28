@@ -84,9 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
     windows_list.add_argument("--process", help="Keep windows with this executable name.")
     windows_capture = windows_subparsers.add_parser(
         "capture",
-        help="Capture one visible target client area without changing focus.",
+        help="Capture one visible target client area, optionally focusing it first.",
     )
     _add_window_selector(windows_capture)
+    windows_capture.add_argument(
+        "--focus",
+        action="store_true",
+        help="Bring the target to the foreground before capture for GPU/screen-pixel fallback.",
+    )
     windows_capture.add_argument(
         "--output",
         type=Path,
@@ -122,6 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Deliver execution input directly to a visible, unminimized target without focusing "
             "it. The target app must accept Win32 window messages."
+        ),
+    )
+    windows_agent.add_argument(
+        "--focus",
+        action="store_true",
+        help=(
+            "Bring the target to the foreground before a dry-run capture. Foreground execution "
+            "already focuses it."
         ),
     )
 
@@ -188,11 +201,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.windows_command == "capture":
             backend = Win32Backend()
+            if args.focus:
+                print("Waiting up to 10 seconds for the target to become foreground...")
             result = capture_window_once(
                 _window_selector_from_args(args),
                 args.output,
                 backend=backend,
                 capture=GdiWindowCapture(),
+                focus=args.focus,
             )
         elif args.windows_command == "record":
             backend = Win32Backend()
@@ -207,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
                 monitor=Win32InputMonitor(),
             )
         else:
+            if args.focus or (args.execute and not args.background):
+                print("Waiting up to 10 seconds for the target to become foreground...")
             result = run_windows_agent(
                 args.task,
                 execute=args.execute,
@@ -216,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_actions=args.max_actions,
                 output_root=args.output,
                 background=args.background,
+                focus=args.focus,
             )
     elif args.command == "agent":
         result = run_agent(

@@ -208,7 +208,7 @@ def capture_window_once(
     focus: bool = False,
 ) -> CaptureResult:
     session = WindowSession(selector, backend)
-    window = session.focus() if focus else session.resolve()
+    window = session.focus(timeout_seconds=10) if focus else session.resolve()
     if not window.is_visible or window.is_minimized:
         raise RuntimeError("The target window must be visible and unminimized for capture")
     surface = capture.capture(window)

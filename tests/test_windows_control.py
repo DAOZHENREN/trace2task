@@ -211,6 +211,25 @@ def test_executor_focuses_then_maps_normalized_click_inside_client_area() -> Non
     assert sleeps == [0.02]
 
 
+def test_session_allows_manual_focus_during_bounded_wait() -> None:
+    backend = FakeWindowsBackend([window()], foreground=99)
+    backend.focus_succeeds = False
+    sleeps: list[float] = []
+
+    def switch_manually(seconds: float) -> None:
+        sleeps.append(seconds)
+        backend.foreground = 7
+
+    focused = WindowSession(WindowSelector(handle=7), backend).focus(
+        timeout_seconds=1,
+        sleeper=switch_manually,
+    )
+
+    assert focused.handle == 7
+    assert sleeps and sleeps[0] <= 0.05
+    assert backend.events == [("focus", 7)]
+
+
 def test_lost_focus_or_minimized_window_blocks_input() -> None:
     backend = FakeWindowsBackend([window()], foreground=99)
     executor = WindowsMotorExecutor(WindowSession(WindowSelector(handle=7), backend))

@@ -590,12 +590,27 @@ class WindowSession:
         self._resolved_handle = matches[0].handle
         return matches[0]
 
-    def focus(self) -> WindowInfo:
+    def focus(
+        self,
+        *,
+        timeout_seconds: float = 0,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> WindowInfo:
+        if timeout_seconds < 0:
+            raise ValueError("Focus timeout cannot be negative")
         window = self._require_available(self.resolve())
         focus_requested = self.backend.focus_window(window.handle)
+        deadline = time.monotonic() + timeout_seconds
+        while self.backend.foreground_handle() != window.handle and time.monotonic() < deadline:
+            sleeper(min(0.05, max(0, deadline - time.monotonic())))
         if self.backend.foreground_handle() != window.handle:
             reason = "Windows refused to focus" if not focus_requested else "Could not foreground"
-            raise WindowSafetyError(f"{reason} target window {window.handle}")
+            suffix = (
+                f" within {timeout_seconds:g}s; switch to it manually while the command waits"
+                if timeout_seconds
+                else ""
+            )
+            raise WindowSafetyError(f"{reason} target window {window.handle}{suffix}")
         refreshed = self.backend.get_window(window.handle)
         return self._require_available(refreshed or window)
 

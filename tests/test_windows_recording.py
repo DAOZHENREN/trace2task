@@ -318,6 +318,23 @@ def test_capture_once_saves_only_fake_target_surface(tmp_path: Path) -> None:
     assert backend.events == []
 
 
+def test_capture_once_can_focus_target_before_capture(tmp_path: Path) -> None:
+    backend = FakeBackend(window())
+    capture = FakeCapture()
+    output = tmp_path / "captures" / "focused-target.png"
+
+    capture_window_once(
+        WindowSelector(handle=7),
+        output,
+        backend=backend,
+        capture=capture,
+        focus=True,
+    )
+
+    assert output.is_file()
+    assert backend.events == [("focus", 7)]
+
+
 def test_mouse_event_outside_target_is_marked_without_normalized_coordinates() -> None:
     raw_event = WindowRecorder._mouse_event("down", "left", (10, 20), window())
 

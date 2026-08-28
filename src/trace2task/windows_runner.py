@@ -154,6 +154,7 @@ def run_windows_agent(
     emergency_stop: EmergencyStop | None = None,
     agent_factory: AgentFactory | None = None,
     background: bool = False,
+    focus: bool = False,
 ) -> WindowsAgentResult:
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
@@ -162,6 +163,8 @@ def run_windows_agent(
         raise RuntimeError(
             "This Windows task pack is still a draft. Review and confirm it before --execute."
         )
+    if background and focus:
+        raise ValueError("--focus cannot be combined with --background")
     action_limit = max_actions if max_actions is not None else contract.task.max_actions
     if action_limit <= 0:
         raise ValueError("max_actions must be positive")
@@ -182,7 +185,7 @@ def run_windows_agent(
 
     if not execute:
         try:
-            window = session.resolve()
+            window = session.focus(timeout_seconds=10) if focus else session.resolve()
             if not window.is_visible or window.is_minimized:
                 raise RuntimeError("Windows Agent target must be visible and unminimized")
             plan = agent.plan(active_capture.capture(window))
@@ -215,7 +218,11 @@ def run_windows_agent(
     try:
         active_emergency.start()
         active_emergency.raise_if_requested()
-        window = session.require_available() if background else session.focus()
+        window = (
+            session.require_available()
+            if background
+            else session.focus(timeout_seconds=10)
+        )
         surface = active_capture.capture(window)
         writer = TraceWriter(
             make_run_dir(output_root, "windows-agent"),
