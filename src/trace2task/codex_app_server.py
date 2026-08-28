@@ -207,18 +207,23 @@ class CodexAppServerSession:
         prompt: str,
         image_path: Path,
         output_schema: dict[str, Any],
+        additional_image_paths: tuple[Path, ...] = (),
     ) -> str:
         thread_id = self.start()
         deadline = time.monotonic() + self.timeout_seconds
+        image_paths = (image_path, *additional_image_paths)
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [
                 {"type": "text", "text": prompt},
-                {
-                    "type": "localImage",
-                    "path": str(image_path.resolve()),
-                    "detail": "original",
-                },
+                *(
+                    {
+                        "type": "localImage",
+                        "path": str(current_path.resolve()),
+                        "detail": "original",
+                    }
+                    for current_path in image_paths
+                ),
             ],
             "effort": "low",
             "summary": "none",

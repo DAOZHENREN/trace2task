@@ -68,9 +68,16 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
     )
     image_path = tmp_path / "observation.png"
     image_path.write_bytes(b"png")
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"png")
     schema = {"type": "object"}
 
-    first = session.run_turn(prompt="first", image_path=image_path, output_schema=schema)
+    first = session.run_turn(
+        prompt="first",
+        image_path=image_path,
+        additional_image_paths=(reference_path,),
+        output_schema=schema,
+    )
     second = session.run_turn(prompt="second", image_path=image_path, output_schema=schema)
 
     assert first == '{"actions":["move_right"]}'
@@ -95,6 +102,11 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
     assert first_turn["input"][1] == {
         "type": "localImage",
         "path": str(image_path.resolve()),
+        "detail": "original",
+    }
+    assert first_turn["input"][2] == {
+        "type": "localImage",
+        "path": str(reference_path.resolve()),
         "detail": "original",
     }
     assert first_turn["outputSchema"] == schema
@@ -136,4 +148,3 @@ def test_session_reports_failed_turn(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="model unavailable"):
         session.run_turn(prompt="test", image_path=image_path, output_schema={})
-

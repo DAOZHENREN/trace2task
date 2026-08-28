@@ -19,7 +19,8 @@ The task is simple: move a blue player to a gold daily-task marker and press `E`
 - `record` captures each human input, timestamp, screenshot, and final outcome.
 - `compile` validates a successful trace and turns it into a self-contained draft task pack.
 - `confirm` marks a reviewed generated task pack as executable.
-- `windows list/capture/record` discovers and records real Windows targets without sending input.
+- `windows list/capture/record/agent` discovers, records, plans, and explicitly executes Windows
+  targets through guarded parameterized actions.
 - `replay` applies the same input sequence to another seeded layout.
 - `agent --provider visual` detects fixed pixel colors and uses A* as a deterministic baseline.
 - `agent --provider codex` sends the current screenshot and task contract to a general multimodal
@@ -228,9 +229,47 @@ rule, and evidence frame. The pack deliberately uses a generic instruction and a
 reference-frame verifier, so it remains a draft until you inspect `task.yaml`,
 `demonstration.json`, and `compiler-report.json`.
 
-Version 0.5.3 compiles and reviews the Windows workflow but does not yet run the general Windows
-Agent loop. External-app execution and reference-region verification are the next integration
-step.
+Version 0.5.3 compiles and reviews the Windows workflow. Version 0.5.4 connects the resulting pack
+to the guarded multimodal Windows Agent loop below.
+
+## Guarded Windows Agent (v0.5.4)
+
+Start with the default read-only dry-run. It captures only the selected target client area, sends
+the current image and the task pack's successful reference image to the Codex model, and prints a
+strict parameterized action plan without changing focus or injecting input:
+
+```powershell
+uv run trace2task windows agent --task taskpacks\generated\<pack>\task.yaml
+```
+
+The dry-run may use a draft pack so you can inspect the proposed action before confirmation. The
+images are sent to the configured Codex service through the existing ChatGPT subscription login;
+do not run it on a window whose contents you do not want the model to process.
+
+Before execution, edit the generic instruction and target selector if needed, inspect
+`demonstration.json` and the reference frame, then confirm the exact pack:
+
+```powershell
+uv run trace2task confirm taskpacks\generated\<pack>\task.yaml
+```
+
+Execution requires both that confirmation and the explicit `--execute` flag:
+
+```powershell
+uv run trace2task windows agent --task taskpacks\generated\<pack>\task.yaml --execute
+```
+
+- `F9` is reserved as the emergency stop; waits and key holds poll it every 50ms.
+- The target is focused before planning, and every non-focus action fails closed if focus changes.
+- Model output is constrained by the task pack's parameterized JSON Schema and validated again
+  locally before `SendInput`.
+- The default plan horizon is one action, so the model sees a fresh screenshot after each action.
+- The Codex session is persistent, read-only, approval-free, and network-disabled for tool use.
+- Each executed action and resulting target screenshot is written to a new trace under `runs/`.
+
+For v0.5.4, completion is a constrained model comparison between the live target image and the
+human-reviewed final reference image. This is useful for the integration loop but is not yet a
+deterministic region verifier; keep action limits small and supervise the first executions.
 
 Run the visual agent on that layout and move the target after four actions:
 
@@ -312,8 +351,8 @@ uv run ruff check .
 
 ## Next milestones
 
-- Execute confirmed Windows task packs with the multimodal Agent and guarded local motor layer.
-- Add reference-region verification and model-assisted semantic labels for Windows task packs.
+- Add deterministic reference-region verification and model-assisted semantic labels.
+- Add approval checkpoints for high-impact actions and application-specific policies.
 - Infer reusable motor-skill boundaries from longer demonstrations.
 - Add pop-up recovery and changed-obstacle scenarios.
 - Extend the local motor layer from grid moves to reusable desktop/game skills.

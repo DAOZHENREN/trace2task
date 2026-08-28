@@ -15,6 +15,7 @@ from trace2task.windows_control import (
     list_window_records,
 )
 from trace2task.windows_recording import Win32InputMonitor, record_window_trace
+from trace2task.windows_runner import run_windows_agent
 
 
 def _print_result(result: object) -> None:
@@ -100,6 +101,21 @@ def build_parser() -> argparse.ArgumentParser:
     windows_record.add_argument("--output", type=Path, default=Path("runs"))
     windows_record.add_argument("--poll-hz", type=int, default=120)
     windows_record.add_argument("--max-seconds", type=float, default=300)
+    windows_agent = windows_subparsers.add_parser(
+        "agent",
+        help="Plan or explicitly execute a confirmed Windows task pack.",
+    )
+    windows_agent.add_argument("--task", type=Path, required=True)
+    windows_agent.add_argument("--model", default="gpt-5.6-terra")
+    windows_agent.add_argument("--codex-bin", default="codex")
+    windows_agent.add_argument("--plan-horizon", type=int, default=1)
+    windows_agent.add_argument("--max-actions", type=int)
+    windows_agent.add_argument("--output", type=Path, default=Path("runs"))
+    windows_agent.add_argument(
+        "--execute",
+        action="store_true",
+        help="Inject the validated actions. Without this flag the command is read-only dry-run.",
+    )
 
     agent = subparsers.add_parser("agent", help="Run a deterministic or multimodal agent.")
     agent.add_argument("--seed", type=int, default=19)
@@ -170,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=backend,
                 capture=GdiWindowCapture(),
             )
-        else:
+        elif args.windows_command == "record":
             backend = Win32Backend()
             result = record_window_trace(
                 _window_selector_from_args(args),
@@ -181,6 +197,16 @@ def main(argv: list[str] | None = None) -> int:
                 backend=backend,
                 capture=GdiWindowCapture(),
                 monitor=Win32InputMonitor(),
+            )
+        else:
+            result = run_windows_agent(
+                args.task,
+                execute=args.execute,
+                model=args.model,
+                codex_bin=args.codex_bin,
+                plan_horizon=args.plan_horizon,
+                max_actions=args.max_actions,
+                output_root=args.output,
             )
     elif args.command == "agent":
         result = run_agent(

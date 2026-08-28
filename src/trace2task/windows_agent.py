@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import json
+import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pygame
+
+from trace2task.actions import ActionCall, parameterized_action_schema
+from trace2task.codex_agent import resolve_codex_binary
+from trace2task.codex_app_server import CodexAppServerSession
+from trace2task.windows_task import WindowsTaskContract
+
+BinaryResolver = Callable[[str], str]
+SessionFactory = Callable[..., CodexAppServerSession]
+
+
+@dataclass(frozen=True)
+class WindowsAgentPlan:
+    task_complete: bool
+    actions: tuple[ActionCall, ...]
+    reason: str
+    confidence: float
+
+
+class CodexWindowsAgent:
+    """Plan bounded parameterized actions from current and successful reference frames."""
+
+    def __init__(
+        self,
+        contract: WindowsTaskContract,
+        *,
+        model: str | None = "gpt-5.6-terra",
+        codex_bin: str = "codex",
+        plan_horizon: int = 1,
+        timeout_seconds: float = 120,
+        binary_resolver: BinaryResolver = resolve_codex_binary,
+        session_factory: SessionFactory = CodexAppServerSession,
+    ) -> None:
+        if plan_horizon <= 0 or plan_horizon > 4:
+            raise ValueError("Windows plan_horizon must be between 1 and 4")
+        self.contract = contract
+        self.model = model
+        self.codex_bin = codex_bin
+        self.plan_horizon = plan_horizon
+        self.timeout_seconds = timeout_seconds
+        self.binary_resolver = binary_resolver
+        self.session_factory = session_factory
+        self.replans = 0
+        self._turn_index = 0
+        self._history: list[str] = []
+        self._session: CodexAppServerSession | None = None
+
+    def plan(self, surface: pygame.Surface) -> WindowsAgentPlan:
+        with tempfile.TemporaryDirectory(prefix="trace2task-windows-agent-") as directory:
+            current_frame = Path(directory) / "current.png"
+            pygame.image.save(surface, current_frame)
+            output = self._get_session().run_turn(
+                prompt=self._prompt(),
+                image_path=current_frame,
+                additional_image_paths=(self.contract.reference_frame,),
+                output_schema=self._output_schema(),
+            )
+        self._turn_index += 1
+        self.replans += 1
+        return self._parse_payload(output)
+
+    def observe_transition(self, action: ActionCall, applied: bool) -> None:
+        payload = json.dumps(action.to_payload(), ensure_ascii=False, separators=(",", ":"))
+        outcome = "applied" if applied else "blocked_or_failed"
+        self._history.append(f"{payload}: {outcome}")
+        self._history = self._history[-8:]
+
+    def _get_session(self) -> CodexAppServerSession:
+        if self._session is None:
+            executable = self.binary_resolver(self.codex_bin)
+            self._session = self.session_factory(
+                executable,
+                model=self.model,
+                cwd=Path.cwd(),
+                timeout_seconds=self.timeout_seconds,
+            )
+        return self._session
+
+    def _prompt(self) -> str:
+        task = self.contract.task
+        demonstration = [action.to_payload() for action in self.contract.demonstration]
+        history = "\n".join(self._history) if self._history else "none"
+        session_context = (
+            "This is the first observation in a new Windows task run."
+            if self._turn_index == 0
+            else "Continue the same Windows task from the new authoritative current screenshot."
+        )
+        return (
+            f"{session_context}\n"
+            "You are the visual planner of a constrained Windows agent. Do not run commands, "
+            "read files, or use tools. Image 1 is the current target client area. Image 2 is the "
+            "human-reviewed successful reference frame. Compare them visually. The local motor "
+            "controller alone will execute your structured actions.\n\n"
+            f"Task: {task.instruction}\n"
+            f"Success condition: {task.expected_result}\n"
+            f"Allowed motor skills: {', '.join(task.actions)}\n"
+            "Mouse x/y coordinates are normalized within Image 1: top-left is (0,0), "
+            "bottom-right is (1,1).\n"
+            f"Recorded demonstration (a hint, not a fixed script): "
+            f"{json.dumps(demonstration, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"Recent execution history:\n{history}\n\n"
+            "If Image 1 already satisfies the success condition, return task_complete=true and "
+            "no actions. Otherwise return task_complete=false and the smallest safe next action "
+            f"batch, between 1 and {self.plan_horizon} actions. Replan from current pixels rather "
+            "than blindly copying recorded coordinates. Never interact outside Image 1. The "
+            "response must match the supplied JSON schema."
+        )
+
+    def _output_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "task_complete": {"type": "boolean"},
+                "actions": {
+                    "type": "array",
+                    "items": parameterized_action_schema(self.contract.task.actions),
+                    "minItems": 0,
+                    "maxItems": self.plan_horizon,
+                },
+                "reason": {"type": "string", "minLength": 1},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": ["task_complete", "actions", "reason", "confidence"],
+            "additionalProperties": False,
+        }
+
+    def _parse_payload(self, output: str) -> WindowsAgentPlan:
+        try:
+            payload = json.loads(output.strip())
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Codex returned invalid JSON: {output.strip()}") from error
+        if not isinstance(payload, dict):
+            raise TypeError("Codex Windows decision must be a JSON object")
+        task_complete = payload.get("task_complete")
+        raw_actions = payload.get("actions")
+        reason = payload.get("reason")
+        confidence = payload.get("confidence")
+        if not isinstance(task_complete, bool):
+            raise TypeError("Codex returned an invalid task_complete value")
+        if not isinstance(raw_actions, list) or len(raw_actions) > self.plan_horizon:
+            raise RuntimeError("Codex returned an invalid Windows action batch")
+        actions = tuple(ActionCall.from_payload(raw_action) for raw_action in raw_actions)
+        if any(action.skill not in self.contract.task.actions for action in actions):
+            raise RuntimeError("Codex returned an action outside the Windows task pack")
+        if task_complete and actions:
+            raise RuntimeError("Codex marked the task complete while still returning actions")
+        if not task_complete and not actions:
+            raise RuntimeError("Codex returned no action for an incomplete task")
+        if not isinstance(reason, str) or not reason.strip():
+            raise RuntimeError("Codex returned an empty Windows decision reason")
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not 0 <= float(confidence) <= 1
+        ):
+            raise RuntimeError("Codex returned an invalid Windows confidence value")
+        return WindowsAgentPlan(
+            task_complete=task_complete,
+            actions=actions,
+            reason=reason.strip(),
+            confidence=float(confidence),
+        )
+
+    def close(self) -> None:
+        if self._session is not None:
+            self._session.close()
+            self._session = None
