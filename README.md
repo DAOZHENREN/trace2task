@@ -193,12 +193,21 @@ Record raw keyboard/mouse transitions and a target screenshot after every event:
 uv run trace2task windows record --handle 123456 --task-id external-daily
 ```
 
+If a game or keyboard intercepts the function keys, choose different recorder controls:
+
+```powershell
+uv run trace2task windows record --handle 123456 --task-id external-daily `
+  --success-key home --cancel-key end
+```
+
 The recorder first tries the normal Windows focus request. If Windows declines it, switch to the
 target window yourself; recording begins only after the selected handle becomes visible,
 unminimized, and foreground.
 
 - Press `F8` to save a final success frame and finish successfully.
 - Press `F9` to cancel the recording.
+- `--success-key` and `--cancel-key` accept letters, digits, function keys, and supported special
+  keys. The selected controls are reserved and are not written into the task trace.
 - Recorder controls use both registered global hotkeys and physical key-state edges so GPU games
   that suppress `WM_HOTKEY` can still finish or cancel a recording.
 - Input is polled but never injected by the recorder.

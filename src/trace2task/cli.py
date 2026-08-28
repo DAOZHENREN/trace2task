@@ -14,7 +14,11 @@ from trace2task.windows_control import (
     WindowSelector,
     list_window_records,
 )
-from trace2task.windows_recording import Win32InputMonitor, record_window_trace
+from trace2task.windows_recording import (
+    CONTROL_KEY_CODES,
+    Win32InputMonitor,
+    record_window_trace,
+)
 from trace2task.windows_runner import run_windows_agent
 
 
@@ -106,6 +110,18 @@ def build_parser() -> argparse.ArgumentParser:
     windows_record.add_argument("--output", type=Path, default=Path("runs"))
     windows_record.add_argument("--poll-hz", type=int, default=120)
     windows_record.add_argument("--max-seconds", type=float, default=300)
+    windows_record.add_argument(
+        "--success-key",
+        choices=sorted(CONTROL_KEY_CODES),
+        default="f8",
+        help="Key that saves the success frame and finishes recording (default: f8).",
+    )
+    windows_record.add_argument(
+        "--cancel-key",
+        choices=sorted(CONTROL_KEY_CODES),
+        default="f9",
+        help="Key that cancels recording (default: f9).",
+    )
     windows_agent = windows_subparsers.add_parser(
         "agent",
         help="Plan or explicitly execute a confirmed Windows task pack.",
@@ -220,7 +236,10 @@ def main(argv: list[str] | None = None) -> int:
                 max_seconds=args.max_seconds,
                 backend=backend,
                 capture=GdiWindowCapture(),
-                monitor=Win32InputMonitor(),
+                monitor=Win32InputMonitor(
+                    success_key=args.success_key,
+                    cancel_key=args.cancel_key,
+                ),
             )
         else:
             if args.focus or (args.execute and not args.background):

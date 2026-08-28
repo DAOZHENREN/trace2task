@@ -10,6 +10,7 @@ import pygame
 from trace2task.windows_capture import capture_window_once
 from trace2task.windows_control import WindowInfo, WindowSelector, WindowSession
 from trace2task.windows_recording import (
+    CONTROL_KEY_CODES,
     VK_F8,
     VK_F9,
     InputSnapshot,
@@ -126,6 +127,10 @@ def test_win32_monitor_falls_back_to_physical_f8_f9_edges() -> None:
     monitor = Win32InputMonitor.__new__(Win32InputMonitor)
     monitor.user32 = user32
     monitor._started = True
+    monitor.success_key = "f8"
+    monitor.cancel_key = "f9"
+    monitor._success_virtual_key = VK_F8
+    monitor._cancel_virtual_key = VK_F9
     monitor._success_key_down = False
     monitor._cancel_key_down = False
 
@@ -144,6 +149,26 @@ def test_win32_monitor_falls_back_to_physical_f8_f9_edges() -> None:
     snapshot = monitor.poll()
     assert not snapshot.success_requested
     assert snapshot.cancel_requested
+
+
+def test_win32_monitor_supports_alternate_control_keys_without_recording_them() -> None:
+    user32 = FakePollingUser32()
+    monitor = Win32InputMonitor.__new__(Win32InputMonitor)
+    monitor.user32 = user32
+    monitor._started = True
+    monitor.success_key = "home"
+    monitor.cancel_key = "end"
+    monitor._success_virtual_key = CONTROL_KEY_CODES["home"]
+    monitor._cancel_virtual_key = CONTROL_KEY_CODES["end"]
+    monitor._success_key_down = False
+    monitor._cancel_key_down = False
+
+    user32.down = {CONTROL_KEY_CODES["home"]}
+    snapshot = monitor.poll()
+
+    assert snapshot.success_requested
+    assert not snapshot.cancel_requested
+    assert "home" not in snapshot.keys_down
 
 
 class StepClock:

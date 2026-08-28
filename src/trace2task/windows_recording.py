@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from trace2task.actions import SPECIAL_KEYS
+from trace2task.actions import SPECIAL_KEYS, normalize_key
 from trace2task.recording import TraceWriter, make_run_dir
 from trace2task.windows_capture import WindowFrameCapture
 from trace2task.windows_control import (
@@ -32,13 +32,11 @@ CANCEL_HOTKEY_ID = 0x545202
 VK_F8 = 0x77
 VK_F9 = 0x78
 MOUSE_VIRTUAL_KEYS = {"left": 0x01, "right": 0x02, "middle": 0x04}
-RECORDING_KEY_CODES = {
+CONTROL_KEY_CODES = {
     **{chr(code).casefold(): code for code in range(ord("A"), ord("Z") + 1)},
     **{str(number): ord(str(number)) for number in range(10)},
     **{key: value for key, value in VK_CODES.items() if key in SPECIAL_KEYS},
 }
-RECORDING_KEY_CODES.pop("f8", None)
-RECORDING_KEY_CODES.pop("f9", None)
 
 
 @dataclass(frozen=True)
@@ -59,11 +57,17 @@ class InputMonitor(Protocol):
 
 
 class Win32InputMonitor:
-    """Poll raw key/button state while reserving F8/F9 as recorder controls."""
+    """Poll raw key/button state while reserving two configurable controls."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, success_key: str = "f8", cancel_key: str = "f9") -> None:
         if os.name != "nt":
             raise RuntimeError("The Windows input monitor is available only on Windows")
+        self.success_key = normalize_key(success_key)
+        self.cancel_key = normalize_key(cancel_key)
+        if self.success_key == self.cancel_key:
+            raise ValueError("success_key and cancel_key must be different")
+        self._success_virtual_key = CONTROL_KEY_CODES[self.success_key]
+        self._cancel_virtual_key = CONTROL_KEY_CODES[self.cancel_key]
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
         self.user32.RegisterHotKey.argtypes = [
             wintypes.HWND,
@@ -94,13 +98,31 @@ class Win32InputMonitor:
     def start(self) -> None:
         if self._started:
             return
-        if not self.user32.RegisterHotKey(None, SUCCESS_HOTKEY_ID, MOD_NOREPEAT, VK_F8):
-            raise RuntimeError("Could not reserve F8 as the recording-success hotkey")
-        if not self.user32.RegisterHotKey(None, CANCEL_HOTKEY_ID, MOD_NOREPEAT, VK_F9):
+        if not self.user32.RegisterHotKey(
+            None,
+            SUCCESS_HOTKEY_ID,
+            MOD_NOREPEAT,
+            self._success_virtual_key,
+        ):
+            raise RuntimeError(
+                f"Could not reserve {self.success_key.upper()} as the recording-success hotkey"
+            )
+        if not self.user32.RegisterHotKey(
+            None,
+            CANCEL_HOTKEY_ID,
+            MOD_NOREPEAT,
+            self._cancel_virtual_key,
+        ):
             self.user32.UnregisterHotKey(None, SUCCESS_HOTKEY_ID)
-            raise RuntimeError("Could not reserve F9 as the recording-cancel hotkey")
-        self._success_key_down = bool(self.user32.GetAsyncKeyState(VK_F8) & 0x8000)
-        self._cancel_key_down = bool(self.user32.GetAsyncKeyState(VK_F9) & 0x8000)
+            raise RuntimeError(
+                f"Could not reserve {self.cancel_key.upper()} as the recording-cancel hotkey"
+            )
+        self._success_key_down = bool(
+            self.user32.GetAsyncKeyState(self._success_virtual_key) & 0x8000
+        )
+        self._cancel_key_down = bool(
+            self.user32.GetAsyncKeyState(self._cancel_virtual_key) & 0x8000
+        )
         self._started = True
 
     def poll(self) -> InputSnapshot:
@@ -121,8 +143,12 @@ class Win32InputMonitor:
             elif message.wParam == CANCEL_HOTKEY_ID:
                 cancel_requested = True
 
-        success_key_down = bool(self.user32.GetAsyncKeyState(VK_F8) & 0x8000)
-        cancel_key_down = bool(self.user32.GetAsyncKeyState(VK_F9) & 0x8000)
+        success_key_down = bool(
+            self.user32.GetAsyncKeyState(self._success_virtual_key) & 0x8000
+        )
+        cancel_key_down = bool(
+            self.user32.GetAsyncKeyState(self._cancel_virtual_key) & 0x8000
+        )
         success_requested = success_requested or (
             success_key_down and not self._success_key_down
         )
@@ -134,7 +160,8 @@ class Win32InputMonitor:
 
         keys_down = frozenset(
             key
-            for key, virtual_key in RECORDING_KEY_CODES.items()
+            for key, virtual_key in CONTROL_KEY_CODES.items()
+            if key not in {self.success_key, self.cancel_key}
             if self.user32.GetAsyncKeyState(virtual_key) & 0x8000
         )
         buttons_down = frozenset(
@@ -210,6 +237,10 @@ class WindowRecorder:
         focus_losses = 0
         stop_reason = "cancelled"
         success = False
+        success_key = getattr(self.monitor, "success_key", "f8")
+        cancel_key = getattr(self.monitor, "cancel_key", "f9")
+        success_label = success_key.upper()
+        cancel_label = cancel_key.upper()
         previous: InputSnapshot | None = None
         was_foreground = True
         started = self.clock()
@@ -234,7 +265,8 @@ class WindowRecorder:
                 },
             )
             self.status_callback(
-                f"Recording '{initial_window.title}'. Press F8 to mark success or F9 to cancel."
+                f"Recording '{initial_window.title}'. Press {success_label} to mark success "
+                f"or {cancel_label} to cancel."
             )
             previous_geometry = self._geometry(initial_window)
             while True:
@@ -254,12 +286,14 @@ class WindowRecorder:
                 is_foreground = self.session.backend.foreground_handle() == window.handle
                 if snapshot.success_requested:
                     if not is_foreground or window.is_minimized or not window.is_visible:
-                        self.status_callback("F8 ignored because the target window is not active.")
+                        self.status_callback(
+                            f"{success_label} ignored because the target window is not active."
+                        )
                     else:
                         writer.record(
                             "success_marker",
                             self.capture.capture(window),
-                            details={"window": asdict(window), "control_hotkey": "f8"},
+                            details={"window": asdict(window), "control_hotkey": success_key},
                         )
                         success = True
                         stop_reason = "success_marked"
@@ -324,8 +358,8 @@ class WindowRecorder:
                 "initial_window": asdict(initial_window),
                 "capture_method": "target_client_area",
                 "coordinate_space": "physical_pixels",
-                "success_hotkey": "f8",
-                "cancel_hotkey": "f9",
+                "success_hotkey": success_key,
+                "cancel_hotkey": cancel_key,
             },
         )
         return WindowRecordResult(
@@ -339,12 +373,14 @@ class WindowRecorder:
         )
 
     def _wait_for_active_target(self, started: float) -> tuple[WindowInfo, InputSnapshot]:
+        cancel_key = getattr(self.monitor, "cancel_key", "f9").upper()
         try:
             window = self.session.focus()
         except WindowSafetyError:
             window = self.session.resolve()
             self.status_callback(
-                f"Switch to '{window.title}' to begin recording. F9 cancels before start."
+                f"Switch to '{window.title}' to begin recording. "
+                f"{cancel_key} cancels before start."
             )
         while True:
             if self.clock() - started >= self.max_seconds:
