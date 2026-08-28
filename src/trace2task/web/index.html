@@ -47,15 +47,15 @@
               <span class="step">01</span>
             </div>
 
-            <label class="field-label" for="taskpack">示范经验</label>
+            <label class="field-label" for="taskpack">经验选择</label>
             <div class="select-wrap">
               <select id="taskpack" aria-describedby="task-meta"></select>
             </div>
-            <div class="task-meta" id="task-meta">正在读取可用任务包…</div>
+            <div class="task-meta" id="task-meta">正在读取可用 Trace 经验…</div>
 
             <div class="agent-settings">
               <div>
-                <label class="field-label" for="model">模型</label>
+                <label class="field-label" for="model">执行 Agent 模型</label>
                 <div class="select-wrap">
                   <select id="model">
                     <option value="gpt-5.6-terra" selected>Terra · 平衡</option>
@@ -65,7 +65,7 @@
                 </div>
               </div>
               <div>
-                <label class="field-label" for="reasoning-effort">思考强度</label>
+                <label class="field-label" for="reasoning-effort">执行思考强度</label>
                 <div class="select-wrap">
                   <select id="reasoning-effort">
                     <option value="low" selected>Low · 快速</option>
@@ -77,7 +77,7 @@
                 </div>
               </div>
             </div>
-            <div class="agent-settings-help">更强的模型和更高的思考强度通常会增加等待时间。</div>
+            <div class="agent-settings-help">只影响每次任务的规划与执行；不会改变已经编译的经验。</div>
 
             <label class="field-label instruction-label" for="instruction">本次指令</label>
             <textarea
@@ -140,10 +140,26 @@
               placeholder="例如：wechat-send-message"
             >
 
+            <div class="agent-settings record-agent-settings">
+              <div>
+                <label class="field-label" for="record-model">Compiler Agent 模型</label>
+                <div class="select-wrap">
+                  <select id="record-model"></select>
+                </div>
+              </div>
+              <div>
+                <label class="field-label" for="record-reasoning-effort">编译思考强度</label>
+                <div class="select-wrap">
+                  <select id="record-reasoning-effort"></select>
+                </div>
+              </div>
+            </div>
+            <div class="agent-settings-help">录制结束后，Compiler Agent 会自动理解阶段与动作意图。</div>
+
             <div class="record-flow">
               <div><span>1</span><p>点击开始后自动切换到目标窗口</p></div>
               <div><span>2</span><p>正常完成一次人工示范</p></div>
-              <div><span>3</span><p>按 F8 成功并自动编译；F9 取消</p></div>
+              <div><span>3</span><p>按 F8 成功并自动生成语义经验；F9 取消</p></div>
             </div>
 
             <div class="form-error hidden" id="record-error" role="alert"></div>
@@ -156,7 +172,7 @@
               <span class="safety-icon">i</span>
               <div>
                 <strong>录制保存在本地</strong>
-                <p>截图、按键和鼠标轨迹写入 runs；成功后生成草稿任务包。</p>
+                <p>原始 Trace 永久保留；Agent 只生成可重新编译、可审核的语义层。</p>
               </div>
             </div>
           </section>
@@ -170,11 +186,38 @@
               <button class="text-button" id="refresh-library" type="button">刷新</button>
             </div>
 
+            <div class="compiler-settings-panel">
+              <div class="compiler-settings-copy">
+                <strong>经验编译模型（教师）</strong>
+                <p>强模型只在把 Trace 编译为语义经验时调用；执行模型在“执行任务”页单独选择。</p>
+              </div>
+              <div class="agent-settings compiler-agent-settings">
+                <div>
+                  <label class="field-label" for="compiler-model">Compiler Agent 模型</label>
+                  <div class="select-wrap">
+                    <select id="compiler-model"></select>
+                  </div>
+                </div>
+                <div>
+                  <label class="field-label" for="compiler-reasoning-effort">编译思考强度</label>
+                  <div class="select-wrap">
+                    <select id="compiler-reasoning-effort"></select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div class="library-heading">
               <h3>任务经验</h3>
               <span id="taskpack-count">0 项</span>
             </div>
             <div class="library-list" id="taskpack-list"></div>
+
+            <div class="library-heading recordings-heading">
+              <h3>候选经验</h3>
+              <span id="candidate-count">0 项</span>
+            </div>
+            <div class="library-list compact" id="candidate-list"></div>
 
             <div class="library-heading recordings-heading">
               <h3>原始录制</h3>

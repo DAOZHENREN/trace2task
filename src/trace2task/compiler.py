@@ -329,6 +329,28 @@ def confirm_taskpack(task_path: Path) -> ConfirmResult:
     review["requires_confirmation"] = False
     review["confirmed_at"] = confirmed_at
 
+    semantic_path: Path | None = None
+    semantic_data: dict[str, Any] | None = None
+    semantic_config = data.get("semantic_experience")
+    if semantic_config is not None:
+        if not isinstance(semantic_config, dict):
+            raise TypeError("Task semantic_experience block must be a mapping")
+        relative = semantic_config.get("path")
+        if not isinstance(relative, str) or not relative:
+            raise ValueError("Task semantic_experience.path must be a relative file path")
+        semantic_path = (source_path.parent / relative).resolve()
+        if not semantic_path.is_relative_to(source_path.parent.resolve()):
+            raise ValueError("Task semantic_experience.path points outside the task pack")
+        semantic_data = yaml.safe_load(semantic_path.read_text(encoding="utf-8"))
+        if not isinstance(semantic_data, dict):
+            raise TypeError("Semantic experience root must be a mapping")
+        semantic_review = semantic_data.get("review")
+        if not isinstance(semantic_review, dict):
+            raise TypeError("Semantic experience review block must be a mapping")
+        semantic_review["status"] = "confirmed"
+        semantic_review["requires_confirmation"] = False
+        semantic_review["confirmed_at"] = confirmed_at
+
     report_path = source_path.parent / "compiler-report.json"
     report: dict[str, Any] | None = None
     if report_path.is_file():
@@ -347,6 +369,16 @@ def confirm_taskpack(task_path: Path) -> ConfirmResult:
     if report is not None:
         report_path.write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    if semantic_path is not None and semantic_data is not None:
+        semantic_path.write_text(
+            yaml.safe_dump(
+                semantic_data,
+                sort_keys=False,
+                allow_unicode=True,
+                width=100,
+            ),
             encoding="utf-8",
         )
     confirmed = load_taskpack(source_path)

@@ -25,6 +25,7 @@ WAIT_THRESHOLD_MS = 500
 MAX_COMPILED_WAIT_MS = 10_000
 MAX_KEY_HOLD_MS = 5_000
 MAX_MOUSE_CLICK_MS = 1_000
+MAX_MOUSE_HOLD_MS = 5_000
 MAX_MOUSE_DRAG_MS = 5_000
 DOUBLE_CLICK_GAP_MS = 500
 POINTER_JITTER_TOLERANCE = 0.02
@@ -125,18 +126,32 @@ def _validate_windows_trace(
 
     frames = _frame_paths(trace_path, events)
     raw_events: list[_RawInputEvent] = []
+    previous_sampled_elapsed = -1.0
     for event in events:
         if event.get("type") != "windows_input":
             continue
         details = event.get("details")
         if not isinstance(details, dict) or not isinstance(details.get("raw_input"), dict):
             raise TypeError(f"Windows input event {event['seq']} has no raw_input object")
+        raw_input = details["raw_input"]
+        sampled_elapsed = raw_input.get("sampled_elapsed_ms", event["elapsed_ms"])
+        if (
+            not isinstance(sampled_elapsed, (int, float))
+            or isinstance(sampled_elapsed, bool)
+            or sampled_elapsed < 0
+        ):
+            raise ValueError(
+                f"Windows input event {event['seq']} has invalid sampled_elapsed_ms"
+            )
+        if float(sampled_elapsed) < previous_sampled_elapsed:
+            raise ValueError("Windows sampled input times must be monotonic")
+        previous_sampled_elapsed = float(sampled_elapsed)
         raw_events.append(
             _RawInputEvent(
                 seq=event["seq"],
-                elapsed_ms=float(event["elapsed_ms"]),
+                elapsed_ms=float(sampled_elapsed),
                 frame=event["frame"],
-                payload=details["raw_input"],
+                payload=raw_input,
             )
         )
     if not raw_events:
@@ -353,15 +368,29 @@ def _compile_mouse(intervals: list[_InputInterval]) -> list[_TimedAction]:
             )
             inference = "paired_mouse_button_with_pointer_displacement"
         else:
-            if duration_ms > MAX_MOUSE_CLICK_MS:
+            if duration_ms > MAX_MOUSE_HOLD_MS:
                 raise ValueError(
-                    f"Mouse button {interval.name!r} was held too long to infer a safe click"
+                    f"Mouse button {interval.name!r} was held for {duration_ms}ms between "
+                    f"events {interval.start.seq}-{interval.end.seq}; the safe hold limit is "
+                    f"{MAX_MOUSE_HOLD_MS}ms"
                 )
-            action = ActionCall(
-                "click",
-                {"x": down_position[0], "y": down_position[1], "button": interval.name},
-            )
-            inference = "paired_mouse_button_without_drag"
+            if duration_ms > MAX_MOUSE_CLICK_MS:
+                action = ActionCall(
+                    "hold_mouse",
+                    {
+                        "x": down_position[0],
+                        "y": down_position[1],
+                        "duration_ms": duration_ms,
+                        "button": interval.name,
+                    },
+                )
+                inference = "paired_mouse_button_stationary_hold"
+            else:
+                action = ActionCall(
+                    "click",
+                    {"x": down_position[0], "y": down_position[1], "button": interval.name},
+                )
+                inference = "paired_mouse_button_without_drag"
         actions.append(
             _TimedAction(
                 action=action,
@@ -717,6 +746,11 @@ def compile_windows_trace(
             "coordinate_space": "physical_pixels",
         },
         "actions": declared_skills,
+        "experience": {
+            "intent": task_id,
+            "examples": [task_id],
+            "source": "human_trace",
+        },
         "demonstration": {"path": "demonstration.json", "action_count": len(demonstration)},
         "verifier": {
             "type": "reviewed_reference_frame",
@@ -789,6 +823,7 @@ def compile_windows_trace(
                 "wait": WAIT_THRESHOLD_MS,
                 "double_click_gap": DOUBLE_CLICK_GAP_MS,
                 "max_mouse_click": MAX_MOUSE_CLICK_MS,
+                "max_mouse_hold": MAX_MOUSE_HOLD_MS,
                 "max_mouse_drag": MAX_MOUSE_DRAG_MS,
             },
             "pointer_jitter_tolerance": POINTER_JITTER_TOLERANCE,
@@ -815,6 +850,7 @@ def compile_windows_trace(
             "Ctrl, Alt, or Shift intervals containing another key interval form a hotkey.",
             "Two adjacent same-position clicks within the time window form a double click.",
             "Mouse intervals with pointer displacement compile to bounded drag actions.",
+            "Stationary mouse intervals above the click threshold compile to bounded holds.",
             "Idle gaps above the threshold are waits capped at ten seconds.",
             f"The {success_hotkey} success marker is human evidence and still requires visual review.",
             "Unmatched release events are ignored and listed in the compiler report.",

@@ -70,9 +70,7 @@ class CodexWindowsAgent:
         with tempfile.TemporaryDirectory(prefix="trace2task-windows-agent-") as directory:
             current_frame = Path(directory) / "current.png"
             pygame.image.save(surface, current_frame)
-            reference_paths = (
-                (self.contract.reference_frame,) if self._turn_index == 0 else ()
-            )
+            reference_paths = self._first_turn_reference_paths()
             output = self._get_session().run_turn(
                 prompt=self._prompt(),
                 image_path=current_frame,
@@ -82,6 +80,24 @@ class CodexWindowsAgent:
         self._turn_index += 1
         self.replans += 1
         return self._parse_payload(output)
+
+    def _first_turn_reference_paths(self) -> tuple[Path, ...]:
+        if self._turn_index != 0:
+            return ()
+        paths = [self.contract.reference_frame]
+        experience = self.contract.semantic_experience
+        if experience is not None:
+            evidence = experience.evidence_paths(experience.source_path.parent)
+            if len(evidence) > 4:
+                indexes = {
+                    round(index * (len(evidence) - 1) / 3)
+                    for index in range(4)
+                }
+                evidence = tuple(evidence[index] for index in sorted(indexes))
+            for path in evidence:
+                if path not in paths:
+                    paths.append(path)
+        return tuple(paths)
 
     def observe_transition(self, action: ActionCall, applied: bool) -> None:
         payload = json.dumps(action.to_payload(), ensure_ascii=False, separators=(",", ":"))
@@ -120,6 +136,7 @@ class CodexWindowsAgent:
             )
 
         demonstration = [action.to_payload() for action in self.contract.demonstration]
+        semantic_context = self._semantic_context()
         allowed_skills = self._allowed_skills()
         execution_context = (
             "Execution mode: background window messages. The target stays behind the user's "
@@ -148,6 +165,9 @@ class CodexWindowsAgent:
             "read files, or use tools. Image 1 is the current target client area. Image 2 is the "
             "human-reviewed successful reference frame. Compare them visually. The local motor "
             "controller alone will execute your structured actions.\n\n"
+            "The compiled Trace is mandatory guidance: preserve its demonstrated stage order and "
+            "checkpoints unless the current pixels require a deviation. Explain any deviation in "
+            "the response reason.\n"
             f"{task_context}"
             f"Allowed motor skills: {', '.join(allowed_skills)}\n"
             f"{execution_context}"
@@ -160,8 +180,9 @@ class CodexWindowsAgent:
             "A recorded <runtime-text-N> value is a reserved semantic marker: resolve it from the "
             "current run instruction and the visibly focused field. Never return or type that marker "
             "literally.\n"
-            f"Recorded demonstration (a hint, not a fixed script): "
+            f"Recorded demonstration (the structural guide; adapt values, not stage order): "
             f"{json.dumps(demonstration, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"{semantic_context}"
             f"Recent execution history:\n{history}\n\n"
             "If Image 1 already satisfies the success condition, return task_complete=true and "
             "no actions. Otherwise return task_complete=false and a safe next action batch "
@@ -170,6 +191,29 @@ class CodexWindowsAgent:
             "screen, uncertain branch, or state-dependent target. Replan from current pixels rather "
             "than blindly copying recorded coordinates. Never interact outside Image 1. The "
             "response must match the supplied JSON schema."
+        )
+
+    def _semantic_context(self) -> str:
+        experience = self.contract.semantic_experience
+        if experience is None:
+            return "Semantic stage interpretation: unavailable; rely on raw demonstration evidence.\n"
+        references = self._first_turn_reference_paths()
+        image_map = [
+            {
+                "image": index,
+                "path": path.resolve().relative_to(experience.source_path.parent).as_posix(),
+            }
+            for index, path in enumerate(references[1:], start=3)
+        ]
+        return (
+            "Compiler Agent semantic experience (derived and reviewable; raw human Trace remains "
+            "stronger evidence): "
+            f"{json.dumps(experience.prompt_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
+            "Semantic evidence images after the final success reference: "
+            f"{json.dumps(image_map, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Use stage preconditions and expected effects to interpret the current state. Choices "
+            "marked runtime_agent_decides or unknown must be decided from the current screenshot, "
+            "not copied from the single demonstration.\n"
         )
 
     def _output_schema(self) -> dict[str, Any]:

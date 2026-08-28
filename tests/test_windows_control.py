@@ -300,6 +300,10 @@ def test_parameterized_actions_are_normalized_and_strict() -> None:
             "duration_ms": 650,
         },
     )
+    mouse_hold = ActionCall(
+        "hold_mouse",
+        {"x": 0.3, "y": 0.4, "duration_ms": 1_100},
+    )
     text = ActionCall("type_text", {"text": "给文件传输助手发送：测试😊"})
 
     assert hold.to_payload() == {
@@ -308,6 +312,12 @@ def test_parameterized_actions_are_normalized_and_strict() -> None:
     }
     assert click.args == {"x": 1.0, "y": 0.25, "button": "left"}
     assert drag.args["button"] == "left"
+    assert mouse_hold.args == {
+        "x": 0.3,
+        "y": 0.4,
+        "duration_ms": 1_100,
+        "button": "left",
+    }
     assert text.args == {"text": "给文件传输助手发送：测试😊"}
 
     with pytest.raises(ActionValidationError, match="exactly"):
@@ -550,6 +560,50 @@ def test_drag_interpolates_pointer_and_always_releases_button() -> None:
     assert backend.events[-2:] == [("cursor", 400, 350), ("mouse", "left", False)]
     assert len([event for event in backend.events if event[0] == "cursor"]) == 4
     assert sleeps == [0.016, 0.016, 0.016]
+
+
+def test_mouse_hold_preserves_duration_and_always_releases_button() -> None:
+    backend = FakeWindowsBackend([window()], foreground=7)
+    sleeps: list[float] = []
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=sleeps.append,
+    )
+
+    result = executor.execute(
+        ActionCall(
+            "hold_mouse",
+            {"x": 0.25, "y": 0.25, "duration_ms": 1_112, "button": "left"},
+        )
+    )
+
+    assert result.screen_position == (200, 250)
+    assert backend.events == [
+        ("cursor", 200, 250),
+        ("mouse", "left", True),
+        ("mouse", "left", False),
+    ]
+    assert sleeps == [1.112]
+
+
+def test_background_mouse_hold_targets_window_without_foreground_focus() -> None:
+    backend = FakeWindowsBackend([window()], foreground=99)
+    sleeps: list[float] = []
+    executor = WindowsMotorExecutor(
+        WindowSession(WindowSelector(handle=7), backend),
+        sleeper=sleeps.append,
+        background=True,
+    )
+
+    executor.execute(
+        ActionCall("hold_mouse", {"x": 0.25, "y": 0.25, "duration_ms": 1_100})
+    )
+
+    assert backend.events == [
+        ("window_mouse", 7, 100, 50, "left", True, False),
+        ("window_mouse", 7, 100, 50, "left", False, False),
+    ]
+    assert sleeps == [1.1]
 
 
 def test_background_drag_posts_held_mouse_moves_to_target() -> None:

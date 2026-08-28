@@ -353,6 +353,21 @@ select:focus, textarea:focus {
 .record-flow p { margin: 0; color: #53615a; font-size: 12px; }
 
 .library-card { padding-bottom: 24px; }
+.compiler-settings-panel {
+  margin: 0 0 22px;
+  padding: 14px;
+  background: linear-gradient(135deg, #f1f7f4, #f7faf8);
+  border: 1px solid #dfeae4;
+  border-radius: 13px;
+}
+.compiler-settings-copy strong { color: var(--green-dark); font-size: 12px; }
+.compiler-settings-copy p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.compiler-agent-settings { margin-top: 12px; }
 .library-heading {
   display: flex;
   align-items: center;
@@ -408,6 +423,24 @@ select:focus, textarea:focus {
 .mini-tag.ok { color: var(--green-dark); background: var(--green-soft); border-color: transparent; }
 .mini-tag.warn { color: #7c4d18; background: var(--amber-soft); border-color: transparent; }
 .library-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.semantic-storyboard {
+  margin-top: 10px;
+  padding: 9px;
+  background: white;
+  border: 1px solid #e2e8e4;
+  border-radius: 9px;
+}
+.semantic-storyboard summary {
+  color: #405049;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 750;
+}
+.semantic-stages { display: grid; gap: 7px; margin-top: 9px; }
+.semantic-stage { padding-left: 8px; border-left: 2px solid var(--green-soft); }
+.semantic-stage strong { color: #34423b; font-size: 10px; }
+.semantic-stage p { margin: 3px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.semantic-stage .semantic-uncertain { color: #8a5a21; }
 .mini-button {
   padding: 6px 8px;
   color: #405049;
@@ -419,6 +452,8 @@ select:focus, textarea:focus {
   font-weight: 750;
 }
 .mini-button.accent { color: white; background: var(--green); border-color: var(--green); }
+.mini-button.danger { color: #a13d35; border-color: #efd5d2; }
+.mini-button.danger:hover { background: #fff1ef; }
 .empty-list { padding: 20px 8px; color: var(--muted); text-align: center; font-size: 11px; }
 
 .safety-note {

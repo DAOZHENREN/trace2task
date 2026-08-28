@@ -18,6 +18,8 @@ class TaskPack:
     max_actions: int
     review_status: str
     requires_confirmation: bool
+    experience_intent: str
+    experience_examples: tuple[str, ...]
     source_path: Path
 
 
@@ -52,6 +54,14 @@ def load_taskpack(path: Path) -> TaskPack:
         review_mapping = _require_mapping(review, "review")
         review_status = review_mapping.get("status")
         requires_confirmation = review_mapping.get("requires_confirmation")
+    experience = root.get("experience")
+    if experience is None:
+        experience_intent = task_id
+        experience_examples = [task_id]
+    else:
+        experience_mapping = _require_mapping(experience, "experience")
+        experience_intent = experience_mapping.get("intent", task_id)
+        experience_examples = experience_mapping.get("examples", [task_id])
 
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("Task pack must define a non-empty string 'id'")
@@ -79,6 +89,13 @@ def load_taskpack(path: Path) -> TaskPack:
         raise TypeError("Task pack review.requires_confirmation must be a boolean")
     if (review_status == "draft") != requires_confirmation:
         raise ValueError("Draft task packs must require confirmation, and confirmed packs must not")
+    if not isinstance(experience_intent, str) or not experience_intent.strip():
+        raise ValueError("Task pack experience.intent must be a non-empty string")
+    if (
+        not isinstance(experience_examples, list)
+        or not all(isinstance(example, str) and example.strip() for example in experience_examples)
+    ):
+        raise ValueError("Task pack experience.examples must be a string list")
 
     return TaskPack(
         task_id=task_id.strip(),
@@ -90,5 +107,7 @@ def load_taskpack(path: Path) -> TaskPack:
         max_actions=max_actions,
         review_status=review_status,
         requires_confirmation=requires_confirmation,
+        experience_intent=experience_intent.strip(),
+        experience_examples=tuple(" ".join(example.split()) for example in experience_examples),
         source_path=source_path,
     )

@@ -26,8 +26,14 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_REASONING_EFFORT,
 )
 from trace2task.compiler import compile_trace, confirm_taskpack
+from trace2task.experience import route_experience
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import Win32Backend, WindowSelector, list_window_records
+from trace2task.windows_experience import (
+    DEFAULT_COMPILER_MODEL,
+    DEFAULT_COMPILER_REASONING_EFFORT,
+    compile_windows_semantic_experience,
+)
 from trace2task.windows_recording import InputSnapshot, Win32InputMonitor, record_window_trace
 from trace2task.windows_runner import (
     EmergencyStopRequested,
@@ -65,6 +71,9 @@ class ConsoleJob:
     mode: str
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT
+    selection_mode: str = "manual"
+    selection_confidence: float | None = None
+    selection_reason: str | None = None
     kind: str = "agent"
     status: str = "queued"
     created_at: str = field(default_factory=_now)
@@ -84,6 +93,9 @@ class ConsoleJob:
             "mode": self.mode,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "selection_mode": self.selection_mode,
+            "selection_confidence": self.selection_confidence,
+            "selection_reason": self.selection_reason,
             "kind": self.kind,
             "status": self.status,
             "created_at": self.created_at,
@@ -145,6 +157,7 @@ class ConsoleRecordingMonitor:
             cursor_position=snapshot.cursor_position,
             success_requested=snapshot.success_requested,
             cancel_requested=True,
+            sampled_at=snapshot.sampled_at,
         )
 
     def close(self) -> None:
@@ -160,6 +173,7 @@ class WebConsoleController:
     def __init__(self, project_root: Path, *, runner: Runner = run_windows_agent) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.task_root = (self.project_root / "taskpacks").resolve()
+        self.candidate_root = (self.project_root / "runs" / "candidates").resolve()
         self.runner = runner
         self._lock = threading.RLock()
         self._jobs: dict[str, ConsoleJob] = {}
@@ -170,6 +184,8 @@ class WebConsoleController:
             return []
         records: list[tuple[float, dict[str, Any]]] = []
         for path in self.task_root.rglob("task.yaml"):
+            if ".trash" in path.relative_to(self.task_root).parts:
+                continue
             try:
                 contract = load_windows_task(path)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -191,6 +207,7 @@ class WebConsoleController:
                 if is_messaging_target
                 else []
             )
+            semantic = contract.semantic_experience
             records.append(
                 (
                     path.stat().st_mtime,
@@ -207,12 +224,51 @@ class WebConsoleController:
                         "title_contains": contract.selector.title_contains,
                         "actions": list(contract.task.actions),
                         "max_actions": contract.task.max_actions,
+                        "experience_intent": contract.task.experience_intent,
+                        "experience_examples": list(contract.task.experience_examples),
+                        "semantic_experience": (
+                            {
+                                "status": semantic.review_status,
+                                "goal": semantic.goal,
+                                "summary": semantic.summary,
+                                "model": semantic.model,
+                                "reasoning_effort": semantic.reasoning_effort,
+                                "stage_count": len(semantic.stages),
+                                "stages": [
+                                    {
+                                        "id": stage.stage_id,
+                                        "name": stage.name,
+                                        "state_before": stage.state_before.description,
+                                        "intent": stage.action_intents[0].description,
+                                        "state_after": stage.state_after.description,
+                                        "confidence": stage.confidence,
+                                        "dynamic_decisions": [
+                                            {
+                                                "description": decision.description,
+                                                "generalization": decision.generalization,
+                                                "confidence": decision.confidence,
+                                            }
+                                            for decision in stage.dynamic_decisions
+                                        ],
+                                    }
+                                    for stage in semantic.stages
+                                ],
+                            }
+                            if semantic is not None
+                            else None
+                        ),
                         "missing_message_capabilities": missing_capabilities,
                     },
                 )
             )
         records.sort(key=lambda item: item[0], reverse=True)
         return [record for _, record in records]
+
+    def route_instruction(self, instruction: str) -> dict[str, Any]:
+        taskpacks = self.list_taskpacks()
+        match = route_experience(instruction, taskpacks)
+        selected = next(task for task in taskpacks if task["path"] == match.task_path)
+        return {**match.to_payload(), "task": selected}
 
     def list_windows(self) -> list[dict[str, Any]]:
         return list_window_records(backend=Win32Backend())["windows"]
@@ -254,6 +310,38 @@ class WebConsoleController:
         records.sort(key=lambda item: item[0], reverse=True)
         return [record for _, record in records]
 
+    def list_candidates(self) -> list[dict[str, Any]]:
+        if not self.candidate_root.is_dir():
+            return []
+        records: list[tuple[float, dict[str, Any]]] = []
+        for path in self.candidate_root.glob("*/candidate.yaml"):
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(data, dict) or data.get("status") != "pending_review":
+                continue
+            records.append(
+                (
+                    path.stat().st_mtime,
+                    {
+                        "candidate_id": data.get("candidate_id"),
+                        "status": data.get("status"),
+                        "task_id": data.get("task_id"),
+                        "instruction": data.get("runtime_instruction"),
+                        "source_task": data.get("source_task"),
+                        "execution_trace": data.get("execution_trace"),
+                        "created_at": data.get("created_at"),
+                        "metrics": data.get("metrics") or {},
+                        "local_path": path.parent.relative_to(
+                            self.project_root
+                        ).as_posix(),
+                    },
+                )
+            )
+        records.sort(key=lambda item: item[0], reverse=True)
+        return [record for _, record in records]
+
     def start_job(
         self,
         *,
@@ -272,7 +360,17 @@ class WebConsoleController:
             raise ValueError(f"不支持的模型：{model}")
         if reasoning_effort not in CODEX_REASONING_EFFORTS:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
-        resolved_task = self._resolve_task_path(task_path)
+        if isinstance(task_path, str) and task_path.strip():
+            resolved_task = self._resolve_task_path(task_path)
+            selection_mode = "manual"
+            selection_confidence = None
+            selection_reason = "用户手动选择 Trace 经验"
+        else:
+            routed = self.route_instruction(normalized_instruction)
+            resolved_task = self._resolve_task_path(routed["task_path"])
+            selection_mode = "auto"
+            selection_confidence = float(routed["confidence"])
+            selection_reason = str(routed["reason"])
         contract = load_windows_task(resolved_task)
         if execute and contract.task.requires_confirmation:
             raise ValueError("这个示范任务仍是草稿，确认任务包后才能执行")
@@ -293,7 +391,15 @@ class WebConsoleController:
                 mode="execute" if execute else "plan",
                 model=model,
                 reasoning_effort=reasoning_effort,
+                selection_mode=selection_mode,
+                selection_confidence=selection_confidence,
+                selection_reason=selection_reason,
             )
+            if selection_mode == "auto":
+                job.logs.append(
+                    f"自动选择经验：{contract.task.task_id}（置信度 "
+                    f"{selection_confidence:.0%}）。{selection_reason}"
+                )
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
         thread = threading.Thread(
@@ -305,7 +411,14 @@ class WebConsoleController:
         thread.start()
         return job.snapshot()
 
-    def start_recording(self, *, handle: int, task_id: str) -> dict[str, Any]:
+    def start_recording(
+        self,
+        *,
+        handle: int,
+        task_id: str,
+        model: str = DEFAULT_COMPILER_MODEL,
+        reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+    ) -> dict[str, Any]:
         normalized_task_id = " ".join(task_id.split())
         if not normalized_task_id:
             raise ValueError("请输入经验名称")
@@ -313,6 +426,10 @@ class WebConsoleController:
             raise ValueError("经验名称不能超过 80 个字符")
         if re.search(r"[\\/:*?\"<>|\x00-\x1f]", normalized_task_id):
             raise ValueError("经验名称包含 Windows 路径不支持的字符")
+        if model not in CODEX_MODELS:
+            raise ValueError(f"不支持的模型：{model}")
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         windows = self.list_windows()
         selected = next((window for window in windows if window["handle"] == handle), None)
         if selected is None:
@@ -326,6 +443,8 @@ class WebConsoleController:
                 instruction=f"录制 {selected['process_name']} - {selected['title']}",
                 mode="record",
                 kind="recording",
+                model=model,
+                reasoning_effort=reasoning_effort,
             )
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
@@ -377,13 +496,212 @@ class WebConsoleController:
         result = confirm_taskpack(task_path)
         return _jsonable(result)
 
-    def compile_recording(self, raw_path: str) -> dict[str, Any]:
+    def compile_recording(
+        self,
+        raw_path: str,
+        *,
+        model: str = DEFAULT_COMPILER_MODEL,
+        reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+    ) -> dict[str, Any]:
         trace_path = self._resolve_recording_trace(raw_path)
-        result = compile_trace(
+        return self._compile_trace_bundle(
             trace_path,
-            self.project_root / "taskpacks" / "generated" / "web",
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
-        return _jsonable(result)
+
+    def start_compilation(
+        self,
+        raw_path: str,
+        *,
+        model: str = DEFAULT_COMPILER_MODEL,
+        reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+    ) -> dict[str, Any]:
+        trace_path = self._resolve_recording_trace(raw_path)
+        metadata_path = trace_path.with_name("metadata.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        task_id = str(metadata.get("task_id") or trace_path.parent.name)
+        if model not in CODEX_MODELS:
+            raise ValueError(f"不支持的模型：{model}")
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        with self._lock:
+            self._require_idle()
+            job = ConsoleJob(
+                job_id=uuid.uuid4().hex,
+                task_path="",
+                task_id=task_id,
+                instruction=f"编译原始 Trace：{trace_path.parent.name}",
+                mode="compile",
+                kind="compilation",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            job.logs.append("编译请求已接收，正在准备人类 Trace 证据。")
+            self._jobs[job.job_id] = job
+            self._active_job_id = job.job_id
+        thread = threading.Thread(
+            target=self._run_compilation,
+            args=(job, trace_path),
+            name=f"trace2task-compile-{job.job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return job.snapshot()
+
+    def _compile_trace_bundle(
+        self,
+        trace_path: Path,
+        *,
+        model: str,
+        reasoning_effort: str,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        if model not in CODEX_MODELS:
+            raise ValueError(f"不支持的模型：{model}")
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        report = status_callback or (lambda message: None)
+        existing_task = self._find_taskpack_for_trace(trace_path)
+        if existing_task is None:
+            report("正在把原始输入编译为确定性动作证据。")
+            result = compile_trace(
+                trace_path,
+                self.project_root / "taskpacks" / "generated" / "web",
+            )
+            payload = _jsonable(result)
+            semantic_task = Path(result.task_path)
+            payload["reused_taskpack"] = False
+        else:
+            report("检测到同一原始 Trace 的任务包，将重新生成语义层，不再创建副本。")
+            contract = load_windows_task(existing_task)
+            semantic_task = existing_task
+            payload = {
+                "task_id": contract.task.task_id,
+                "task_path": str(existing_task),
+                "source_trace": str(trace_path),
+                "demonstration_actions": len(contract.demonstration),
+                "review_status": contract.task.review_status,
+                "requires_confirmation": contract.task.requires_confirmation,
+                "reused_taskpack": True,
+            }
+        report("动作证据已就绪，Compiler Agent 正在理解阶段、状态和动作意图。")
+        try:
+            semantic = compile_windows_semantic_experience(
+                semantic_task,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception as error:  # noqa: BLE001 - deterministic artifact remains useful
+            payload["semantic_compilation"] = {
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+        else:
+            payload["review_status"] = "draft"
+            payload["requires_confirmation"] = True
+            payload["semantic_compilation"] = {
+                "status": "completed",
+                "result": _jsonable(semantic),
+            }
+        return payload
+
+    def _find_taskpack_for_trace(self, trace_path: Path) -> Path | None:
+        source_trace = trace_path.resolve()
+        matches: list[Path] = []
+        if not self.task_root.is_dir():
+            return None
+        for report_path in self.task_root.rglob("compiler-report.json"):
+            if ".trash" in report_path.relative_to(self.task_root).parts:
+                continue
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                raw_source = (report.get("source") or {}).get("trace")
+                if not isinstance(raw_source, str) or not raw_source:
+                    continue
+                candidate_source = Path(raw_source)
+                if not candidate_source.is_absolute():
+                    candidate_source = self.project_root / candidate_source
+                task_path = report_path.with_name("task.yaml")
+                if candidate_source.resolve() == source_trace and task_path.is_file():
+                    matches.append(task_path)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if not matches:
+            return None
+        return max(matches, key=lambda path: path.stat().st_mtime)
+
+    def delete_taskpack(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            task_path = self._resolve_task_path(raw_path)
+            return self._move_to_trash(
+                task_path.parent,
+                allowed_root=self.task_root,
+                trash_root=self.task_root / ".trash",
+                kind="taskpack",
+            )
+
+    def delete_recording(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            trace_path = self._resolve_recording_trace(raw_path)
+            runs_root = (self.project_root / "runs").resolve()
+            return self._move_to_trash(
+                trace_path.parent,
+                allowed_root=runs_root,
+                trash_root=runs_root / ".trash" / "recordings",
+                kind="recording",
+            )
+
+    def delete_candidate(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError("缺少候选经验路径")
+            candidate = (self.project_root / raw_path).resolve()
+            if (
+                not candidate.is_relative_to(self.candidate_root)
+                or candidate == self.candidate_root
+                or not (candidate / "candidate.yaml").is_file()
+            ):
+                raise ValueError("候选经验路径必须指向 runs/candidates 中的有效目录")
+            runs_root = (self.project_root / "runs").resolve()
+            return self._move_to_trash(
+                candidate,
+                allowed_root=self.candidate_root,
+                trash_root=runs_root / ".trash" / "candidates",
+                kind="candidate",
+            )
+
+    def _move_to_trash(
+        self,
+        target: Path,
+        *,
+        allowed_root: Path,
+        trash_root: Path,
+        kind: str,
+    ) -> dict[str, Any]:
+        resolved_target = target.resolve()
+        resolved_root = allowed_root.resolve()
+        resolved_trash = trash_root.resolve()
+        if (
+            resolved_target == resolved_root
+            or not resolved_target.is_relative_to(resolved_root)
+            or resolved_target.is_relative_to(resolved_trash)
+            or not resolved_target.is_dir()
+        ):
+            raise ValueError("删除目标不在允许的本地资产目录中")
+        resolved_trash.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+        destination = resolved_trash / f"{stamp}-{resolved_target.name}"
+        resolved_target.replace(destination)
+        return {
+            "deleted": True,
+            "kind": kind,
+            "trash_path": destination.relative_to(self.project_root).as_posix(),
+            "recoverable": True,
+        }
 
     def open_local(self, raw_path: str) -> dict[str, Any]:
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -494,11 +812,15 @@ class WebConsoleController:
             )
             payload = asdict(result)
             if result.success:
-                self._update(job, log="示范录制成功，正在自动编译为草稿经验。")
+                self._update(
+                    job,
+                    log="示范录制成功，正在编译动作证据并由 Compiler Agent 理解阶段。",
+                )
                 try:
-                    compilation = compile_trace(
+                    compilation = self._compile_trace_bundle(
                         Path(result.trace_path),
-                        self.project_root / "taskpacks" / "generated" / "web",
+                        model=job.model,
+                        reasoning_effort=job.reasoning_effort,
                     )
                 except Exception as error:  # noqa: BLE001 - preserve successful recording
                     payload["compilation"] = {
@@ -516,14 +838,22 @@ class WebConsoleController:
                     )
                 else:
                     payload["compilation"] = {
-                        "status": "completed",
-                        "result": _jsonable(compilation),
+                        "status": (
+                            "completed"
+                            if compilation["semantic_compilation"]["status"] == "completed"
+                            else "partial"
+                        ),
+                        "result": compilation,
                     }
                     self._update(
                         job,
-                        status="completed",
+                        status=payload["compilation"]["status"],
                         result=payload,
-                        log="草稿经验已生成。",
+                        log=(
+                            "V0.7 语义经验草稿已生成，请到本地经验中审查阶段。"
+                            if payload["compilation"]["status"] == "completed"
+                            else "动作任务包已生成，但 Compiler Agent 语义编译失败，可稍后重试。"
+                        ),
                     )
             else:
                 self._update(job, status="stopped", result=payload, log="录制未标记成功。")
@@ -533,6 +863,34 @@ class WebConsoleController:
                 status="failed",
                 error=f"{type(error).__name__}: {error}",
                 log=f"录制失败：{type(error).__name__}: {error}",
+            )
+
+    def _run_compilation(self, job: ConsoleJob, trace_path: Path) -> None:
+        self._update(job, status="running", log="编译任务已启动。")
+        try:
+            payload = self._compile_trace_bundle(
+                trace_path,
+                model=job.model,
+                reasoning_effort=job.reasoning_effort,
+                status_callback=lambda message: self._update(job, log=message),
+            )
+            semantic_status = payload["semantic_compilation"]["status"]
+            self._update(
+                job,
+                status="completed" if semantic_status == "completed" else "partial",
+                result=payload,
+                log=(
+                    "语义经验草稿已生成，请展开阶段并审核确认。"
+                    if semantic_status == "completed"
+                    else "动作任务包已保留，但 Compiler Agent 语义编译失败，可再次重试。"
+                ),
+            )
+        except Exception as error:  # noqa: BLE001 - compilation must become UI state
+            self._update(
+                job,
+                status="failed",
+                error=f"{type(error).__name__}: {error}",
+                log=f"编译失败：{type(error).__name__}: {error}",
             )
 
     def _run_job(self, job: ConsoleJob, task_path: Path, execute: bool) -> None:
@@ -553,6 +911,21 @@ class WebConsoleController:
             payload = _jsonable(result)
             if not isinstance(payload, dict):
                 payload = {"value": payload}
+            if execute and payload.get("task_complete") is True:
+                try:
+                    candidate = self._save_candidate(job, payload)
+                except Exception as error:  # noqa: BLE001 - execution already succeeded
+                    self._update(
+                        job,
+                        log=f"任务已成功，但候选经验保存失败：{type(error).__name__}: {error}",
+                    )
+                else:
+                    if candidate is not None:
+                        payload["candidate_experience"] = candidate
+                        self._update(
+                            job,
+                            log="本次成功运行已保存为待审核候选经验。",
+                        )
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
             self._update(job, status=final_status, result=payload, log="任务运行结束。")
         except Exception as error:  # noqa: BLE001 - job failures must become UI state
@@ -562,6 +935,62 @@ class WebConsoleController:
                 error=f"{type(error).__name__}: {error}",
                 log=f"运行失败：{type(error).__name__}: {error}",
             )
+
+    def _save_candidate(
+        self,
+        job: ConsoleJob,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        raw_trace_path = payload.get("trace_path")
+        if not isinstance(raw_trace_path, str) or not raw_trace_path.strip():
+            return None
+        trace_path = Path(raw_trace_path)
+        if not trace_path.is_absolute():
+            trace_path = self.project_root / trace_path
+        trace_path = trace_path.resolve()
+        runs_root = (self.project_root / "runs").resolve()
+        if not trace_path.is_relative_to(runs_root) or not trace_path.is_file():
+            return None
+
+        created_at = _now()
+        directory_name = (
+            f"{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}-{job.job_id[:8]}"
+        )
+        candidate_dir = self.candidate_root / directory_name
+        candidate_dir.mkdir(parents=True, exist_ok=False)
+        candidate_id = f"candidate-{job.job_id[:12]}"
+        manifest = {
+            "schema_version": "0.1",
+            "candidate_id": candidate_id,
+            "status": "pending_review",
+            "created_at": created_at,
+            "source_task": job.task_path,
+            "task_id": job.task_id,
+            "runtime_instruction": job.instruction,
+            "execution_trace": trace_path.relative_to(self.project_root).as_posix(),
+            "model": job.model,
+            "reasoning_effort": job.reasoning_effort,
+            "selection": {
+                "mode": job.selection_mode,
+                "confidence": job.selection_confidence,
+                "reason": job.selection_reason,
+            },
+            "metrics": {
+                "executed_actions": payload.get("executed_actions", 0),
+                "replans": payload.get("replans", 0),
+                "planning_ms": payload.get("planning_ms", 0),
+            },
+        }
+        manifest_path = candidate_dir / "candidate.yaml"
+        manifest_path.write_text(
+            yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True, width=100),
+            encoding="utf-8",
+        )
+        return {
+            "candidate_id": candidate_id,
+            "status": "pending_review",
+            "local_path": candidate_dir.relative_to(self.project_root).as_posix(),
+        }
 
     def _update(
         self,
@@ -597,6 +1026,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     "version": __version__,
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
+                    "candidates": self.controller.list_candidates(),
                     "active_job": self.controller.active_job(),
                     "agent_options": {
                         "models": list(CODEX_MODELS),
@@ -604,6 +1034,10 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "defaults": {
                             "model": DEFAULT_CODEX_MODEL,
                             "reasoning_effort": DEFAULT_CODEX_REASONING_EFFORT,
+                        },
+                        "compiler_defaults": {
+                            "model": DEFAULT_COMPILER_MODEL,
+                            "reasoning_effort": DEFAULT_COMPILER_REASONING_EFFORT,
                         },
                     },
                 }
@@ -647,10 +1081,19 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
+            if parsed.path == "/api/experience-route":
+                self._json(
+                    self.controller.route_instruction(payload.get("instruction", ""))
+                )
+                return
             if parsed.path == "/api/recordings":
                 result = self.controller.start_recording(
                     handle=payload.get("handle"),
                     task_id=payload.get("task_id", ""),
+                    model=payload.get("model", DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get(
+                        "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
+                    ),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
@@ -664,7 +1107,27 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/recordings/compile":
                 self._json(
-                    self.controller.compile_recording(payload.get("trace_path", ""))
+                    self.controller.start_compilation(
+                        payload.get("trace_path", ""),
+                        model=payload.get("model", DEFAULT_COMPILER_MODEL),
+                        reasoning_effort=payload.get(
+                            "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
+                        ),
+                    ),
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+            if parsed.path == "/api/taskpacks/delete":
+                self._json(self.controller.delete_taskpack(payload.get("task_path", "")))
+                return
+            if parsed.path == "/api/recordings/delete":
+                self._json(
+                    self.controller.delete_recording(payload.get("trace_path", ""))
+                )
+                return
+            if parsed.path == "/api/candidates/delete":
+                self._json(
+                    self.controller.delete_candidate(payload.get("path", ""))
                 )
                 return
             if parsed.path == "/api/open-local":

@@ -7,12 +7,15 @@ from typing import Any
 
 import pygame
 
+from trace2task import recording as recording_module
+from trace2task.compiler import compile_trace
 from trace2task.windows_capture import capture_window_once
 from trace2task.windows_control import WindowInfo, WindowSelector, WindowSession
 from trace2task.windows_recording import (
     CONTROL_KEY_CODES,
     VK_F8,
     VK_F9,
+    BufferedInputMonitor,
     InputSnapshot,
     Win32InputMonitor,
     WindowRecorder,
@@ -80,6 +83,27 @@ class FakeCapture:
         surface = pygame.Surface((target.client_width, target.client_height))
         surface.fill((30, 80, 140))
         return surface
+
+
+class AdvancingClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class SlowClockCapture(FakeCapture):
+    def __init__(self, clock: AdvancingClock) -> None:
+        super().__init__()
+        self.clock = clock
+
+    def capture(self, target: WindowInfo) -> pygame.Surface:
+        self.clock.advance(1.1)
+        return super().capture(target)
 
 
 class FakePollingUser32:
@@ -279,6 +303,60 @@ def test_window_recorder_saves_raw_input_transitions_and_target_frames(tmp_path:
     assert monitor.started and monitor.closed
     assert backend.events == [("focus", 7)]
     assert "Press F8" in statuses[0]
+
+
+def test_buffered_sampler_preserves_fast_click_while_frame_capture_is_slow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    backend = FakeBackend(window())
+    trace_clock = AdvancingClock()
+    monkeypatch.setattr(recording_module, "perf_counter", trace_clock)
+    inner = SequenceMonitor(
+        [
+            snapshot(),
+            snapshot(buttons={"left"}, cursor=(300, 250)),
+            snapshot(cursor=(300, 250)),
+            snapshot(success=True),
+        ]
+    )
+    buffered = BufferedInputMonitor(
+        inner,
+        poll_hz=120,
+        clock=StepClock(),
+        sleeper=lambda _: None,
+    )
+    recorder = WindowRecorder(
+        WindowSession(WindowSelector(handle=7), backend),
+        SlowClockCapture(trace_clock),
+        buffered,
+        clock=StepClock(),
+        sleeper=lambda _: None,
+        status_callback=lambda _: None,
+    )
+
+    result = recorder.record(task_id="slow-capture-click", output_root=tmp_path)
+    events = trace_events(Path(result.trace_path))
+    inputs = [event for event in events if event["type"] == "windows_input"]
+    top_level_duration = inputs[1]["elapsed_ms"] - inputs[0]["elapsed_ms"]
+    sampled_duration = (
+        inputs[1]["details"]["raw_input"]["sampled_elapsed_ms"]
+        - inputs[0]["details"]["raw_input"]["sampled_elapsed_ms"]
+    )
+    compilation = compile_trace(Path(result.trace_path), tmp_path / "compiled")
+    demonstration = json.loads(
+        (Path(compilation.task_path).parent / "demonstration.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert top_level_duration == 1100.0
+    assert sampled_duration == 1.0
+    assert [item["action"]["skill"] for item in demonstration["actions"]] == [
+        "focus_window",
+        "click",
+    ]
+    assert inner.closed
 
 
 def test_recorder_pauses_on_focus_loss_and_does_not_capture_other_app_input(

@@ -1,0 +1,942 @@
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pygame
+import yaml
+
+from trace2task import __version__
+from trace2task.codex_agent import resolve_codex_binary
+from trace2task.codex_app_server import (
+    CodexAppServerSession,
+)
+
+MAX_EVIDENCE_IMAGES = 12
+CONTACT_SHEET_COLUMNS = 3
+CONTACT_SHEET_ROWS = 2
+CONTACT_SHEET_THUMBNAIL = (320, 190)
+CONTACT_SHEET_LABEL_HEIGHT = 24
+MAX_SEMANTIC_STAGES = 12
+SCREEN_CHANGE_THRESHOLD = 0.12
+TEMPORAL_BOUNDARY_MS = 1_500
+PROVENANCE_VALUES = {"observed", "inferred", "unknown"}
+GENERALIZATION_VALUES = {"demonstrated_only", "runtime_agent_decides", "unknown"}
+DEFAULT_COMPILER_MODEL = "gpt-5.6-sol"
+DEFAULT_COMPILER_REASONING_EFFORT = "high"
+
+BinaryResolver = Callable[[str], str]
+SessionFactory = Callable[..., CodexAppServerSession]
+
+
+@dataclass(frozen=True)
+class ExperienceState:
+    description: str
+    evidence_frame: str
+    visual_anchors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ActionIntent:
+    start_action_index: int
+    end_action_index: int
+    description: str
+    target: str
+    provenance: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class DynamicDecision:
+    description: str
+    generalization: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ExperienceStage:
+    stage_id: str
+    name: str
+    start_action_index: int
+    end_action_index: int
+    state_before: ExperienceState
+    action_intents: tuple[ActionIntent, ...]
+    preconditions: tuple[str, ...]
+    expected_effects: tuple[str, ...]
+    state_after: ExperienceState
+    dynamic_decisions: tuple[DynamicDecision, ...]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class SemanticExperience:
+    goal: str
+    summary: str
+    stages: tuple[ExperienceStage, ...]
+    source_type: str
+    model: str
+    reasoning_effort: str
+    review_status: str
+    requires_confirmation: bool
+    source_path: Path
+
+    def prompt_payload(self) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "summary": self.summary,
+            "stages": [
+                {
+                    "id": stage.stage_id,
+                    "name": stage.name,
+                    "action_range": [
+                        stage.start_action_index,
+                        stage.end_action_index,
+                    ],
+                    "state_before": {
+                        "description": stage.state_before.description,
+                        "evidence_frame": stage.state_before.evidence_frame,
+                        "visual_anchors": list(stage.state_before.visual_anchors),
+                    },
+                    "action_intents": [
+                        {
+                            "action_range": [
+                                intent.start_action_index,
+                                intent.end_action_index,
+                            ],
+                            "description": intent.description,
+                            "target": intent.target,
+                            "provenance": intent.provenance,
+                            "confidence": intent.confidence,
+                        }
+                        for intent in stage.action_intents
+                    ],
+                    "preconditions": list(stage.preconditions),
+                    "expected_effects": list(stage.expected_effects),
+                    "state_after": {
+                        "description": stage.state_after.description,
+                        "evidence_frame": stage.state_after.evidence_frame,
+                        "visual_anchors": list(stage.state_after.visual_anchors),
+                    },
+                    "dynamic_decisions": [
+                        {
+                            "description": decision.description,
+                            "generalization": decision.generalization,
+                            "confidence": decision.confidence,
+                        }
+                        for decision in stage.dynamic_decisions
+                    ],
+                    "confidence": stage.confidence,
+                }
+                for stage in self.stages
+            ],
+        }
+
+    def evidence_paths(self, task_root: Path) -> tuple[Path, ...]:
+        relative_paths = [
+            relative
+            for stage in self.stages
+            for relative in (
+                stage.state_before.evidence_frame,
+                stage.state_after.evidence_frame,
+            )
+        ]
+        paths: list[Path] = []
+        resolved_root = task_root.resolve()
+        for relative in dict.fromkeys(relative_paths):
+            path = (resolved_root / relative).resolve()
+            if path.is_relative_to(resolved_root) and path.is_file():
+                paths.append(path)
+        return tuple(paths)
+
+
+@dataclass(frozen=True)
+class SemanticCompilation:
+    experience_path: str
+    stage_count: int
+    model: str
+    reasoning_effort: str
+    review_status: str
+
+
+def _mapping(value: object, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} must be a mapping")
+    return value
+
+
+def _string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    return " ".join(value.split())
+
+
+def _confidence(value: object, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not 0 <= float(value) <= 1
+    ):
+        raise ValueError(f"{label} must be between zero and one")
+    return round(float(value), 3)
+
+
+def _string_list(value: object, label: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ValueError(f"{label} must be a {'possibly empty ' if allow_empty else 'non-empty '}list")
+    return tuple(_string(item, f"{label} item") for item in value)
+
+
+def _experience_state(
+    value: object,
+    label: str,
+    *,
+    allowed_frames: set[str],
+) -> ExperienceState:
+    data = _mapping(value, label)
+    evidence_frame = _string(data.get("evidence_frame"), f"{label}.evidence_frame")
+    if evidence_frame not in allowed_frames:
+        raise ValueError(f"{label}.evidence_frame is not part of the preserved human evidence")
+    return ExperienceState(
+        description=_string(data.get("description"), f"{label}.description"),
+        evidence_frame=evidence_frame,
+        visual_anchors=_string_list(data.get("visual_anchors"), f"{label}.visual_anchors"),
+    )
+
+
+def _validate_semantic_payload(
+    payload: object,
+    *,
+    task_id: str,
+    action_count: int,
+    allowed_frames: set[str],
+) -> tuple[str, str, tuple[ExperienceStage, ...]]:
+    root = _mapping(payload, "Compiler Agent output")
+    goal = _string(root.get("goal"), "goal")
+    summary = _string(root.get("summary"), "summary")
+    raw_stages = root.get("stages")
+    if not isinstance(raw_stages, list) or not 1 <= len(raw_stages) <= MAX_SEMANTIC_STAGES:
+        raise ValueError(f"Compiler Agent must return 1-{MAX_SEMANTIC_STAGES} stages")
+
+    stages: list[ExperienceStage] = []
+    expected_stage_start = 0
+    stage_ids: set[str] = set()
+    for stage_index, raw_stage in enumerate(raw_stages):
+        label = f"stages[{stage_index}]"
+        data = _mapping(raw_stage, label)
+        stage_id = _string(data.get("id"), f"{label}.id")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,47}", stage_id):
+            raise ValueError(f"{label}.id must be a short lowercase identifier")
+        if stage_id in stage_ids:
+            raise ValueError(f"Compiler Agent returned duplicate stage id {stage_id!r}")
+        stage_ids.add(stage_id)
+        start = data.get("start_action_index")
+        end = data.get("end_action_index")
+        if not isinstance(start, int) or isinstance(start, bool):
+            raise TypeError(f"{label}.start_action_index must be an integer")
+        if not isinstance(end, int) or isinstance(end, bool):
+            raise TypeError(f"{label}.end_action_index must be an integer")
+        if start != expected_stage_start or not start <= end < action_count:
+            raise ValueError("Semantic stages must form one contiguous partition of all actions")
+
+        raw_intents = data.get("action_intents")
+        if not isinstance(raw_intents, list) or not raw_intents:
+            raise ValueError(f"{label}.action_intents must be a non-empty list")
+        intents: list[ActionIntent] = []
+        expected_intent_start = start
+        for intent_index, raw_intent in enumerate(raw_intents):
+            intent_label = f"{label}.action_intents[{intent_index}]"
+            intent_data = _mapping(raw_intent, intent_label)
+            intent_start = intent_data.get("start_action_index")
+            intent_end = intent_data.get("end_action_index")
+            if (
+                not isinstance(intent_start, int)
+                or isinstance(intent_start, bool)
+                or not isinstance(intent_end, int)
+                or isinstance(intent_end, bool)
+                or intent_start != expected_intent_start
+                or not intent_start <= intent_end <= end
+            ):
+                raise ValueError(
+                    f"{label}.action_intents must partition the stage action range"
+                )
+            provenance = _string(
+                intent_data.get("provenance"), f"{intent_label}.provenance"
+            )
+            if provenance not in PROVENANCE_VALUES:
+                raise ValueError(f"{intent_label}.provenance is unsupported")
+            intents.append(
+                ActionIntent(
+                    start_action_index=intent_start,
+                    end_action_index=intent_end,
+                    description=_string(
+                        intent_data.get("description"), f"{intent_label}.description"
+                    ),
+                    target=_string(intent_data.get("target"), f"{intent_label}.target"),
+                    provenance=provenance,
+                    confidence=_confidence(
+                        intent_data.get("confidence"), f"{intent_label}.confidence"
+                    ),
+                )
+            )
+            expected_intent_start = intent_end + 1
+        if expected_intent_start != end + 1:
+            raise ValueError(f"{label}.action_intents do not cover the complete stage")
+
+        raw_decisions = data.get("dynamic_decisions")
+        if not isinstance(raw_decisions, list):
+            raise TypeError(f"{label}.dynamic_decisions must be a list")
+        decisions: list[DynamicDecision] = []
+        for decision_index, raw_decision in enumerate(raw_decisions):
+            decision_label = f"{label}.dynamic_decisions[{decision_index}]"
+            decision_data = _mapping(raw_decision, decision_label)
+            generalization = _string(
+                decision_data.get("generalization"),
+                f"{decision_label}.generalization",
+            )
+            if generalization not in GENERALIZATION_VALUES:
+                raise ValueError(f"{decision_label}.generalization is unsupported")
+            decisions.append(
+                DynamicDecision(
+                    description=_string(
+                        decision_data.get("description"),
+                        f"{decision_label}.description",
+                    ),
+                    generalization=generalization,
+                    confidence=_confidence(
+                        decision_data.get("confidence"),
+                        f"{decision_label}.confidence",
+                    ),
+                )
+            )
+
+        stages.append(
+            ExperienceStage(
+                stage_id=stage_id,
+                name=_string(data.get("name"), f"{label}.name"),
+                start_action_index=start,
+                end_action_index=end,
+                state_before=_experience_state(
+                    data.get("state_before"),
+                    f"{label}.state_before",
+                    allowed_frames=allowed_frames,
+                ),
+                action_intents=tuple(intents),
+                preconditions=_string_list(
+                    data.get("preconditions"), f"{label}.preconditions"
+                ),
+                expected_effects=_string_list(
+                    data.get("expected_effects"), f"{label}.expected_effects"
+                ),
+                state_after=_experience_state(
+                    data.get("state_after"),
+                    f"{label}.state_after",
+                    allowed_frames=allowed_frames,
+                ),
+                dynamic_decisions=tuple(decisions),
+                confidence=_confidence(data.get("confidence"), f"{label}.confidence"),
+            )
+        )
+        expected_stage_start = end + 1
+    if expected_stage_start != action_count:
+        raise ValueError(
+            f"Semantic stages cover {expected_stage_start} of {action_count} actions for {task_id}"
+        )
+    return goal, summary, tuple(stages)
+
+
+def _state_payload(state: ExperienceState) -> dict[str, Any]:
+    return {
+        "description": state.description,
+        "evidence_frame": state.evidence_frame,
+        "visual_anchors": list(state.visual_anchors),
+    }
+
+
+def _experience_document(
+    *,
+    task_id: str,
+    goal: str,
+    summary: str,
+    stages: Sequence[ExperienceStage],
+    model: str,
+    reasoning_effort: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "0.1",
+        "task_id": task_id,
+        "source": {
+            "type": "human_trace",
+            "trace": "reference/trace.jsonl",
+            "demonstration": "demonstration.json",
+            "policy": "immutable_strong_evidence",
+        },
+        "compiler": {
+            "type": "multimodal_agent",
+            "version": __version__,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "compiled_at": datetime.now(UTC).isoformat(),
+            "policy": "replaceable_derived_interpretation",
+        },
+        "goal": goal,
+        "summary": summary,
+        "stages": [
+            {
+                "id": stage.stage_id,
+                "name": stage.name,
+                "start_action_index": stage.start_action_index,
+                "end_action_index": stage.end_action_index,
+                "state_before": _state_payload(stage.state_before),
+                "action_intents": [
+                    {
+                        "start_action_index": intent.start_action_index,
+                        "end_action_index": intent.end_action_index,
+                        "description": intent.description,
+                        "target": intent.target,
+                        "provenance": intent.provenance,
+                        "confidence": intent.confidence,
+                    }
+                    for intent in stage.action_intents
+                ],
+                "preconditions": list(stage.preconditions),
+                "expected_effects": list(stage.expected_effects),
+                "state_after": _state_payload(stage.state_after),
+                "dynamic_decisions": [
+                    {
+                        "description": decision.description,
+                        "generalization": decision.generalization,
+                        "confidence": decision.confidence,
+                    }
+                    for decision in stage.dynamic_decisions
+                ],
+                "confidence": stage.confidence,
+            }
+            for stage in stages
+        ],
+        "review": {
+            "status": "draft",
+            "requires_confirmation": True,
+            "note": "Review inferred semantics; preserved human Trace evidence is unchanged.",
+        },
+    }
+
+
+def load_semantic_experience(
+    path: Path,
+    *,
+    task_id: str,
+    action_count: int,
+) -> SemanticExperience:
+    source_path = path.resolve()
+    root = _mapping(yaml.safe_load(source_path.read_text(encoding="utf-8")), "experience")
+    if _string(root.get("task_id"), "experience.task_id") != task_id:
+        raise ValueError("Semantic experience task_id does not match the task pack")
+    source = _mapping(root.get("source"), "experience.source")
+    source_type = _string(source.get("type"), "experience.source.type")
+    if source_type != "human_trace":
+        raise ValueError("V0.7 semantic experience must derive from a human Trace")
+    task_root = source_path.parent.resolve()
+    allowed_frames = {
+        path.resolve().relative_to(task_root).as_posix()
+        for path in (task_root / "reference" / "frames").glob("*.png")
+        if path.is_file()
+    }
+    goal, summary, stages = _validate_semantic_payload(
+        root,
+        task_id=task_id,
+        action_count=action_count,
+        allowed_frames=allowed_frames,
+    )
+    compiler = _mapping(root.get("compiler"), "experience.compiler")
+    review = _mapping(root.get("review"), "experience.review")
+    review_status = _string(review.get("status"), "experience.review.status")
+    requires_confirmation = review.get("requires_confirmation")
+    if review_status not in {"draft", "confirmed"} or not isinstance(
+        requires_confirmation, bool
+    ):
+        raise ValueError("Semantic experience review state is invalid")
+    if (review_status == "draft") != requires_confirmation:
+        raise ValueError("Semantic experience draft and confirmation state disagree")
+    return SemanticExperience(
+        goal=goal,
+        summary=summary,
+        stages=stages,
+        source_type=source_type,
+        model=_string(compiler.get("model"), "experience.compiler.model"),
+        reasoning_effort=_string(
+            compiler.get("reasoning_effort"), "experience.compiler.reasoning_effort"
+        ),
+        review_status=review_status,
+        requires_confirmation=requires_confirmation,
+        source_path=source_path,
+    )
+
+
+def _load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{label} is not valid JSON: {path}") from error
+    return _mapping(value, label)
+
+
+def _reference_frame_for_event(event: Mapping[str, Any]) -> str:
+    frame = event.get("frame")
+    if not isinstance(frame, str) or not frame:
+        raise ValueError("Human Trace event has no frame")
+    return f"reference/{frame}"
+
+
+def _screen_change(first: Path, second: Path) -> float:
+    if first == second:
+        return 0.0
+    first_surface = pygame.transform.smoothscale(pygame.image.load(first), (64, 36))
+    second_surface = pygame.transform.smoothscale(pygame.image.load(second), (64, 36))
+    first_rgb = pygame.surfarray.array3d(first_surface).astype(np.float32)
+    second_rgb = pygame.surfarray.array3d(second_surface).astype(np.float32)
+    return round(float(np.mean(np.abs(first_rgb - second_rgb)) / 255.0), 4)
+
+
+def _prepare_timeline(task_root: Path) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    demonstration = _load_json(task_root / "demonstration.json", "demonstration")
+    raw_actions = demonstration.get("actions")
+    if not isinstance(raw_actions, list) or not raw_actions:
+        raise ValueError("Demonstration must contain actions")
+    trace = _load_json_lines(task_root / "reference" / "trace.jsonl")
+    by_seq = {event["seq"]: event for event in trace}
+    timeline: list[dict[str, Any]] = []
+    boundary_hints: list[dict[str, Any]] = []
+    all_frames: list[str] = [_reference_frame_for_event(trace[0])]
+    previous_end_ms = 0.0
+    for index, raw_entry in enumerate(raw_actions):
+        entry = _mapping(raw_entry, f"demonstration.actions[{index}]")
+        action = _mapping(entry.get("action"), f"demonstration.actions[{index}].action")
+        source = _mapping(entry.get("source"), f"demonstration.actions[{index}].source")
+        seqs = source.get("seqs")
+        if not isinstance(seqs, list) or not seqs or not all(isinstance(seq, int) for seq in seqs):
+            raise ValueError(f"Demonstration action {index} has invalid source sequences")
+        start_seq = min(seqs)
+        before_event = by_seq.get(max(0, start_seq - 1), by_seq[start_seq])
+        before_frame = _reference_frame_for_event(before_event)
+        after_frame = _string(
+            source.get("evidence_frame"),
+            f"demonstration.actions[{index}].source.evidence_frame",
+        )
+        start_ms = float(source.get("start_elapsed_ms", 0.0))
+        end_ms = float(source.get("end_elapsed_ms", start_ms))
+        before_path = (task_root / before_frame).resolve()
+        after_path = (task_root / after_frame).resolve()
+        change = _screen_change(before_path, after_path)
+        reasons: list[str] = []
+        if start_ms - previous_end_ms >= TEMPORAL_BOUNDARY_MS:
+            reasons.append("long_gap_before")
+        if action.get("skill") == "wait" and int(
+            _mapping(action.get("args"), "action.args").get("duration_ms", 0)
+        ) >= TEMPORAL_BOUNDARY_MS:
+            reasons.append("long_wait")
+        if change >= SCREEN_CHANGE_THRESHOLD:
+            reasons.append("large_screen_change")
+        if reasons:
+            boundary_hints.append(
+                {
+                    "after_action_index": index,
+                    "reasons": reasons,
+                    "screen_change": change,
+                }
+            )
+        timeline.append(
+            {
+                "index": index,
+                "action": action,
+                "source_seqs": seqs,
+                "start_elapsed_ms": start_ms,
+                "end_elapsed_ms": end_ms,
+                "before_frame": before_frame,
+                "after_frame": after_frame,
+                "screen_change": change,
+                "compiler_inference": source.get("inference"),
+            }
+        )
+        all_frames.extend((before_frame, after_frame))
+        previous_end_ms = max(previous_end_ms, end_ms)
+    all_frames.append(_reference_frame_for_event(trace[-1]))
+    return timeline, list(dict.fromkeys(all_frames)), boundary_hints
+
+
+def _load_json_lines(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Human Trace line {line_number} is invalid JSON") from error
+        events.append(_mapping(event, f"Human Trace line {line_number}"))
+    if not events:
+        raise ValueError("Human Trace is empty")
+    return events
+
+
+def _sample_frames(frames: Sequence[str]) -> list[str]:
+    if len(frames) <= MAX_EVIDENCE_IMAGES:
+        return list(frames)
+    indexes = {
+        round(index * (len(frames) - 1) / (MAX_EVIDENCE_IMAGES - 1))
+        for index in range(MAX_EVIDENCE_IMAGES)
+    }
+    return [frames[index] for index in sorted(indexes)]
+
+
+def _create_contact_sheets(
+    task_root: Path,
+    evidence_frames: Sequence[str],
+    output_dir: Path,
+) -> tuple[tuple[Path, ...], str]:
+    pygame.font.init()
+    font = pygame.font.Font(None, 20)
+    per_sheet = CONTACT_SHEET_COLUMNS * CONTACT_SHEET_ROWS
+    cell_width, thumbnail_height = CONTACT_SHEET_THUMBNAIL
+    cell_height = CONTACT_SHEET_LABEL_HEIGHT + thumbnail_height
+    paths: list[Path] = []
+    labels: list[str] = []
+    for sheet_index, start in enumerate(range(0, len(evidence_frames), per_sheet), 1):
+        frames = evidence_frames[start : start + per_sheet]
+        rows = (len(frames) + CONTACT_SHEET_COLUMNS - 1) // CONTACT_SHEET_COLUMNS
+        sheet = pygame.Surface((cell_width * CONTACT_SHEET_COLUMNS, cell_height * rows))
+        sheet.fill((24, 28, 32))
+        for local_index, relative in enumerate(frames):
+            global_index = start + local_index + 1
+            column = local_index % CONTACT_SHEET_COLUMNS
+            row = local_index // CONTACT_SHEET_COLUMNS
+            left = column * cell_width
+            top = row * cell_height
+            label = font.render(f"Frame {global_index}", True, (245, 248, 250))
+            sheet.blit(label, (left + 8, top + 3))
+            source = pygame.image.load(task_root / relative)
+            thumbnail = pygame.transform.smoothscale(source, CONTACT_SHEET_THUMBNAIL)
+            sheet.blit(thumbnail, (left, top + CONTACT_SHEET_LABEL_HEIGHT))
+            labels.append(
+                f"Contact sheet Image {sheet_index}, cell Frame {global_index}: {relative}"
+            )
+        path = output_dir / f"contact-sheet-{sheet_index:02d}.png"
+        pygame.image.save(sheet, path)
+        paths.append(path)
+    return tuple(paths), "\n".join(labels)
+
+
+def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[str, Any]:
+    state = {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "minLength": 1},
+            "evidence_frame": {"type": "string", "enum": list(evidence_frames)},
+            "visual_anchors": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 6,
+            },
+        },
+        "required": ["description", "evidence_frame", "visual_anchors"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "minLength": 1},
+            "summary": {"type": "string", "minLength": 1},
+            "stages": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": min(MAX_SEMANTIC_STAGES, action_count),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "minLength": 2, "maxLength": 48},
+                        "name": {"type": "string", "minLength": 1},
+                        "start_action_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": action_count - 1,
+                        },
+                        "end_action_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": action_count - 1,
+                        },
+                        "state_before": state,
+                        "action_intents": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": action_count,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start_action_index": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": action_count - 1,
+                                    },
+                                    "end_action_index": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": action_count - 1,
+                                    },
+                                    "description": {"type": "string", "minLength": 1},
+                                    "target": {"type": "string", "minLength": 1},
+                                    "provenance": {
+                                        "type": "string",
+                                        "enum": sorted(PROVENANCE_VALUES),
+                                    },
+                                    "confidence": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 1,
+                                    },
+                                },
+                                "required": [
+                                    "start_action_index",
+                                    "end_action_index",
+                                    "description",
+                                    "target",
+                                    "provenance",
+                                    "confidence",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "preconditions": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                            "maxItems": 8,
+                        },
+                        "expected_effects": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                            "maxItems": 8,
+                        },
+                        "state_after": state,
+                        "dynamic_decisions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": {"type": "string", "minLength": 1},
+                                    "generalization": {
+                                        "type": "string",
+                                        "enum": sorted(GENERALIZATION_VALUES),
+                                    },
+                                    "confidence": {
+                                        "type": "number",
+                                        "minimum": 0,
+                                        "maximum": 1,
+                                    },
+                                },
+                                "required": ["description", "generalization", "confidence"],
+                                "additionalProperties": False,
+                            },
+                            "maxItems": 8,
+                        },
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "required": [
+                        "id",
+                        "name",
+                        "start_action_index",
+                        "end_action_index",
+                        "state_before",
+                        "action_intents",
+                        "preconditions",
+                        "expected_effects",
+                        "state_after",
+                        "dynamic_decisions",
+                        "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["goal", "summary", "stages"],
+        "additionalProperties": False,
+    }
+
+
+def _prompt(
+    *,
+    task_id: str,
+    task_instruction: str,
+    timeline: Sequence[Mapping[str, Any]],
+    evidence_map: str,
+    boundary_hints: Sequence[Mapping[str, Any]],
+) -> str:
+    return (
+        "You are the offline multimodal Trace Compiler Agent for Trace2Task. You do not "
+        "execute the task. Convert one successful human demonstration into a grounded, "
+        "replaceable semantic interpretation. The preserved raw Trace and motor demonstration "
+        "are stronger evidence than your interpretation.\n\n"
+        f"Human task name: {task_id}\n"
+        f"Current generic task instruction: {task_instruction}\n"
+        f"Evidence contact-sheet map:\n{evidence_map}\n\n"
+        "Partition every action index exactly once into contiguous stages. Within every stage, "
+        "partition every action index exactly once into contiguous action_intents. Describe only "
+        "visually grounded states, observable preconditions, action intent, and expected visible "
+        "effects. Coordinates and input skills are evidence, not semantic intent.\n\n"
+        "A single trajectory does not prove a general strategy. If a choice could depend on "
+        "runtime content (for example which game card, contact, file, item, or route to choose), "
+        "record it in dynamic_decisions as runtime_agent_decides or unknown. Never turn a "
+        "demonstrated choice into a universal rule without evidence. Use provenance=unknown and "
+        "low confidence when intent cannot be recovered. Do not invent application internals or "
+        "text that is not visible. Use concise Simplified Chinese descriptions when the task name "
+        "or visible application is primarily Chinese; otherwise follow the task language.\n\n"
+        "Local candidate boundaries are hints, not truth:\n"
+        f"{json.dumps(list(boundary_hints), ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "Deterministically compiled action timeline:\n"
+        f"{json.dumps(list(timeline), ensure_ascii=False, separators=(',', ':'))}\n\n"
+        "Return the full result matching the supplied JSON schema."
+    )
+
+
+def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
+    task_root = task_path.parent.resolve()
+    experience_path = task_root / "experience.yaml"
+    temporary = task_root / "experience.yaml.tmp"
+    temporary.write_text(
+        yaml.safe_dump(dict(document), sort_keys=False, allow_unicode=True, width=100),
+        encoding="utf-8",
+    )
+    temporary.replace(experience_path)
+
+    task_data = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
+    task_data["semantic_experience"] = {
+        "path": "experience.yaml",
+        "stage_count": len(document["stages"]),
+        "source": "human_trace",
+    }
+    review = _mapping(task_data.get("review"), "task.review")
+    review["status"] = "draft"
+    review["requires_confirmation"] = True
+    review.pop("confirmed_at", None)
+    checklist = review.setdefault("checklist", [])
+    semantic_check = (
+        "Review the Compiler Agent stages, grounded states, intents, preconditions, expected "
+        "effects, and unknown dynamic decisions."
+    )
+    if isinstance(checklist, list) and semantic_check not in checklist:
+        checklist.append(semantic_check)
+    task_path.write_text(
+        yaml.safe_dump(task_data, sort_keys=False, allow_unicode=True, width=100),
+        encoding="utf-8",
+    )
+    return experience_path
+
+
+def compile_windows_semantic_experience(
+    task_path: Path,
+    *,
+    model: str = DEFAULT_COMPILER_MODEL,
+    reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+    codex_bin: str = "codex",
+    timeout_seconds: float = 300,
+    binary_resolver: BinaryResolver = resolve_codex_binary,
+    session_factory: SessionFactory = CodexAppServerSession,
+) -> SemanticCompilation:
+    """Interpret a preserved human Windows Trace without modifying its evidence."""
+
+    source_path = task_path.expanduser().resolve()
+    task_data = _mapping(yaml.safe_load(source_path.read_text(encoding="utf-8")), "task")
+    environment = _mapping(task_data.get("environment"), "task.environment")
+    if environment.get("adapter") != "trace2task.windows":
+        raise ValueError("Semantic Windows compilation requires a Windows task pack")
+    task_id = _string(task_data.get("id"), "task.id")
+    task_instruction = _string(task_data.get("instruction"), "task.instruction")
+    timeline, all_frames, boundary_hints = _prepare_timeline(source_path.parent)
+    evidence_frames = _sample_frames(all_frames)
+    original_evidence_paths = tuple(
+        (source_path.parent / frame).resolve() for frame in evidence_frames
+    )
+    if not original_evidence_paths or not all(path.is_file() for path in original_evidence_paths):
+        raise FileNotFoundError("Semantic compiler evidence frames are incomplete")
+    schema = _output_schema(evidence_frames, len(timeline))
+    last_error: Exception | None = None
+    with tempfile.TemporaryDirectory(prefix="trace2task-compiler-evidence-") as directory:
+        evidence_paths, evidence_map = _create_contact_sheets(
+            source_path.parent,
+            evidence_frames,
+            Path(directory),
+        )
+        prompt = _prompt(
+            task_id=task_id,
+            task_instruction=task_instruction,
+            timeline=timeline,
+            evidence_map=evidence_map,
+            boundary_hints=boundary_hints,
+        )
+        executable = binary_resolver(codex_bin)
+        session = session_factory(
+            executable,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            cwd=Path.cwd(),
+            timeout_seconds=timeout_seconds,
+        )
+        try:
+            for attempt in range(2):
+                active_prompt = prompt
+                if attempt and last_error is not None:
+                    active_prompt = (
+                        "Your previous semantic compilation failed deterministic validation: "
+                        f"{last_error}. Return a complete corrected result. Preserve exact "
+                        "contiguous coverage of every action index and use only supplied evidence "
+                        "frame paths."
+                    )
+                output = session.run_turn(
+                    prompt=active_prompt,
+                    image_path=evidence_paths[0],
+                    additional_image_paths=evidence_paths[1:],
+                    output_schema=schema,
+                )
+                try:
+                    payload = json.loads(output.strip())
+                    goal, summary, stages = _validate_semantic_payload(
+                        payload,
+                        task_id=task_id,
+                        action_count=len(timeline),
+                        allowed_frames=set(evidence_frames),
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
+                    last_error = error
+                    continue
+                document = _experience_document(
+                    task_id=task_id,
+                    goal=goal,
+                    summary=summary,
+                    stages=stages,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                )
+                experience_path = _attach_experience(source_path, document)
+                loaded = load_semantic_experience(
+                    experience_path,
+                    task_id=task_id,
+                    action_count=len(timeline),
+                )
+                return SemanticCompilation(
+                    experience_path=str(experience_path),
+                    stage_count=len(loaded.stages),
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    review_status=loaded.review_status,
+                )
+        finally:
+            session.close()
+    raise RuntimeError(f"Compiler Agent returned an invalid semantic experience: {last_error}")

@@ -160,6 +160,11 @@ def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
         "recorded_handle": 7,
     }
     assert task_yaml["observation"]["coordinate_space"] == "physical_pixels"
+    assert task_yaml["experience"] == {
+        "intent": task.task_id,
+        "examples": [task.task_id],
+        "source": "human_trace",
+    }
     assert report["inference"]["action_counts"]["wait"] == 2
     assert report["inference"]["verifier"]["success_source"] == "human F8 marker"
     assert (task_path.parent / "reference" / "trace.jsonl").is_file()
@@ -281,6 +286,30 @@ def test_windows_compiler_infers_bounded_drag_motor_skill(tmp_path: Path) -> Non
             "end_x": 0.8,
             "end_y": 0.8,
             "duration_ms": 50,
+            "button": "left",
+        },
+    } in actions
+
+
+def test_windows_compiler_preserves_stationary_mouse_hold(tmp_path: Path) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    events[8]["elapsed_ms"] = 3150
+    events[9]["elapsed_ms"] = 3300
+    events[10]["elapsed_ms"] = 3350
+    _rewrite_bundle(trace_path, events, metadata)
+
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    demonstration = json.loads(
+        (Path(result.task_path).parent / "demonstration.json").read_text(encoding="utf-8")
+    )
+    actions = [item["action"] for item in demonstration["actions"]]
+
+    assert {
+        "skill": "hold_mouse",
+        "args": {
+            "x": 0.4,
+            "y": 0.5,
+            "duration_ms": 1_150,
             "button": "left",
         },
     } in actions

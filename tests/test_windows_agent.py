@@ -19,13 +19,25 @@ from trace2task.windows_runner import (
 from trace2task.windows_task import load_windows_task
 
 
-def _write_taskpack(tmp_path: Path, *, confirmed: bool = False) -> Path:
+def _write_taskpack(
+    tmp_path: Path,
+    *,
+    confirmed: bool = False,
+    semantic: bool = False,
+) -> Path:
     task_dir = tmp_path / ("confirmed-task" if confirmed else "draft-task")
     reference_dir = task_dir / "reference"
     reference_dir.mkdir(parents=True)
     reference = pygame.Surface((100, 50))
     reference.fill((30, 120, 70))
     pygame.image.save(reference, reference_dir / "final.png")
+    if semantic:
+        frames_dir = reference_dir / "frames"
+        frames_dir.mkdir()
+        pygame.image.save(reference, frames_dir / "before.png")
+        after = reference.copy()
+        after.fill((60, 150, 90))
+        pygame.image.save(after, frames_dir / "after.png")
     demonstration = {
         "schema_version": "0.1",
         "task_id": "windows-smoke",
@@ -68,6 +80,76 @@ def _write_taskpack(tmp_path: Path, *, confirmed: bool = False) -> Path:
             "requires_confirmation": not confirmed,
         },
     }
+    if semantic:
+        task["semantic_experience"] = {
+            "path": "experience.yaml",
+            "stage_count": 1,
+            "source": "human_trace",
+        }
+        experience = {
+            "schema_version": "0.1",
+            "task_id": "windows-smoke",
+            "source": {
+                "type": "human_trace",
+                "trace": "reference/trace.jsonl",
+                "demonstration": "demonstration.json",
+                "policy": "immutable_strong_evidence",
+            },
+            "compiler": {
+                "type": "multimodal_agent",
+                "version": "0.7.0",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "low",
+                "policy": "replaceable_derived_interpretation",
+            },
+            "goal": "Open the visible target.",
+            "summary": "Focus the window and click the target.",
+            "stages": [
+                {
+                    "id": "open_target",
+                    "name": "Open target",
+                    "start_action_index": 0,
+                    "end_action_index": 1,
+                    "state_before": {
+                        "description": "Target is visible.",
+                        "evidence_frame": "reference/frames/before.png",
+                        "visual_anchors": ["Visible target"],
+                    },
+                    "action_intents": [
+                        {
+                            "start_action_index": 0,
+                            "end_action_index": 1,
+                            "description": "Focus and open the target.",
+                            "target": "Visible target",
+                            "provenance": "inferred",
+                            "confidence": 0.8,
+                        }
+                    ],
+                    "preconditions": ["Target is visible"],
+                    "expected_effects": ["Target opens"],
+                    "state_after": {
+                        "description": "Target is open.",
+                        "evidence_frame": "reference/frames/after.png",
+                        "visual_anchors": ["Open target content"],
+                    },
+                    "dynamic_decisions": [
+                        {
+                            "description": "Choose current visible content.",
+                            "generalization": "runtime_agent_decides",
+                            "confidence": 0.4,
+                        }
+                    ],
+                    "confidence": 0.75,
+                }
+            ],
+            "review": {
+                "status": "confirmed" if confirmed else "draft",
+                "requires_confirmation": not confirmed,
+            },
+        }
+        (task_dir / "experience.yaml").write_text(
+            yaml.safe_dump(experience, sort_keys=False), encoding="utf-8"
+        )
     task_path = task_dir / "task.yaml"
     task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
     return task_path
@@ -339,10 +421,50 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
     assert "Recorded demonstration" in calls[0]["prompt"]
+    assert "compiled Trace is mandatory guidance" in calls[0]["prompt"]
+    assert "adapt values, not stage order" in calls[0]["prompt"]
     assert sessions[0].model == "gpt-5.6-sol"
     assert sessions[0].reasoning_effort == "high"
     agent.close()
     assert sessions[0].closed
+
+
+def test_codex_windows_agent_uses_semantic_stages_and_their_evidence(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(_write_taskpack(tmp_path, semantic=True))
+    agent = CodexWindowsAgent(
+        contract,
+        plan_horizon=1,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "click",
+                            "args": {"x": 0.25, "y": 0.75, "button": "left"},
+                        }
+                    ],
+                    "reason": "Follow the grounded stage.",
+                    "confidence": 0.9,
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+
+    assert contract.semantic_experience is not None
+    assert len(calls[0]["reference_paths"]) == 3
+    assert "Compiler Agent semantic experience" in calls[0]["prompt"]
+    assert "runtime_agent_decides" in calls[0]["prompt"]
+    assert "raw human Trace remains stronger evidence" in calls[0]["prompt"]
+    agent.close()
 
 
 def test_runtime_instruction_treats_trace_as_structural_example(tmp_path: Path) -> None:

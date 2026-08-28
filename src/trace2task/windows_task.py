@@ -10,6 +10,7 @@ import yaml
 from trace2task.actions import WINDOWS_MOTOR_SKILLS, ActionCall
 from trace2task.taskpack import TaskPack, load_taskpack
 from trace2task.windows_control import WindowSelector
+from trace2task.windows_experience import SemanticExperience, load_semantic_experience
 
 WINDOWS_ADAPTER = "trace2task.windows"
 
@@ -20,6 +21,7 @@ class WindowsTaskContract:
     selector: WindowSelector
     demonstration: tuple[ActionCall, ...]
     reference_frame: Path
+    semantic_experience: SemanticExperience | None = None
     runtime_instruction: str | None = None
 
     @property
@@ -37,6 +39,7 @@ class WindowsTaskContract:
             selector=self.selector,
             demonstration=self.demonstration,
             reference_frame=self.reference_frame,
+            semantic_experience=self.semantic_experience,
             runtime_instruction=normalized,
         )
 
@@ -116,9 +119,33 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
         verifier.get("reference_frame"),
         "verifier.reference_frame",
     )
+    semantic_experience: SemanticExperience | None = None
+    semantic_config = root.get("semantic_experience")
+    if semantic_config is not None:
+        semantic_mapping = _mapping(semantic_config, "semantic_experience")
+        semantic_path = _contained_file(
+            source_path,
+            semantic_mapping.get("path"),
+            "semantic_experience.path",
+        )
+        semantic_experience = load_semantic_experience(
+            semantic_path,
+            task_id=task.task_id,
+            action_count=len(actions),
+        )
+        declared_stages = semantic_mapping.get("stage_count")
+        if declared_stages != len(semantic_experience.stages):
+            raise ValueError(
+                "Windows semantic_experience.stage_count does not match experience.yaml"
+            )
+        if task.requires_confirmation != semantic_experience.requires_confirmation:
+            raise ValueError(
+                "Task pack and semantic experience confirmation states do not match"
+            )
     return WindowsTaskContract(
         task=task,
         selector=selector,
         demonstration=tuple(actions),
         reference_frame=reference_frame,
+        semantic_experience=semantic_experience,
     )

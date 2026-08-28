@@ -49,9 +49,24 @@ To watch the comparison:
 uv run trace2task demo --show
 ```
 
-## Local web console (v0.5.9)
+## Local web console and semantic Trace compiler (v0.7.2)
 
-Version 0.5.9 adds a loopback-only browser console for routine testing. Double-click
+Version 0.7.0 adds the offline multimodal Compiler Agent. Version 0.7.1 makes manual compilation a
+visible background job: the activity panel responds immediately, concurrent duplicate requests are
+rejected, and recompiling the same raw Trace reuses its latest task pack instead of creating another
+copy. The console also provides recoverable delete buttons for task experiences, candidate
+experiences, and raw recordings; deleted directories move under `taskpacks/.trash` or `runs/.trash`.
+Version 0.7.2 separates the teacher Compiler Agent from the runtime Agent. Compiler model and
+reasoning controls are visible in **Local experience**, shared with the recording page, and default
+to Sol + high for a stronger one-time interpretation. Runtime planning and execution keep their own
+Terra + low defaults. Each semantic experience card records and displays the model and effort that
+compiled it, so a stronger teacher can guide a faster student without coupling their settings.
+
+The loopback-only browser console runs the Compiler Agent after a successful Windows recording. The
+recording is still compiled deterministically into motor evidence,
+then the selected Codex model interprets the preserved human Trace as reviewable stages, grounded
+states, action intents, visible preconditions, expected effects, and explicitly uncertain dynamic
+decisions. Double-click
 `start-console.cmd`, or start it once from a terminal:
 
 ```powershell
@@ -63,16 +78,49 @@ instruction, such as `给文件传输助手发送：Trace2Task 网页控制台�
 the reviewed demonstration experience: its original wording, action sequence, and reference frame
 are structural hints rather than literal names, text, or coordinates to replay.
 
+The default **自动选择经验** mode scores the instruction against confirmed local Trace metadata,
+intent examples, target application, and required capabilities. The match is local, deterministic,
+and explainable; it adds no second model request. A low-confidence or ambiguous match is rejected
+before planning or execution, while the task-pack selector remains available as a manual override.
+The selected Trace is mandatory planning guidance: the Agent preserves the demonstrated stage order
+and checkpoints unless the current screenshot requires a reasoned deviation.
+
+Windows recording samples keyboard and mouse transitions on a dedicated high-frequency thread.
+Screenshots are still attached as visual evidence, but a slow target capture (notably Android
+emulators) can no longer inflate click duration or move the recorded mouse-up coordinate to the
+next interaction. The compiler uses the independent sample timestamp when it is present and remains
+backward-compatible with older traces.
+Stationary presses longer than one second compile to a bounded `hold_mouse` action, while pointer
+movement remains a `drag`; the compiler no longer has to mislabel either behavior as a click.
+
+The V0.7 artifact separates evidence from interpretation:
+
+- `reference/trace.jsonl`, its frames, and `demonstration.json` remain immutable strong human
+  evidence.
+- `experience.yaml` is a replaceable Compiler Agent interpretation. Every stage covers a contiguous
+  range of demonstrated actions and cites preserved evidence frames.
+- Strategy that one demonstration cannot prove is marked `runtime_agent_decides` or `unknown`
+  instead of becoming a fixed rule.
+- Confirming a task pack confirms both its deterministic motor contract and the reviewed semantic
+  experience. Runtime planning receives the semantic stages and their evidence, while the current
+  screenshot still controls each Agent decision.
+
 - **只生成计划** captures the selected target and asks the Agent for a read-only plan.
-- **模型 / 思考强度** selects the Codex model and reasoning effort for this run. Terra + low
+- **执行 Agent 模型 / 执行思考强度** selects the Codex model and reasoning effort for this run. Terra + low
   remains the default; Sol prioritizes capability, Luna prioritizes speed, and higher effort can
   improve difficult visual planning at the cost of a longer wait.
+- **经验编译模型（教师）** independently selects the one-time semantic Compiler Agent. Sol + high
+  is the default; changing the runtime Agent never changes this setting or an existing experience.
 - **开始执行** requires a confirmed task pack, shows an explicit confirmation, and retains F9 as
   the emergency stop.
-- **录制经验** lists visible local windows, starts a human demonstration, and uses `F8` to mark
-  success or `F9` to cancel. A successful trace is compiled automatically into a draft task pack.
+- **录制经验** lists visible local windows, selects the Compiler Agent model and effort, starts a
+  human demonstration, and uses `F8` to mark success or `F9` to cancel. A successful trace is
+  compiled automatically into a draft motor task and semantic experience.
 - **本地经验** lists both task packs and raw recordings. It can open their folders in Explorer,
   confirm reviewed drafts, and upgrade legacy WeChat examples with reusable messaging actions.
+- A successful executed run is saved under `runs/candidates/` as a **待审核候选经验**, including
+  its source Trace, runtime instruction, execution trace, selection rationale, and run metrics. It
+  never changes or promotes a confirmed task pack automatically.
 - Only one desktop-control job can run at a time. Job state and progress logs are polled in the
   browser while the Python service owns execution.
 - The server always binds to `127.0.0.1`; it has no LAN-facing mode or remote authentication.
@@ -143,6 +191,7 @@ under `taskpacks/generated/` containing:
 ├── task.yaml
 ├── compiler-report.json
 ├── demonstration.json       # Windows task packs
+├── experience.yaml          # V0.7 replaceable semantic interpretation
 └── reference/
     ├── metadata.json
     ├── trace.jsonl

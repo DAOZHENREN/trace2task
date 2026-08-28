@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
+import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
@@ -46,6 +48,7 @@ class InputSnapshot:
     cursor_position: tuple[int, int]
     success_requested: bool = False
     cancel_requested: bool = False
+    sampled_at: float | None = None
 
 
 class InputMonitor(Protocol):
@@ -54,6 +57,121 @@ class InputMonitor(Protocol):
     def poll(self) -> InputSnapshot: ...
 
     def close(self) -> None: ...
+
+
+class BufferedInputMonitor:
+    """Sample input on a dedicated thread so target capture cannot hide transitions."""
+
+    def __init__(
+        self,
+        inner: InputMonitor,
+        *,
+        poll_hz: int,
+        clock: Callable[[], float] = time.perf_counter,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if poll_hz <= 0:
+            raise ValueError("poll_hz must be positive")
+        self.inner = inner
+        self.success_key = getattr(inner, "success_key", "f8")
+        self.cancel_key = getattr(inner, "cancel_key", "f9")
+        self.poll_interval = 1 / poll_hz
+        self.clock = clock
+        self.sleeper = sleeper
+        self._snapshots: queue.Queue[InputSnapshot] = queue.Queue()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._latest: InputSnapshot | None = None
+        self._error: Exception | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._sample,
+            name="trace2task-input-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=5):
+            raise RuntimeError("Timed out starting the background input sampler")
+        if self._latest is None:
+            self._raise_if_failed()
+
+    def poll(self) -> InputSnapshot:
+        if self._thread is None:
+            raise RuntimeError("Input monitor must be started before polling")
+        try:
+            return self._snapshots.get(timeout=max(0.05, self.poll_interval * 2))
+        except queue.Empty:
+            self._raise_if_failed()
+            if self._latest is None:
+                raise RuntimeError("Background input sampler has no snapshot")
+            return self._latest
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            if self._thread.is_alive():
+                raise RuntimeError("Background input sampler did not stop")
+
+    def discard_pending(self) -> InputSnapshot:
+        """Drop transitions sampled while the target was not ready or foreground."""
+
+        if self._latest is None:
+            raise RuntimeError("Background input sampler has no snapshot")
+        while True:
+            try:
+                self._snapshots.get_nowait()
+            except queue.Empty:
+                return self._latest
+
+    def _sample(self) -> None:
+        try:
+            self.inner.start()
+            previous = self._timestamp(self.inner.poll())
+            self._latest = previous
+            self._snapshots.put(previous)
+            self._ready.set()
+            while not self._stop.is_set():
+                current = self._timestamp(self.inner.poll())
+                self._latest = current
+                if self._is_transition(previous, current):
+                    self._snapshots.put(current)
+                previous = current
+                self.sleeper(self.poll_interval)
+        except Exception as error:  # noqa: BLE001 - surface sampler failures to caller
+            self._error = error
+            self._ready.set()
+        finally:
+            self.inner.close()
+
+    def _timestamp(self, snapshot: InputSnapshot) -> InputSnapshot:
+        return InputSnapshot(
+            keys_down=snapshot.keys_down,
+            buttons_down=snapshot.buttons_down,
+            cursor_position=snapshot.cursor_position,
+            success_requested=snapshot.success_requested,
+            cancel_requested=snapshot.cancel_requested,
+            sampled_at=self.clock(),
+        )
+
+    @staticmethod
+    def _is_transition(previous: InputSnapshot, current: InputSnapshot) -> bool:
+        return bool(
+            previous.keys_down != current.keys_down
+            or previous.buttons_down != current.buttons_down
+            or current.success_requested
+            or current.cancel_requested
+        )
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(
+                f"Background input sampler failed: {type(self._error).__name__}: {self._error}"
+            ) from self._error
 
 
 class Win32InputMonitor:
@@ -273,6 +391,7 @@ class WindowRecorder:
                 f"or {cancel_label} to cancel."
             )
             previous_geometry = self._geometry(initial_window)
+            sampling_started = previous.sampled_at if previous is not None else None
             while True:
                 if self.clock() - started >= self.max_seconds:
                     stop_reason = "timeout"
@@ -314,7 +433,7 @@ class WindowRecorder:
                 if not was_foreground:
                     self.status_callback("Recording resumed: target window is active.")
                     was_foreground = True
-                    previous = snapshot
+                    previous = self._discard_pending(snapshot)
                     previous_geometry = self._geometry(window)
                     self.sleeper(self.poll_interval)
                     continue
@@ -333,7 +452,12 @@ class WindowRecorder:
                     previous_geometry = geometry
 
                 if previous is not None:
-                    raw_events = self._input_transitions(previous, snapshot, window)
+                    raw_events = self._input_transitions(
+                        previous,
+                        snapshot,
+                        window,
+                        sampling_started=sampling_started,
+                    )
                     for raw_input in raw_events:
                         writer.record(
                             "windows_input",
@@ -361,6 +485,11 @@ class WindowRecorder:
                 "window_selector": asdict(self.session.selector),
                 "initial_window": asdict(initial_window),
                 "capture_method": "target_client_area",
+                "input_sampling": (
+                    "background_transition_buffer_v1"
+                    if isinstance(self.monitor, BufferedInputMonitor)
+                    else "inline_snapshot_v0"
+                ),
                 "coordinate_space": "physical_pixels",
                 "success_hotkey": success_key,
                 "cancel_hotkey": cancel_key,
@@ -379,9 +508,11 @@ class WindowRecorder:
 
     def _wait_for_active_target(self, started: float) -> tuple[WindowInfo, InputSnapshot]:
         cancel_key = getattr(self.monitor, "cancel_key", "f9").upper()
+        waited_for_focus = False
         try:
             window = self.session.focus()
         except WindowSafetyError:
+            waited_for_focus = True
             window = self.session.resolve()
             self.status_callback(
                 f"Switch to '{window.title}' to begin recording. "
@@ -399,7 +530,11 @@ class WindowRecorder:
                 and window.is_visible
                 and not window.is_minimized
             ):
-                return window, snapshot
+                return (
+                    window,
+                    self._discard_pending(snapshot) if waited_for_focus else snapshot,
+                )
+            waited_for_focus = True
             self.sleeper(self.poll_interval)
 
     @staticmethod
@@ -412,12 +547,18 @@ class WindowRecorder:
             window.dpi,
         )
 
+    def _discard_pending(self, fallback: InputSnapshot) -> InputSnapshot:
+        discard = getattr(self.monitor, "discard_pending", None)
+        return discard() if callable(discard) else fallback
+
     @classmethod
     def _input_transitions(
         cls,
         previous: InputSnapshot,
         current: InputSnapshot,
         window: WindowInfo,
+        *,
+        sampling_started: float | None = None,
     ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for key in sorted(current.keys_down - previous.keys_down):
@@ -430,6 +571,13 @@ class WindowRecorder:
             )
         for button in sorted(previous.buttons_down - current.buttons_down):
             events.append(cls._mouse_event("up", button, current.cursor_position, window))
+        if sampling_started is not None and current.sampled_at is not None:
+            sampled_elapsed_ms = round(
+                max(0.0, current.sampled_at - sampling_started) * 1000,
+                3,
+            )
+            for event in events:
+                event["sampled_elapsed_ms"] = sampled_elapsed_ms
         return events
 
     @staticmethod
@@ -474,10 +622,11 @@ def record_window_trace(
     capability_profile: str | None = None,
 ) -> WindowRecordResult:
     session = WindowSession(selector, backend)
+    buffered_monitor = BufferedInputMonitor(monitor, poll_hz=poll_hz)
     return WindowRecorder(
         session,
         capture,
-        monitor,
+        buffered_monitor,
         poll_hz=poll_hz,
         max_seconds=max_seconds,
         status_callback=status_callback,

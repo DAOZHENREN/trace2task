@@ -7,6 +7,7 @@ WINDOWS_MOTOR_SKILLS = (
     "focus_window",
     "click",
     "double_click",
+    "hold_mouse",
     "drag",
     "type_text",
     "press_key",
@@ -151,6 +152,24 @@ class ActionCall:
                 "y": _normalized_coordinate(args["y"], "y"),
                 "button": button.casefold(),
             }
+        if self.skill == "hold_mouse":
+            _require_exact_args(
+                self.skill,
+                args,
+                required={"x", "y", "duration_ms"},
+                optional={"button"},
+            )
+            button = args.get("button", "left")
+            if not isinstance(button, str) or button.casefold() not in MOUSE_BUTTONS:
+                raise ActionValidationError(f"Unsupported mouse button: {button!r}")
+            return {
+                "x": _normalized_coordinate(args["x"], "x"),
+                "y": _normalized_coordinate(args["y"], "y"),
+                "duration_ms": _duration(
+                    args["duration_ms"], maximum=5_000, skill=self.skill
+                ),
+                "button": button.casefold(),
+            }
         if self.skill == "drag":
             _require_exact_args(
                 self.skill,
@@ -259,6 +278,19 @@ def parameterized_action_schema(
                     "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
                 },
                 "required": ["x", "y", "button"],
+            },
+        ),
+        "hold_mouse": action_schema(
+            "hold_mouse",
+            {
+                "type": "object",
+                "properties": {
+                    "x": coordinate,
+                    "y": coordinate,
+                    "duration_ms": {"type": "integer", "minimum": 1, "maximum": 5_000},
+                    "button": {"type": "string", "enum": sorted(MOUSE_BUTTONS)},
+                },
+                "required": ["x", "y", "duration_ms", "button"],
             },
         ),
         "drag": action_schema(

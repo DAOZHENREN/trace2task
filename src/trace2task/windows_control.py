@@ -896,6 +896,21 @@ class WindowsMotorExecutor:
                     )
                     if click_index + 1 < clicks:
                         self.sleeper(0.08)
+            elif call.skill == "hold_mouse":
+                duration = call.args["duration_ms"]
+                if duration > self.max_hold_ms:
+                    raise WindowSafetyError(
+                        f"Requested mouse hold {duration}ms exceeds executor limit "
+                        f"{self.max_hold_ms}ms"
+                    )
+                position = self.session.normalized_to_screen(
+                    window,
+                    call.args["x"],
+                    call.args["y"],
+                )
+                if not self.background:
+                    self.session.backend.set_cursor_position(*position)
+                self._hold_mouse(window, call)
             elif call.skill == "drag":
                 duration = call.args["duration_ms"]
                 if duration > self.max_drag_ms:
@@ -1030,6 +1045,27 @@ class WindowsMotorExecutor:
                 )
             else:
                 self.session.backend.send_mouse_button(button, False)
+
+    def _hold_mouse(self, window: WindowInfo, call: ActionCall) -> None:
+        x = call.args["x"]
+        y = call.args["y"]
+        button = call.args["button"]
+        if self.background:
+            client_x, client_y = self.session.normalized_to_client(window, x, y)
+            send = lambda is_down: self.session.backend.post_window_mouse_button(
+                window.handle,
+                client_x,
+                client_y,
+                button,
+                is_down,
+            )
+        else:
+            send = lambda is_down: self.session.backend.send_mouse_button(button, is_down)
+        send(True)
+        try:
+            self.sleeper(call.args["duration_ms"] / 1_000)
+        finally:
+            send(False)
 
     def _press(self, window: WindowInfo, key: str) -> None:
         virtual_key = virtual_key_for(key)
