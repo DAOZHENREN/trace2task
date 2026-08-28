@@ -188,6 +188,38 @@ def test_windows_compiler_rejects_unreleased_key(tmp_path: Path) -> None:
         compile_trace(trace_path, tmp_path / "compiled")
 
 
+def test_windows_compiler_ignores_unmatched_release_at_focus_boundary(
+    tmp_path: Path,
+) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    orphan = {
+        **events[8],
+        "seq": 1,
+        "elapsed_ms": 50,
+        "details": {"raw_input": _mouse("up", position=(0.8, 0.4))},
+    }
+    events.insert(1, orphan)
+    for seq, event in enumerate(events):
+        event["seq"] = seq
+    metadata["event_count"] = len(events)
+    metadata["input_event_count"] = 13
+    _rewrite_bundle(trace_path, events, metadata)
+
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+
+    assert result.demonstration_actions == 7
+    assert report["inference"]["ignored_unmatched_releases"] == [
+        {
+            "seq": 1,
+            "elapsed_ms": 50.0,
+            "device": "mouse",
+            "name": "left",
+            "reason": "release_without_recorded_press_at_focus_boundary",
+        }
+    ]
+
+
 def test_windows_compiler_rejects_drag_without_motor_skill(tmp_path: Path) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
     events[8]["details"]["raw_input"]["normalized_position"] = [0.8, 0.8]

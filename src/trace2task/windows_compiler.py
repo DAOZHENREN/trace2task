@@ -141,11 +141,12 @@ def _validate_windows_trace(
 
 def _pair_input_intervals(
     raw_events: list[_RawInputEvent],
-) -> tuple[list[_InputInterval], list[_InputInterval]]:
+) -> tuple[list[_InputInterval], list[_InputInterval], list[_RawInputEvent]]:
     active_keys: dict[str, _RawInputEvent] = {}
     active_buttons: dict[str, _RawInputEvent] = {}
     keys: list[_InputInterval] = []
     buttons: list[_InputInterval] = []
+    ignored_releases: list[_RawInputEvent] = []
 
     for event in raw_events:
         device = event.payload.get("device")
@@ -172,13 +173,14 @@ def _pair_input_intervals(
             continue
         start = active.pop(name, None)
         if start is None:
-            raise ValueError(f"Raw {device} up event has no matching down event: {name}")
+            ignored_releases.append(event)
+            continue
         destination.append(_InputInterval(device=device, name=name, start=start, end=event))
 
     if active_keys or active_buttons:
         held = sorted([*active_keys, *active_buttons])
         raise ValueError(f"Trace ended with unreleased input: {held}")
-    return keys, buttons
+    return keys, buttons, ignored_releases
 
 
 def _duration(interval: _InputInterval) -> int:
@@ -404,12 +406,14 @@ def _insert_waits(actions: list[_TimedAction]) -> list[_TimedAction]:
     return result
 
 
-def _compile_actions(raw_events: list[_RawInputEvent]) -> list[_TimedAction]:
-    key_intervals, mouse_intervals = _pair_input_intervals(raw_events)
+def _compile_actions(
+    raw_events: list[_RawInputEvent],
+) -> tuple[list[_TimedAction], list[_RawInputEvent]]:
+    key_intervals, mouse_intervals, ignored_releases = _pair_input_intervals(raw_events)
     _reject_unsupported_concurrency(key_intervals, mouse_intervals)
     actions = [*_compile_keyboard(key_intervals), *_compile_mouse(mouse_intervals)]
     actions.sort(key=lambda item: (item.start_ms, item.source_seqs))
-    return _insert_waits(_merge_double_clicks(actions))
+    return _insert_waits(_merge_double_clicks(actions)), ignored_releases
 
 
 def _copy_reference_bundle(
@@ -437,7 +441,7 @@ def compile_windows_trace(
     """Compile one successful Windows demonstration into deterministic motor skills."""
 
     frame_paths, raw_events = _validate_windows_trace(source_trace, metadata, events)
-    inferred = _compile_actions(raw_events)
+    inferred, ignored_releases = _compile_actions(raw_events)
     if not inferred:
         raise ValueError("Windows trace did not produce any supported motor actions")
     task_id = str(metadata["task_id"]).strip()
@@ -504,13 +508,13 @@ def compile_windows_trace(
         {
             "id": "execute",
             "goal": "Reach the demonstrated outcome using the compiled Windows motor skills.",
-            "start_seq": raw_events[0].seq,
-            "end_seq": raw_events[-1].seq,
+            "start_seq": min(inferred[0].source_seqs),
+            "end_seq": max(inferred[-1].source_seqs),
             "action_count": len(demonstration),
             "observed_actions": observed_skills,
             "evidence_frames": [
-                f"reference/{raw_events[0].frame}",
-                f"reference/{raw_events[-1].frame}",
+                f"reference/{inferred[0].evidence_frame}",
+                f"reference/{inferred[-1].evidence_frame}",
             ],
         },
         {
@@ -606,6 +610,16 @@ def compile_windows_trace(
                 "max_mouse_click": MAX_MOUSE_CLICK_MS,
             },
             "pointer_jitter_tolerance": POINTER_JITTER_TOLERANCE,
+            "ignored_unmatched_releases": [
+                {
+                    "seq": event.seq,
+                    "elapsed_ms": event.elapsed_ms,
+                    "device": event.payload.get("device"),
+                    "name": event.payload.get("key", event.payload.get("button")),
+                    "reason": "release_without_recorded_press_at_focus_boundary",
+                }
+                for event in ignored_releases
+            ],
             "verifier": {
                 "type": "reviewed_reference_frame",
                 "evidence_frame": final_frame,
@@ -620,6 +634,7 @@ def compile_windows_trace(
             "Two adjacent same-position clicks within the time window form a double click.",
             "Idle gaps above the threshold are waits capped at ten seconds.",
             "The F8 success marker is human evidence and still requires visual review.",
+            "Unmatched release events are ignored and listed in the compiler report.",
             (
                 "Drag, unsupported concurrent input, outside-target click, unreleased input, and "
                 "excessive holds fail closed."
