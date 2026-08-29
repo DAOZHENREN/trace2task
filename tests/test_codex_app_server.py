@@ -216,3 +216,30 @@ def test_session_reports_failed_turn(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="model unavailable"):
         session.run_turn(prompt="test", image_path=image_path, output_schema={})
+
+
+def test_session_timeout_explains_that_network_reconnect_is_included(
+    tmp_path: Path,
+) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-terra",
+        cwd=tmp_path,
+        timeout_seconds=300,
+        transport_factory=lambda executable: transport,
+    )
+    image_path = tmp_path / "observation.png"
+    image_path.write_bytes(b"png")
+
+    with pytest.raises(
+        RuntimeError,
+        match="model response or network reconnect within 300 seconds",
+    ):
+        session.run_turn(prompt="test", image_path=image_path, output_schema={})

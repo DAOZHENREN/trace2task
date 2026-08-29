@@ -764,6 +764,7 @@ def compile_windows_trace(
         "experience": {
             "intent": task_id,
             "examples": [task_id],
+            "family_id": task_id,
             "source": "human_trace",
         },
         "demonstration": {"path": "demonstration.json", "action_count": len(demonstration)},

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -212,6 +213,60 @@ def _write_windows_recording(
         encoding="utf-8",
     )
     return trace_path
+
+
+def test_experience_family_inherits_confirmed_guidance_without_raw_coordinates(
+    tmp_path: Path,
+) -> None:
+    source_task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    source_root = yaml.safe_load(source_task.read_text(encoding="utf-8"))
+    source_root["experience"]["family_id"] = "wechat-message-family"
+    source_task.write_text(
+        yaml.safe_dump(source_root, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    target_dir = tmp_path / "taskpacks" / "wechat-rerecord"
+    shutil.copytree(source_task.parent, target_dir)
+    target_task = target_dir / "task.yaml"
+    target_root = yaml.safe_load(target_task.read_text(encoding="utf-8"))
+    target_root["id"] = "wechat-message-rerecord"
+    target_root["experience"]["family_id"] = "wechat-message-family"
+    target_root.pop("human_guidance", None)
+    target_task.write_text(
+        yaml.safe_dump(target_root, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    experience_path = target_dir / "experience.yaml"
+    target_experience = yaml.safe_load(experience_path.read_text(encoding="utf-8"))
+    target_experience["task_id"] = "wechat-message-rerecord"
+    experience_path.write_text(
+        yaml.safe_dump(target_experience, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    (target_dir / "guidance.yaml").unlink()
+
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+    inherited = controller._inherit_family_guidance(
+        source_task,
+        target_task,
+        family_id="wechat-message-family",
+    )
+    listed = next(
+        task for task in controller.list_taskpacks() if task["task_id"] == "wechat-message-rerecord"
+    )
+
+    assert inherited == {
+        "family_id": "wechat-message-family",
+        "source_task_id": "wechat-example",
+        "revision": 1,
+        "rule_count": 1,
+        "local_rule_count": 0,
+    }
+    assert listed["human_guidance"]["inheritance"]["source_task_id"] == "wechat-example"
+    assert listed["human_guidance"]["rules"][0]["prefer"] == (
+        "单击正确联系人并等待输入框出现。"
+    )
 
 
 @dataclass(frozen=True)
@@ -1258,6 +1313,9 @@ def test_web_server_serves_console_state_and_job_api(
         "narrated_trace": True,
         "local_whisper_turbo": True,
         "cycle_completion": True,
+        "narration_claim_audit": True,
+        "coordinate_isolation": True,
+        "experience_family_inheritance": True,
     }
     assert route["task_id"] == "wechat-example"
     assert summary_result["summary"] == "人工微调后的摘要"

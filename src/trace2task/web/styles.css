@@ -605,10 +605,21 @@ select:focus, textarea:focus {
 }
 .semantic-stage {
   display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
+  grid-template-columns: 218px minmax(0, 1fr);
   gap: 9px;
   padding: 7px 0 7px 8px;
   border-left: 2px solid var(--green-soft);
+}
+.semantic-stage-evidence-pair {
+  display: grid;
+  grid-template-columns: repeat(2, 104px);
+  gap: 7px;
+}
+.semantic-stage-evidence {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 8px;
 }
 .semantic-stage-frame {
   width: 104px;
@@ -621,6 +632,22 @@ select:focus, textarea:focus {
 .semantic-stage strong { color: #34423b; font-size: 10px; }
 .semantic-stage p { margin: 3px 0 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
 .semantic-stage .semantic-uncertain { color: #8a5a21; }
+.narration-claims {
+  padding: 8px;
+  background: #f8faf9;
+  border: 1px solid #e2e8e4;
+  border-radius: 8px;
+}
+.narration-claim-list { display: grid; gap: 6px; margin-top: 8px; }
+.narration-claim {
+  padding: 7px 8px;
+  border-left: 2px solid #9aaba2;
+  background: white;
+}
+.narration-claim.supported { border-left-color: var(--green); }
+.narration-claim.rejected { border-left-color: #c66a60; }
+.narration-claim strong { color: #405049; font-size: 9px; }
+.narration-claim p { margin: 3px 0 0; font-size: 9px; line-height: 1.45; }
 .mini-button {
   padding: 6px 8px;
   color: #405049;
@@ -807,6 +834,7 @@ footer {
   .agent-settings, .execution-options { grid-template-columns: 1fr; }
   .job-summary { grid-template-columns: 1fr 1fr; }
   .semantic-stage { grid-template-columns: 1fr; }
+  .semantic-stage-evidence-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .semantic-stage-frame { width: 100%; }
   .stop-button { grid-column: 1 / -1; }
   footer { flex-direction: column; gap: 8px; }

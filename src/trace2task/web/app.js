@@ -396,6 +396,10 @@ function renderLibrary() {
         ? "循环完成 · 必须离开再返回"
         : "终态完成";
       tags.append(completion);
+      const motorPolicy = document.createElement("span");
+      motorPolicy.className = "mini-tag info";
+      motorPolicy.textContent = "原始坐标已隔离";
+      tags.append(motorPolicy);
     } else {
       const missingSemantic = document.createElement("span");
       missingSemantic.className = "mini-tag warn";
@@ -408,6 +412,12 @@ function renderLibrary() {
       guidance.textContent = `人工诀窍 v${task.human_guidance.revision} · ${task.human_guidance.rule_count} 条`;
       guidance.title = task.human_guidance.summary;
       tags.append(guidance);
+    }
+    if (task.experience_family_id) {
+      const family = document.createElement("span");
+      family.className = "mini-tag";
+      family.textContent = `经验族：${task.experience_family_id}`;
+      tags.append(family);
     }
 
     let storyboard = null;
@@ -428,18 +438,31 @@ function renderLibrary() {
       task.semantic_experience.stages.forEach((stage, index) => {
         const stageItem = document.createElement("div");
         stageItem.className = "semantic-stage";
-        const evidence = document.createElement("img");
-        evidence.className = "semantic-stage-frame";
-        evidence.loading = "lazy";
-        evidence.src = `/api/local-image?path=${encodeURIComponent(stage.evidence_frame)}`;
-        evidence.alt = `${stage.name} 的 Trace 阶段结束证据`;
+        const evidencePair = document.createElement("div");
+        evidencePair.className = "semantic-stage-evidence-pair";
+        [
+          ["前置", stage.evidence_before],
+          ["结果", stage.evidence_after || stage.evidence_frame],
+        ].forEach(([label, source]) => {
+          const evidenceBlock = document.createElement("div");
+          evidenceBlock.className = "semantic-stage-evidence";
+          const evidenceLabel = document.createElement("span");
+          evidenceLabel.textContent = label;
+          const evidence = document.createElement("img");
+          evidence.className = "semantic-stage-frame";
+          evidence.loading = "lazy";
+          evidence.src = `/api/local-image?path=${encodeURIComponent(source)}`;
+          evidence.alt = `${stage.name} 的 Trace ${label}证据`;
+          evidenceBlock.append(evidenceLabel, evidence);
+          evidencePair.append(evidenceBlock);
+        });
         const stageTitle = document.createElement("strong");
         stageTitle.textContent = `${index + 1}. ${stage.name} · ${Math.round(stage.confidence * 100)}%`;
         const transition = document.createElement("p");
         transition.textContent = `${stage.state_before} → ${stage.intent} → ${stage.state_after}`;
         const stageCopy = document.createElement("div");
         stageCopy.append(stageTitle, transition);
-        stageItem.append(evidence, stageCopy);
+        stageItem.append(evidencePair, stageCopy);
         if (stage.dynamic_decisions.length) {
           const decisions = document.createElement("p");
           decisions.className = "semantic-uncertain";
@@ -448,6 +471,37 @@ function renderLibrary() {
         }
         stages.append(stageItem);
       });
+      if (task.semantic_experience.narration_claims?.length) {
+        const claimDetails = document.createElement("details");
+        claimDetails.className = "narration-claims";
+        const claimSummary = document.createElement("summary");
+        const supported = task.semantic_experience.narration_claims.filter(
+          (claim) => claim.verdict === "supported",
+        ).length;
+        claimSummary.textContent = `查看口语声明审计 · ${supported} 条有 Trace 支撑 · 不直接变成运行指令`;
+        const claimList = document.createElement("div");
+        claimList.className = "narration-claim-list";
+        const verdictLabels = {
+          supported: "有证据支持",
+          advisory: "仅作参考",
+          rejected: "已拒绝",
+        };
+        task.semantic_experience.narration_claims.forEach((claim) => {
+          const claimItem = document.createElement("div");
+          claimItem.className = `narration-claim ${claim.verdict}`;
+          const claimTitle = document.createElement("strong");
+          claimTitle.textContent = `${verdictLabels[claim.verdict] || claim.verdict} · ${claim.type} · 动作 ${claim.action_range[0]}–${claim.action_range[1]}`;
+          const claimText = document.createElement("p");
+          claimText.textContent = claim.text;
+          const claimReason = document.createElement("p");
+          claimReason.className = "semantic-uncertain";
+          claimReason.textContent = `判断：${claim.reason}（${Math.round(claim.confidence * 100)}%）`;
+          claimItem.append(claimTitle, claimText, claimReason);
+          claimList.append(claimItem);
+        });
+        claimDetails.append(claimSummary, claimList);
+        stages.append(claimDetails);
+      }
       storyboard.append(summary, stages);
     }
 
@@ -469,6 +523,13 @@ function renderLibrary() {
             is_active: true,
           }];
       guidanceSummary.textContent = `查看经验融合记录 · 当前 v${task.human_guidance.revision} · 共 ${history.length} 版`;
+      if (task.human_guidance.inheritance) {
+        guidanceSummary.textContent += ` · 继承自 ${task.human_guidance.inheritance.source_task_id}`;
+        const renamed = task.human_guidance.inheritance.renamed_local_rules?.length || 0;
+        if (renamed) {
+          guidanceSummary.textContent += ` · ${renamed} 条本地规则已保留并重新编号`;
+        }
+      }
       const timeline = document.createElement("div");
       timeline.className = "guidance-timeline";
       const operationLabels = {
@@ -1128,11 +1189,16 @@ function clearRecordError() {
 async function refreshState() {
   const state = await request("/api/state");
   backendSupportsIncrementalGuidance = state.capabilities?.incremental_guidance === true;
-  elements.version.textContent = backendSupportsIncrementalGuidance
+  const backendSupportsV13 = state.capabilities?.coordinate_isolation === true
+    && state.capabilities?.narration_claim_audit === true
+    && state.capabilities?.experience_family_inheritance === true;
+  elements.version.textContent = backendSupportsV13
     ? `v${state.version}`
     : `v${state.version} · 需要重启`;
   if (!backendSupportsIncrementalGuidance) {
     showError("网页后台仍是旧版本。请停止并重新启动 trace2task web；在此之前已确认经验可能被整包覆写。");
+  } else if (!backendSupportsV13) {
+    showError("网页后台还没有加载 V0.13。请停止并重新启动 trace2task web；重启前运行 Agent 仍可能收到旧的原始动作上下文。");
   }
   candidates = state.candidates || [];
   recordings = state.recordings || [];

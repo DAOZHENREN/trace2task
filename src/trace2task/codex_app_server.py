@@ -386,13 +386,15 @@ class CodexAppServerSession:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(
-                f"Codex did not return a decision within {self.timeout_seconds:g} seconds"
+                "Codex did not complete its model response or network reconnect within "
+                f"{self.timeout_seconds:g} seconds"
             )
         try:
             return self._transport.receive(remaining)
         except TimeoutError as error:
             raise RuntimeError(
-                f"Codex did not return a decision within {self.timeout_seconds:g} seconds"
+                "Codex did not complete its model response or network reconnect within "
+                f"{self.timeout_seconds:g} seconds"
             ) from error
 
     def _handle_server_request(self, message: dict[str, Any]) -> bool:

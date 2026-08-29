@@ -23,6 +23,7 @@ class TaskPack:
     requires_confirmation: bool
     experience_intent: str
     experience_examples: tuple[str, ...]
+    experience_family_id: str
     source_path: Path
 
 
@@ -73,10 +74,12 @@ def load_taskpack(path: Path) -> TaskPack:
     if experience is None:
         experience_intent = task_id
         experience_examples = [task_id]
+        experience_family_id = task_id
     else:
         experience_mapping = _require_mapping(experience, "experience")
         experience_intent = experience_mapping.get("intent", task_id)
         experience_examples = experience_mapping.get("examples", [task_id])
+        experience_family_id = experience_mapping.get("family_id", task_id)
 
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("Task pack must define a non-empty string 'id'")
@@ -119,6 +122,8 @@ def load_taskpack(path: Path) -> TaskPack:
         or not all(isinstance(example, str) and example.strip() for example in experience_examples)
     ):
         raise ValueError("Task pack experience.examples must be a string list")
+    if not isinstance(experience_family_id, str) or not experience_family_id.strip():
+        raise ValueError("Task pack experience.family_id must be a non-empty string")
 
     return TaskPack(
         task_id=task_id.strip(),
@@ -135,5 +140,6 @@ def load_taskpack(path: Path) -> TaskPack:
         requires_confirmation=requires_confirmation,
         experience_intent=experience_intent.strip(),
         experience_examples=tuple(" ".join(example.split()) for example in experience_examples),
+        experience_family_id=" ".join(experience_family_id.split()),
         source_path=source_path,
     )

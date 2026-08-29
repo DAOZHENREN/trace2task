@@ -18,7 +18,11 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_REASONING_EFFORT,
 )
 from trace2task.recording import TraceWriter, make_run_dir
-from trace2task.windows_agent import CodexWindowsAgent, WindowsAgentPlan
+from trace2task.windows_agent import (
+    WINDOWS_DECISION_TIMEOUT_SECONDS,
+    CodexWindowsAgent,
+    WindowsAgentPlan,
+)
 from trace2task.windows_capture import GdiWindowCapture, WindowFrameCapture
 from trace2task.windows_control import (
     Win32Backend,
@@ -364,7 +368,10 @@ def run_windows_agent(
             window = session.focus(timeout_seconds=10) if focus else session.resolve()
             if not window.is_visible or window.is_minimized:
                 raise RuntimeError("Windows Agent target must be visible and unminimized")
-            status_callback("Requesting a multimodal plan; this can take up to 120 seconds...")
+            status_callback(
+                "Requesting a multimodal plan. Network interruptions are retried "
+                f"automatically for up to {WINDOWS_DECISION_TIMEOUT_SECONDS:g} seconds..."
+            )
             surface, capture_ms = _capture_with_timing(active_capture, window)
             planning_started = time.perf_counter()
             plan = agent.plan(surface)
@@ -625,7 +632,8 @@ def run_windows_agent(
                 surface, plan_capture_ms = _capture_with_timing(active_capture, window)
                 total_capture_ms += plan_capture_ms
             status_callback(
-                f"[plan {agent.replans + 1}] Requesting a multimodal decision..."
+                f"[plan {agent.replans + 1}] Requesting a multimodal decision; "
+                "Codex network reconnects are allowed to finish..."
             )
             planning_started = time.perf_counter()
             plan = agent.plan(surface)
@@ -648,6 +656,13 @@ def run_windows_agent(
             )
             last_proposed = [action.to_payload() for action in plan.actions]
             proposed = ", ".join(action.skill for action in plan.actions) or "complete"
+            if plan_timing.decision_repair_attempts:
+                status_callback(
+                    f"[plan {agent.replans}] Same-session recovery succeeded after rejecting "
+                    f"{plan_timing.decision_repair_attempts} empty incomplete decision(s); "
+                    f"candidate stage {plan_timing.decision_repair_stage_id or 'unknown'}. "
+                    "No rejected action was executed."
+                )
             status_callback(
                 f"[plan {agent.replans}] Received in {planning_ms / 1000:.1f}s: "
                 f"{len(plan.actions)}-action stage program ({proposed}) "

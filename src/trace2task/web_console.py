@@ -11,8 +11,10 @@ import time
 import uuid
 import webbrowser
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -175,6 +177,15 @@ def _guidance_history(active_path: Path, *, task_id: str) -> list[dict[str, Any]
         if active_revision is not None:
             revisions[active_revision]["is_active"] = True
     return [revisions[revision] for revision in sorted(revisions, reverse=True)]
+
+
+def _guidance_inheritance(active_path: Path) -> dict[str, Any] | None:
+    try:
+        root = yaml.safe_load(active_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    inheritance = root.get("inheritance") if isinstance(root, dict) else None
+    return dict(inheritance) if isinstance(inheritance, dict) else None
 
 
 @dataclass
@@ -370,6 +381,7 @@ class WebConsoleController:
                         "max_actions": contract.task.max_actions,
                         "experience_intent": contract.task.experience_intent,
                         "experience_examples": list(contract.task.experience_examples),
+                        "experience_family_id": contract.task.experience_family_id,
                         "semantic_experience": (
                             {
                                 "status": semantic.review_status,
@@ -386,6 +398,8 @@ class WebConsoleController:
                                 "model": semantic.model,
                                 "reasoning_effort": semantic.reasoning_effort,
                                 "stage_count": len(semantic.stages),
+                                "motor_policy": "semantic_intent_only_no_recorded_coordinates",
+                                "narration_claims": semantic.narration_audit_payload(),
                                 "stages": [
                                     {
                                         "id": stage.stage_id,
@@ -393,6 +407,18 @@ class WebConsoleController:
                                         "state_before": stage.state_before.description,
                                         "intent": stage.action_intents[0].description,
                                         "state_after": stage.state_after.description,
+                                        "evidence_before": (
+                                            path.parent
+                                            / stage.state_before.evidence_frame
+                                        ).resolve().relative_to(
+                                            self.project_root
+                                        ).as_posix(),
+                                        "evidence_after": (
+                                            path.parent
+                                            / stage.state_after.evidence_frame
+                                        ).resolve().relative_to(
+                                            self.project_root
+                                        ).as_posix(),
                                         "evidence_frame": (
                                             path.parent
                                             / stage.state_after.evidence_frame
@@ -426,6 +452,7 @@ class WebConsoleController:
                                     guidance.source_path,
                                     task_id=contract.task.task_id,
                                 ),
+                                "inheritance": _guidance_inheritance(guidance.source_path),
                                 "rules": [
                                     {
                                         "id": rule.rule_id,
@@ -1035,13 +1062,19 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         report = status_callback or (lambda message: None)
         existing_task = self._find_taskpack_for_trace(trace_path)
+        recording_metadata = json.loads(
+            trace_path.with_name("metadata.json").read_text(encoding="utf-8")
+        )
+        recording_task_id = recording_metadata.get("task_id")
+        if not isinstance(recording_task_id, str) or not recording_task_id.strip():
+            raise ValueError("原始录制缺少有效的经验名称")
+        family_source = self._select_family_source(recording_task_id, recording_metadata)
+        family_id = (
+            str(family_source.get("experience_family_id"))
+            if family_source is not None
+            else recording_task_id.strip()
+        )
         if existing_task is None:
-            recording_metadata = json.loads(
-                trace_path.with_name("metadata.json").read_text(encoding="utf-8")
-            )
-            recording_task_id = recording_metadata.get("task_id")
-            if not isinstance(recording_task_id, str) or not recording_task_id.strip():
-                raise ValueError("原始录制缺少有效的经验名称")
             duplicate_task = next(
                 (
                     task
@@ -1063,11 +1096,15 @@ class WebConsoleController:
             )
             payload = _jsonable(result)
             semantic_task = Path(result.task_path)
+            if semantic_task.is_file():
+                self._set_experience_family(semantic_task, family_id)
             payload["reused_taskpack"] = False
         else:
             report("检测到同一原始 Trace 的任务包，将重新生成语义层，不再创建副本。")
             contract = load_windows_task(existing_task)
             semantic_task = existing_task
+            if family_source is not None:
+                self._set_experience_family(semantic_task, family_id)
             payload = {
                 "task_id": contract.task.task_id,
                 "task_path": str(existing_task),
@@ -1096,6 +1133,18 @@ class WebConsoleController:
                 "status": "completed",
                 "result": _jsonable(semantic),
             }
+            if family_source is not None:
+                inherited = self._inherit_family_guidance(
+                    self._resolve_task_path(str(family_source["path"])),
+                    semantic_task,
+                    family_id=family_id,
+                )
+                if inherited is not None:
+                    payload["guidance_inheritance"] = inherited
+                    report(
+                        "已从同一经验族继承确认过的人工诀窍："
+                        f"{inherited['source_task_id']} v{inherited['revision']}。"
+                    )
         return payload
 
     def _find_taskpack_for_trace(self, trace_path: Path) -> Path | None:
@@ -1126,6 +1175,229 @@ class WebConsoleController:
     @staticmethod
     def _experience_name_key(value: object) -> str:
         return " ".join(str(value or "").split()).casefold()
+
+    def _select_family_source(
+        self,
+        task_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        initial_window = (
+            metadata.get("initial_window")
+            if isinstance(metadata.get("initial_window"), dict)
+            else {}
+        )
+        process_name = str(initial_window.get("process_name") or "").casefold()
+        candidates = [
+            task
+            for task in self.list_taskpacks()
+            if task.get("confirmed")
+            and task.get("human_guidance") is not None
+            and (
+                not process_name
+                or str(task.get("process_name") or "").casefold() == process_name
+            )
+            and self._experience_name_key(task.get("task_id"))
+            != self._experience_name_key(task_id)
+        ]
+        if not candidates:
+            return None
+        requested = self._experience_name_key(task_id).replace(" ", "")
+        candidates = [
+            task
+            for task in candidates
+            if requested
+            and (
+                requested in self._experience_name_key(task.get("task_id")).replace(" ", "")
+                or SequenceMatcher(
+                    None,
+                    requested,
+                    self._experience_name_key(task.get("task_id")).replace(" ", ""),
+                ).ratio()
+                >= 0.55
+            )
+        ]
+        if not candidates:
+            return None
+        try:
+            match = route_experience(task_id, candidates)
+        except ValueError:
+            candidates.sort(
+                key=lambda task: int((task.get("human_guidance") or {}).get("revision") or 0),
+                reverse=True,
+            )
+            return candidates[0]
+        if match.confidence < 0.75:
+            return None
+        return next(
+            (task for task in candidates if task.get("path") == match.task_path),
+            None,
+        )
+
+    @staticmethod
+    def _set_experience_family(task_path: Path, family_id: str) -> None:
+        root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+        if not isinstance(root, dict):
+            raise TypeError("任务经验格式无效")
+        experience = root.get("experience")
+        if not isinstance(experience, dict):
+            experience = {}
+        experience["family_id"] = " ".join(family_id.split())
+        root["experience"] = experience
+        task_path.write_text(
+            yaml.safe_dump(root, sort_keys=False, allow_unicode=True, width=100),
+            encoding="utf-8",
+        )
+
+    def _inherit_family_guidance(
+        self,
+        source_task: Path,
+        target_task: Path,
+        *,
+        family_id: str,
+    ) -> dict[str, Any] | None:
+        if source_task.resolve() == target_task.resolve():
+            return None
+        source_contract = load_windows_task(source_task)
+        target_contract = load_windows_task(target_task)
+        if source_contract.human_guidance is None or target_contract.semantic_experience is None:
+            return None
+        target_stage_ids = {
+            stage.stage_id for stage in target_contract.semantic_experience.stages
+        }
+        source_guidance = source_contract.human_guidance.source_path
+        target_guidance = target_contract.human_guidance
+
+        def inherited_document(path: Path) -> dict[str, Any] | None:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or raw.get("status") != "confirmed":
+                return None
+            document = deepcopy(raw)
+            rules = [
+                deepcopy(rule)
+                for rule in document.get("rules", [])
+                if isinstance(rule, dict)
+                and rule.get("stage_id") in target_stage_ids | {"global"}
+            ]
+            if not rules:
+                return None
+            document["task_id"] = target_contract.task.task_id
+            document["rules"] = rules
+            operations = document.get("operations")
+            if isinstance(operations, list):
+                document["operations"] = [
+                    operation
+                    for operation in operations
+                    if isinstance(operation, dict)
+                    and operation.get("stage_id") in target_stage_ids | {"global"}
+                ]
+            document["inheritance"] = {
+                "family_id": family_id,
+                "source_task": source_task.relative_to(self.project_root).as_posix(),
+                "source_task_id": source_contract.task.task_id,
+                "inherited_at": _now(),
+                "policy": "confirmed_human_guidance_wins",
+            }
+            return document
+
+        active = inherited_document(source_guidance)
+        if active is None:
+            return None
+        local_rule_count = 0
+        if target_guidance is not None:
+            source_rules = {
+                str(rule.get("id")): rule
+                for rule in active["rules"]
+                if isinstance(rule, dict) and rule.get("id")
+            }
+            operations: list[dict[str, Any]] = []
+            renamed_local_rules: list[dict[str, str]] = []
+            for local_rule in target_guidance.rules:
+                payload = local_rule.prompt_payload()
+                result_rule_id = local_rule.rule_id
+                existing = source_rules.get(result_rule_id)
+                if existing == payload:
+                    continue
+                if existing is not None:
+                    number = 1
+                    while f"trick-{number:04d}" in source_rules:
+                        number += 1
+                    result_rule_id = f"trick-{number:04d}"
+                    payload = {**payload, "id": result_rule_id}
+                    renamed_local_rules.append(
+                        {"from": local_rule.rule_id, "to": result_rule_id}
+                    )
+                source_rules[result_rule_id] = payload
+                operations.append(
+                    {
+                        "operation": "add",
+                        "target_rule_id": "",
+                        "result_rule_id": result_rule_id,
+                        **{key: value for key, value in payload.items() if key != "id"},
+                        "reason": "保留该新录制已经确认的本地人工反馈。",
+                    }
+                )
+            if len(source_rules) > 12:
+                raise ValueError("经验族合并后超过 12 条人工规则，请先在网页端精简旧规则")
+            local_rule_count = len(target_guidance.rules)
+            source_revision = int(active["revision"])
+            active["parent_revision"] = source_revision
+            active["revision"] = source_revision + 1
+            active["rules"] = list(source_rules.values())
+            active["operations"] = operations
+            active["summary"] = (
+                f"{active.get('summary', '')}；本录制已确认反馈：{target_guidance.summary}"
+            )
+            active["source"] = {
+                "type": "experience_family_inheritance",
+                "feedback": "",
+            }
+            active.setdefault("review", {})["confirmed_at"] = _now()
+            active.setdefault("revision_agent", {})["created_at"] = _now()
+            active["inheritance"]["local_revision"] = target_guidance.revision
+            active["inheritance"]["local_rule_count"] = local_rule_count
+            active["inheritance"]["renamed_local_rules"] = renamed_local_rules
+        target_guidance_path = target_task.with_name("guidance.yaml")
+        target_revisions = target_task.parent / "guidance-revisions"
+        source_revisions = source_guidance.parent / "guidance-revisions"
+        if source_revisions.is_dir():
+            for source_revision in source_revisions.glob("revision-*.yaml"):
+                revision = inherited_document(source_revision)
+                if revision is None:
+                    continue
+                target_revisions.mkdir(parents=True, exist_ok=True)
+                (target_revisions / source_revision.name).write_text(
+                    yaml.safe_dump(
+                        revision,
+                        sort_keys=False,
+                        allow_unicode=True,
+                        width=100,
+                    ),
+                    encoding="utf-8",
+                )
+        target_guidance_path.write_text(
+            yaml.safe_dump(active, sort_keys=False, allow_unicode=True, width=100),
+            encoding="utf-8",
+        )
+        task_root = yaml.safe_load(target_task.read_text(encoding="utf-8"))
+        if not isinstance(task_root, dict):
+            raise TypeError("任务经验格式无效")
+        task_root["human_guidance"] = {
+            "path": target_guidance_path.name,
+            "revision": int(active["revision"]),
+            "rule_count": len(active["rules"]),
+        }
+        target_task.write_text(
+            yaml.safe_dump(task_root, sort_keys=False, allow_unicode=True, width=100),
+            encoding="utf-8",
+        )
+        load_windows_task(target_task)
+        return {
+            "family_id": family_id,
+            "source_task_id": source_contract.task.task_id,
+            "revision": int(active["revision"]),
+            "rule_count": len(active["rules"]),
+            "local_rule_count": local_rule_count,
+        }
 
     def _ensure_experience_name_available(self, task_id: str) -> None:
         requested = self._experience_name_key(task_id)
@@ -1688,6 +1960,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "narrated_trace": True,
                         "local_whisper_turbo": True,
                         "cycle_completion": True,
+                        "narration_claim_audit": True,
+                        "coordinate_isolation": True,
+                        "experience_family_inheritance": True,
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),

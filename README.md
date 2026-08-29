@@ -49,7 +49,7 @@ To watch the comparison:
 uv run trace2task demo --show
 ```
 
-## Local web console and iterative Trace experience (v0.12.1)
+## Local web console and iterative Trace experience (v0.13.0)
 
 Version 0.7.0 adds the offline multimodal Compiler Agent. Version 0.7.1 makes manual compilation a
 visible background job: the activity panel responds immediately, concurrent duplicate requests are
@@ -117,7 +117,23 @@ The model is downloaded once into `.cache/faster-whisper/` on first use and then
 FP16 is preferred; machines without usable CUDA 12/cuDNN 9 libraries automatically fall back to
 CPU INT8 instead of blocking compilation. A failed local transcription preserves the browser draft
 so the user can still correct it and continue.
-
+Version 0.12.2 hardens runtime planning against transient Codex WebSocket disconnects. Windows
+planning now gives Codex's built-in reconnects a five-minute outer window instead of terminating
+them at the old 120-second boundary. Current and Trace evidence images are downscaled only for the
+model request to maximum 1440- and 1280-pixel edges respectively, while the original Trace frames remain untouched. This
+keeps all stage evidence but brings the first-turn multimodal payload closer to the size of earlier
+successful runs. Timeout errors and web logs now explicitly distinguish model/network completion
+from local action parsing.
+Version 0.13.0 separates observation evidence from runtime authority. Timestamped narration is
+aligned to Trace action ranges, deduplicated, and compiled into reviewable goal/strategy/observation/
+recovery/example-only claims; those claims never become motor commands by themselves. The Compiler
+Agent's visually selected before/after frames are preserved instead of being overwritten by adjacent
+raw boundary frames. Runtime planning no longer receives the full demonstration, recorded
+coordinates, drag paths, hold durations, or fixed waits; it retrieves the active semantic stage,
+confirmed human guidance, exact stage images, and a coordinate-free action-category summary. New or
+recompiled recordings can join a matched experience family and inherit compatible confirmed guidance
+without discarding already confirmed local rules. The task card shows the family, both stage images,
+narration-claim audit, inheritance source, and the explicit recorded-coordinate isolation policy.
 The loopback-only browser console runs the Compiler Agent after a successful Windows recording. The
 recording is still compiled deterministically into motor evidence,
 then the selected Codex model interprets the preserved human Trace as reviewable stages, grounded

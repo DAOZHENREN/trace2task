@@ -4,7 +4,7 @@ import json
 import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,8 @@ TEMPORAL_BOUNDARY_MS = 1_500
 PROVENANCE_VALUES = {"observed", "inferred", "unknown"}
 GENERALIZATION_VALUES = {"demonstrated_only", "runtime_agent_decides", "unknown"}
 COMPLETION_MODES = {"state", "cycle"}
+NARRATION_CLAIM_TYPES = {"goal", "strategy", "observation", "recovery", "example_only"}
+NARRATION_CLAIM_VERDICTS = {"supported", "advisory", "rejected"}
 DEFAULT_COMPILER_MODEL = "gpt-5.6-sol"
 DEFAULT_COMPILER_REASONING_EFFORT = "high"
 
@@ -63,6 +65,17 @@ class DynamicDecision:
 
 
 @dataclass(frozen=True)
+class NarrationClaim:
+    text: str
+    claim_type: str
+    start_action_index: int
+    end_action_index: int
+    confidence: float
+    verdict: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class ExperienceStage:
     stage_id: str
     name: str
@@ -86,6 +99,7 @@ class SemanticExperience:
     completion_success_condition: str
     completion_reason: str
     stages: tuple[ExperienceStage, ...]
+    narration_claims: tuple[NarrationClaim, ...]
     source_type: str
     model: str
     reasoning_effort: str
@@ -147,6 +161,20 @@ class SemanticExperience:
             },
             "stages": [self._stage_payload(stage) for stage in self.stages],
         }
+
+    def narration_audit_payload(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "text": claim.text,
+                "type": claim.claim_type,
+                "action_range": [claim.start_action_index, claim.end_action_index],
+                "confidence": claim.confidence,
+                "verdict": claim.verdict,
+                "reason": claim.reason,
+                "runtime_policy": "compiler_evidence_only",
+            }
+            for claim in self.narration_claims
+        ]
 
     def stage_index_payload(self) -> dict[str, Any]:
         return {
@@ -268,7 +296,16 @@ def _validate_semantic_payload(
     task_id: str,
     action_count: int,
     allowed_frames: set[str],
-) -> tuple[str, str, str, str, str, str, tuple[ExperienceStage, ...]]:
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    tuple[ExperienceStage, ...],
+    tuple[NarrationClaim, ...],
+]:
     root = _mapping(payload, "Compiler Agent output")
     goal = _string(root.get("goal"), "goal")
     summary = _string(root.get("summary"), "summary")
@@ -417,6 +454,41 @@ def _validate_semantic_payload(
         raise ValueError(
             f"Semantic stages cover {expected_stage_start} of {action_count} actions for {task_id}"
         )
+
+    raw_claims = root.get("narration_claims", [])
+    if not isinstance(raw_claims, list) or len(raw_claims) > 24:
+        raise ValueError("narration_claims must contain at most 24 items")
+    narration_claims: list[NarrationClaim] = []
+    for claim_index, raw_claim in enumerate(raw_claims):
+        label = f"narration_claims[{claim_index}]"
+        data = _mapping(raw_claim, label)
+        claim_type = _string(data.get("type"), f"{label}.type")
+        if claim_type not in NARRATION_CLAIM_TYPES:
+            raise ValueError(f"{label}.type is unsupported")
+        verdict = _string(data.get("verdict"), f"{label}.verdict")
+        if verdict not in NARRATION_CLAIM_VERDICTS:
+            raise ValueError(f"{label}.verdict is unsupported")
+        start = data.get("start_action_index")
+        end = data.get("end_action_index")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not 0 <= start <= end < action_count
+        ):
+            raise ValueError(f"{label} has an invalid aligned action range")
+        narration_claims.append(
+            NarrationClaim(
+                text=_string(data.get("text"), f"{label}.text"),
+                claim_type=claim_type,
+                start_action_index=start,
+                end_action_index=end,
+                confidence=_confidence(data.get("confidence"), f"{label}.confidence"),
+                verdict=verdict,
+                reason=_string(data.get("reason"), f"{label}.reason"),
+            )
+        )
     return (
         canonical_instruction,
         goal,
@@ -425,33 +497,8 @@ def _validate_semantic_payload(
         completion_success_condition,
         completion_reason,
         tuple(stages),
+        tuple(narration_claims),
     )
-
-
-def _align_stage_frames(
-    stages: Sequence[ExperienceStage],
-    timeline: Sequence[Mapping[str, Any]],
-) -> tuple[ExperienceStage, ...]:
-    """Bind semantic ranges to their exact preserved Trace boundary frames."""
-
-    aligned: list[ExperienceStage] = []
-    for stage in stages:
-        before_frame = _string(
-            timeline[stage.start_action_index].get("before_frame"),
-            f"{stage.stage_id}.aligned_state_before",
-        )
-        after_frame = _string(
-            timeline[stage.end_action_index].get("after_frame"),
-            f"{stage.stage_id}.aligned_state_after",
-        )
-        aligned.append(
-            replace(
-                stage,
-                state_before=replace(stage.state_before, evidence_frame=before_frame),
-                state_after=replace(stage.state_after, evidence_frame=after_frame),
-            )
-        )
-    return tuple(aligned)
 
 
 def _state_payload(state: ExperienceState) -> dict[str, Any]:
@@ -472,19 +519,21 @@ def _experience_document(
     completion_success_condition: str,
     completion_reason: str,
     stages: Sequence[ExperienceStage],
+    narration_claims: Sequence[NarrationClaim],
     model: str,
     reasoning_effort: str,
     narration_available: bool,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "task_id": task_id,
         "source": {
             "type": "human_trace",
             "trace": "reference/trace.jsonl",
             "demonstration": "demonstration.json",
             "narration": "reference/narration.json" if narration_available else None,
-            "policy": "immutable_strong_evidence",
+            "policy": "immutable_observation_evidence",
+            "runtime_motor_policy": "semantic_intent_only_no_recorded_coordinates",
         },
         "compiler": {
             "type": "multimodal_agent",
@@ -502,6 +551,19 @@ def _experience_document(
             "success_condition": completion_success_condition,
             "reason": completion_reason,
         },
+        "narration_claims": [
+            {
+                "text": claim.text,
+                "type": claim.claim_type,
+                "start_action_index": claim.start_action_index,
+                "end_action_index": claim.end_action_index,
+                "confidence": claim.confidence,
+                "verdict": claim.verdict,
+                "reason": claim.reason,
+                "runtime_policy": "compiler_evidence_only",
+            }
+            for claim in narration_claims
+        ],
         "stages": [
             {
                 "id": stage.stage_id,
@@ -571,6 +633,7 @@ def load_semantic_experience(
         completion_success_condition,
         completion_reason,
         stages,
+        narration_claims,
     ) = _validate_semantic_payload(
         root,
         task_id=task_id,
@@ -595,6 +658,7 @@ def load_semantic_experience(
         completion_success_condition=completion_success_condition,
         completion_reason=completion_reason,
         stages=stages,
+        narration_claims=narration_claims,
         source_type=source_type,
         model=_string(compiler.get("model"), "experience.compiler.model"),
         reasoning_effort=_string(
@@ -791,6 +855,46 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
                 "required": ["mode", "success_condition", "reason"],
                 "additionalProperties": False,
             },
+            "narration_claims": {
+                "type": "array",
+                "maxItems": 24,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+                        "type": {
+                            "type": "string",
+                            "enum": sorted(NARRATION_CLAIM_TYPES),
+                        },
+                        "start_action_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": action_count - 1,
+                        },
+                        "end_action_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": action_count - 1,
+                        },
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "verdict": {
+                            "type": "string",
+                            "enum": sorted(NARRATION_CLAIM_VERDICTS),
+                        },
+                        "reason": {"type": "string", "minLength": 1, "maxLength": 1000},
+                    },
+                    "required": [
+                        "text",
+                        "type",
+                        "start_action_index",
+                        "end_action_index",
+                        "confidence",
+                        "verdict",
+                        "reason",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
             "stages": {
                 "type": "array",
                 "minItems": 1,
@@ -904,9 +1008,105 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
                 },
             },
         },
-        "required": ["canonical_instruction", "goal", "summary", "completion", "stages"],
+        "required": [
+            "canonical_instruction",
+            "goal",
+            "summary",
+            "completion",
+            "narration_claims",
+            "stages",
+        ],
         "additionalProperties": False,
     }
+
+
+def _deduplicate_narration_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    clauses = [
+        " ".join(clause.split())
+        for clause in re.split(r"[，。！？,!?；;]+", value)
+        if clause.strip()
+    ]
+    compact: list[str] = []
+    for clause in clauses:
+        if not compact or clause.casefold() != compact[-1].casefold():
+            compact.append(clause)
+    return "；".join(compact)
+
+
+def _aligned_narration_context(
+    narration: Mapping[str, Any] | None,
+    timeline: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if narration is None or not timeline:
+        return []
+    raw_segments = narration.get("segments")
+    segments = raw_segments if isinstance(raw_segments, list) else []
+    if not segments:
+        transcript = _deduplicate_narration_text(narration.get("transcript"))
+        return (
+            [
+                {
+                    "segment": 1,
+                    "text": transcript,
+                    "aligned_action_range": [0, len(timeline) - 1],
+                    "alignment": "task_level_without_timestamps",
+                }
+            ]
+            if transcript
+            else []
+        )
+
+    aligned: list[dict[str, Any]] = []
+    for segment_index, raw_segment in enumerate(segments, start=1):
+        if not isinstance(raw_segment, dict):
+            continue
+        text = _deduplicate_narration_text(raw_segment.get("text"))
+        start_ms = raw_segment.get("start_ms")
+        end_ms = raw_segment.get("end_ms")
+        if (
+            not text
+            or not isinstance(start_ms, (int, float))
+            or isinstance(start_ms, bool)
+            or not isinstance(end_ms, (int, float))
+            or isinstance(end_ms, bool)
+            or end_ms < start_ms
+        ):
+            continue
+        overlapping = [
+            index
+            for index, action in enumerate(timeline)
+            if float(action.get("end_elapsed_ms", 0.0)) >= float(start_ms)
+            and float(action.get("start_elapsed_ms", 0.0)) <= float(end_ms)
+        ]
+        alignment = "timestamp_overlap"
+        if not overlapping:
+            midpoint = (float(start_ms) + float(end_ms)) / 2
+            nearest = min(
+                range(len(timeline)),
+                key=lambda index: abs(
+                    (
+                        float(timeline[index].get("start_elapsed_ms", 0.0))
+                        + float(timeline[index].get("end_elapsed_ms", 0.0))
+                    )
+                    / 2
+                    - midpoint
+                ),
+            )
+            overlapping = [nearest]
+            alignment = "nearest_action"
+        aligned.append(
+            {
+                "segment": segment_index,
+                "start_ms": round(float(start_ms), 1),
+                "end_ms": round(float(end_ms), 1),
+                "text": text,
+                "aligned_action_range": [min(overlapping), max(overlapping)],
+                "alignment": alignment,
+            }
+        )
+    return aligned
 
 
 def _prompt(
@@ -918,39 +1118,47 @@ def _prompt(
     boundary_hints: Sequence[Mapping[str, Any]],
     narration: Mapping[str, Any] | None,
 ) -> str:
-    narration_context = (
-        json.dumps(
-            {
-                "transcript": narration.get("transcript", ""),
-                "transcription_engine": narration.get("transcription_engine", "unknown"),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        if narration is not None
-        else "unavailable"
+    aligned_narration = _aligned_narration_context(narration, timeline)
+    narration_context = json.dumps(
+        {
+            "transcription_engine": (
+                narration.get("transcription_engine", "unknown")
+                if narration is not None
+                else "unavailable"
+            ),
+            "segments": aligned_narration,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
     return (
         "You are the offline multimodal Trace Compiler Agent for Trace2Task. You do not "
         "execute the task. Convert one successful human demonstration into a grounded, "
-        "replaceable semantic interpretation. The preserved raw Trace and motor demonstration "
-        "are stronger evidence than your interpretation.\n\n"
+        "replaceable semantic interpretation. The preserved raw Trace is immutable evidence of "
+        "what happened, not an executable program for future runs.\n\n"
         f"Human task name: {task_id}\n"
         f"Current generic task instruction: {task_instruction}\n"
         f"Evidence contact-sheet map:\n{evidence_map}\n\n"
-        "Optional task-level human narration is authoritative evidence for intent, reasons, tricks, and "
-        "cycle semantics, while the preserved Trace and pixels remain authoritative for what "
-        "actually occurred. Narration timestamps are intentionally not action-aligned in this "
-        "version. Do not invent an action merely because it was narrated:\n"
+        "Optional human narration is advisory evidence. Its timestamped segments have been aligned "
+        "to action ranges, but casual phrases such as '随便', '都用掉', repetition, and speech-recognition "
+        "errors are not universal strategy. Extract every useful statement into narration_claims. "
+        "Classify a one-off convenient choice as example_only, use verdict=advisory when pixels do not "
+        "fully ground it, and verdict=rejected when it conflicts with observed state changes. A claim "
+        "may help explain intent during compilation, but narration claims are never injected directly "
+        "as runtime motor commands:\n"
         f"{narration_context}\n\n"
-        "Return a concise canonical_instruction suitable for the runtime Agent. Also classify "
+        "Return a concise canonical_instruction suitable for the runtime Agent. It must state the "
+        "goal and major phase order, not turn low-confidence narration or one demonstrated choice "
+        "into a universal tactic. Also classify "
         "completion as state or cycle. A cycle starts and ends at the same visual anchor; if the "
         "initial screen already matches that anchor, it is not complete until the run visibly "
         "leaves it and later returns.\n\n"
         "Partition every action index exactly once into contiguous stages. Within every stage, "
         "partition every action index exactly once into contiguous action_intents. Describe only "
         "visually grounded states, observable preconditions, action intent, and expected visible "
-        "effects. Coordinates and input skills are evidence, not semantic intent.\n\n"
+        "effects. Coordinates, drag paths, hold durations, and input skills are physical evidence, "
+        "not semantic intent. A recorded drag or hold does not prove that the control requires that "
+        "gesture; describe the visible target and intended state transition instead.\n\n"
         "A single trajectory does not prove a general strategy. If a choice could depend on "
         "runtime content (for example which game card, contact, file, item, or route to choose), "
         "record it in dynamic_decisions as runtime_agent_decides or unknown. Never turn a "
@@ -958,6 +1166,10 @@ def _prompt(
         "low confidence when intent cannot be recovered. Do not invent application internals or "
         "text that is not visible. Use concise Simplified Chinese descriptions when the task name "
         "or visible application is primarily Chinese; otherwise follow the task language.\n\n"
+        "For every stage, choose state_before and state_after evidence only from contact-sheet frames "
+        "you can actually see. Prefer stable pre-interaction and post-transition frames; do not use an "
+        "animation frame merely because it is mechanically adjacent to an action boundary. The chosen "
+        "frames remain reviewable and will not be overwritten by raw boundary frames.\n\n"
         "Local candidate boundaries are hints, not truth:\n"
         f"{json.dumps(list(boundary_hints), ensure_ascii=False, separators=(',', ':'))}\n\n"
         "Deterministically compiled action timeline:\n"
@@ -991,7 +1203,31 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
         "stage_count": len(document["stages"]),
         "source": "human_trace",
     }
-    previous_guidance = task_data.pop("human_guidance", None)
+    previous_guidance = task_data.get("human_guidance")
+    guidance_compatible = False
+    if isinstance(previous_guidance, dict):
+        guidance_relative = previous_guidance.get("path")
+        guidance_path = (
+            (task_root / guidance_relative).resolve()
+            if isinstance(guidance_relative, str) and guidance_relative
+            else None
+        )
+        if (
+            guidance_path is not None
+            and guidance_path.is_relative_to(task_root)
+            and guidance_path.is_file()
+        ):
+            guidance_data = yaml.safe_load(guidance_path.read_text(encoding="utf-8"))
+            raw_rules = guidance_data.get("rules", []) if isinstance(guidance_data, dict) else []
+            referenced_stages = {
+                str(rule.get("stage_id"))
+                for rule in raw_rules
+                if isinstance(rule, dict) and rule.get("stage_id") != "global"
+            }
+            stage_ids = {str(stage["id"]) for stage in document["stages"]}
+            guidance_compatible = referenced_stages <= stage_ids
+    if previous_guidance is not None and not guidance_compatible:
+        task_data.pop("human_guidance", None)
     review = _mapping(task_data.get("review"), "task.review")
     review["status"] = "draft"
     review["requires_confirmation"] = True
@@ -1009,6 +1245,7 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     )
     if (
         previous_guidance is not None
+        and not guidance_compatible
         and isinstance(checklist, list)
         and guidance_check not in checklist
     ):
@@ -1097,13 +1334,13 @@ def compile_windows_semantic_experience(
                         completion_success_condition,
                         completion_reason,
                         stages,
+                        narration_claims,
                     ) = _validate_semantic_payload(
                         payload,
                         task_id=task_id,
                         action_count=len(timeline),
                         allowed_frames=set(evidence_frames),
                     )
-                    stages = _align_stage_frames(stages, timeline)
                 except (json.JSONDecodeError, TypeError, ValueError) as error:
                     last_error = error
                     continue
@@ -1116,6 +1353,7 @@ def compile_windows_semantic_experience(
                     completion_success_condition=completion_success_condition,
                     completion_reason=completion_reason,
                     stages=stages,
+                    narration_claims=narration_claims,
                     model=model,
                     reasoning_effort=reasoning_effort,
                     narration_available=narration is not None,

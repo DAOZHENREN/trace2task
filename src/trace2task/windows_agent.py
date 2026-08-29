@@ -26,6 +26,18 @@ from trace2task.windows_task import WindowsTaskContract
 BinaryResolver = Callable[[str], str]
 SessionFactory = Callable[..., CodexAppServerSession]
 MAX_STAGE_SESSION_TURNS = 4
+MAX_DECISION_REPAIR_ATTEMPTS = 1
+WINDOWS_DECISION_TIMEOUT_SECONDS = 300
+MODEL_CURRENT_IMAGE_MAX_EDGE = 1_440
+MODEL_REFERENCE_IMAGE_MAX_EDGE = 1_280
+
+
+class _IncompletePlanWithoutActionsError(RuntimeError):
+    """A model decision that is safe to reject and repair before execution."""
+
+    def __init__(self, message: str, *, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.payload = payload
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,8 @@ class WindowsPlanTiming:
     session_generation: int = 0
     session_reused: bool = False
     session_reset_reason: str = "initial"
+    decision_repair_attempts: int = 0
+    decision_repair_stage_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +85,7 @@ class CodexWindowsAgent:
         reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
         codex_bin: str = "codex",
         plan_horizon: int = 12,
-        timeout_seconds: float = 120,
+        timeout_seconds: float = WINDOWS_DECISION_TIMEOUT_SECONDS,
         background: bool = False,
         adaptive_reasoning: bool = True,
         binary_resolver: BinaryResolver = resolve_codex_binary,
@@ -102,12 +116,24 @@ class CodexWindowsAgent:
     def plan(self, surface: pygame.Surface) -> WindowsAgentPlan:
         total_started = time.perf_counter()
         session, reset_reason, fresh_context = self._prepare_session()
+        model_roundtrip_ms = 0.0
+        prompt_build_ms = 0.0
+        parse_ms = 0.0
+        prompt_chars = 0
+        repair_attempts = 0
+        repair_stage_id: str | None = None
+        server_metrics: list[Any] = []
         with tempfile.TemporaryDirectory(prefix="trace2task-windows-agent-") as directory:
-            current_frame = Path(directory) / "current.png"
+            model_directory = Path(directory)
+            current_frame = model_directory / "current.png"
             encode_started = time.perf_counter()
-            pygame.image.save(surface, current_frame)
-            frame_encode_ms = (time.perf_counter() - encode_started) * 1000
+            self._save_model_surface(surface, current_frame)
             reference_paths = self._reference_paths(fresh_context=fresh_context)
+            model_reference_paths = self._prepare_model_references(
+                reference_paths,
+                model_directory,
+            )
+            frame_encode_ms = (time.perf_counter() - encode_started) * 1000
             active_model, active_effort = self._planning_profile()
             prompt_started = time.perf_counter()
             prompt = self._prompt(
@@ -115,50 +141,149 @@ class CodexWindowsAgent:
                 reference_paths=reference_paths,
             )
             output_schema = self._output_schema()
-            prompt_build_ms = (time.perf_counter() - prompt_started) * 1000
-            model_started = time.perf_counter()
-            output = session.run_turn(
-                prompt=prompt,
-                image_path=current_frame,
-                additional_image_paths=reference_paths,
-                output_schema=output_schema,
-                model=active_model,
-                reasoning_effort=active_effort,
-            )
-            model_roundtrip_ms = (time.perf_counter() - model_started) * 1000
-            server_metrics = getattr(session, "last_turn_metrics", None)
-        parse_started = time.perf_counter()
-        plan = self._parse_payload(
-            output,
-            model=active_model,
-            reasoning_effort=active_effort,
-        )
-        parse_ms = (time.perf_counter() - parse_started) * 1000
+            prompt_build_ms += (time.perf_counter() - prompt_started) * 1000
+            prompt_chars += len(prompt)
+            additional_image_paths = model_reference_paths
+            while True:
+                model_started = time.perf_counter()
+                output = session.run_turn(
+                    prompt=prompt,
+                    image_path=current_frame,
+                    additional_image_paths=additional_image_paths,
+                    output_schema=output_schema,
+                    model=active_model,
+                    reasoning_effort=active_effort,
+                )
+                model_roundtrip_ms += (time.perf_counter() - model_started) * 1000
+                server_metrics.append(getattr(session, "last_turn_metrics", None))
+                parse_started = time.perf_counter()
+                try:
+                    plan = self._parse_payload(
+                        output,
+                        model=active_model,
+                        reasoning_effort=active_effort,
+                    )
+                except _IncompletePlanWithoutActionsError as error:
+                    parse_ms += (time.perf_counter() - parse_started) * 1000
+                    if repair_attempts >= MAX_DECISION_REPAIR_ATTEMPTS:
+                        target = repair_stage_id or "unknown"
+                        raise RuntimeError(
+                            "Codex repeated an empty incomplete decision after "
+                            f"same-session repair toward stage {target}"
+                        ) from error
+                    repair_attempts += 1
+                    repair_stage_id = self._repair_stage_id(error.payload)
+                    repair_prompt_started = time.perf_counter()
+                    prompt = self._decision_repair_prompt(
+                        error.payload,
+                        repair_stage_id=repair_stage_id,
+                    )
+                    output_schema = self._repair_output_schema()
+                    prompt_build_ms += (
+                        time.perf_counter() - repair_prompt_started
+                    ) * 1000
+                    prompt_chars += len(prompt)
+                    # Keep the same model thread and the exact same captured pixels. The
+                    # repair turn is validation feedback, not a fresh observation.
+                    additional_image_paths = ()
+                    continue
+                parse_ms += (time.perf_counter() - parse_started) * 1000
+                break
         self._turn_index += 1
-        self._session_turns += 1
+        self._session_turns += 1 + repair_attempts
         self.replans += 1
+        final_server_metrics = server_metrics[-1] if server_metrics else None
         timing = WindowsPlanTiming(
             total_ms=(time.perf_counter() - total_started) * 1000,
             frame_encode_ms=frame_encode_ms,
             prompt_build_ms=prompt_build_ms,
             model_roundtrip_ms=model_roundtrip_ms,
-            request_ack_ms=float(getattr(server_metrics, "request_ack_ms", 0.0)),
-            model_completion_wait_ms=float(
-                getattr(server_metrics, "completion_wait_ms", model_roundtrip_ms)
+            request_ack_ms=sum(
+                float(getattr(metrics, "request_ack_ms", 0.0))
+                for metrics in server_metrics
             ),
-            thread_start_ms=float(getattr(server_metrics, "thread_start_ms", 0.0)),
+            model_completion_wait_ms=sum(
+                float(getattr(metrics, "completion_wait_ms", 0.0))
+                for metrics in server_metrics
+            ),
+            thread_start_ms=sum(
+                float(getattr(metrics, "thread_start_ms", 0.0))
+                for metrics in server_metrics
+            ),
             parse_ms=parse_ms,
-            prompt_chars=len(prompt),
-            image_count=1 + len(reference_paths),
-            session_generation=int(getattr(server_metrics, "thread_generation", 0)),
-            session_reused=bool(getattr(server_metrics, "thread_reused", not fresh_context)),
+            prompt_chars=prompt_chars,
+            image_count=1 + len(model_reference_paths) + repair_attempts,
+            session_generation=int(
+                getattr(final_server_metrics, "thread_generation", 0)
+            ),
+            session_reused=bool(
+                getattr(final_server_metrics, "thread_reused", not fresh_context)
+            ),
             session_reset_reason=reset_reason,
+            decision_repair_attempts=repair_attempts,
+            decision_repair_stage_id=repair_stage_id,
         )
         plan = replace(plan, timing=timing)
         if plan.stage_id != "unknown":
             self._active_stage_id = plan.stage_id
         self._update_escalation(plan)
         return plan
+
+    @staticmethod
+    def _model_size(
+        size: tuple[int, int],
+        *,
+        max_edge: int,
+    ) -> tuple[int, int]:
+        width, height = size
+        longest = max(width, height)
+        if longest <= max_edge:
+            return size
+        scale = max_edge / longest
+        return max(1, round(width * scale)), max(1, round(height * scale))
+
+    @classmethod
+    def _save_model_surface(
+        cls,
+        surface: pygame.Surface,
+        path: Path,
+        *,
+        max_edge: int = MODEL_CURRENT_IMAGE_MAX_EDGE,
+    ) -> None:
+        target_size = cls._model_size(surface.get_size(), max_edge=max_edge)
+        prepared = (
+            pygame.transform.smoothscale(surface, target_size)
+            if target_size != surface.get_size()
+            else surface
+        )
+        pygame.image.save(prepared, path)
+
+    @classmethod
+    def _prepare_model_references(
+        cls,
+        reference_paths: tuple[Path, ...],
+        directory: Path,
+    ) -> tuple[Path, ...]:
+        prepared: list[Path] = []
+        for index, source_path in enumerate(reference_paths):
+            surface = pygame.image.load(source_path)
+            if (
+                cls._model_size(
+                    surface.get_size(),
+                    max_edge=MODEL_REFERENCE_IMAGE_MAX_EDGE,
+                )
+                == surface.get_size()
+            ):
+                prepared.append(source_path)
+                continue
+            model_path = directory / f"reference-{index:02d}.png"
+            cls._save_model_surface(
+                surface,
+                model_path,
+                max_edge=MODEL_REFERENCE_IMAGE_MAX_EDGE,
+            )
+            prepared.append(model_path)
+        return tuple(prepared)
 
     def _reference_paths(self, *, fresh_context: bool) -> tuple[Path, ...]:
         if not fresh_context:
@@ -323,15 +448,17 @@ class CodexWindowsAgent:
                 "and interrupts the remaining batch if the preceding pointer action produced no "
                 "visible response. Never return a one-action wait-only program for a routine "
                 "animation. Keep the next predictable reviewed interactions after the wait in the "
-                "same program. Stop only "
-                "before a choice whose correct target cannot be known from the current screenshot "
-                "and reviewed Trace, or at the declared stage end. State the expected end state and observable abort "
+                "same program. If the current stage's state_after is already visible, select the "
+                "next stage whose state_before matches Image 1, set stage_id to that stage, and "
+                "return its first safe actions in this response. A stage boundary is not a reason "
+                "to return an empty incomplete decision. Stop only before a choice whose correct "
+                "target cannot be known from the current screenshot and reviewed Trace. State the "
+                "expected end state and observable abort "
                 "conditions. A blocked_or_failed history item means the previous batch was "
                 "discarded at that action; recover from the current pixels instead of continuing it. "
                 "The response must match the supplied JSON schema."
             )
 
-        demonstration = [action.to_payload() for action in self.contract.demonstration]
         semantic_context = self._semantic_context(reference_paths)
         allowed_skills = self._allowed_skills()
         execution_context = (
@@ -361,9 +488,10 @@ class CodexWindowsAgent:
             "read files, or use tools. Image 1 is the current target client area. Image 2 is the "
             "human-reviewed successful reference frame. Compare them visually. The local motor "
             "controller alone will execute your structured actions.\n\n"
-            "The compiled Trace is mandatory guidance: preserve its demonstrated stage order and "
-            "checkpoints unless the current pixels require a deviation. Explain any deviation in "
-            "the response reason.\n"
+            "Evidence priority is: current pixels and local safety, confirmed human guidance, "
+            "reviewed semantic stages, then raw Trace motor evidence. The Trace proves observed "
+            "state transitions; it is not a coordinate script. Preserve reviewed phase intent when "
+            "it matches the current pixels and explain deviations in the response reason.\n"
             f"{task_context}"
             f"{completion_context}"
             f"Allowed motor skills: {', '.join(allowed_skills)}\n"
@@ -383,8 +511,9 @@ class CodexWindowsAgent:
             "discards the rest of this batch and replans. Use interaction, wait, then the next "
             "predictable interaction in one batch; do not spend a model turn only checking whether "
             "a routine animation ended.\n"
-            f"Recorded demonstration (the structural guide; adapt values, not stage order): "
-            f"{json.dumps(demonstration, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Raw demonstration coordinates, drag paths, hold durations, and fixed waits are "
+            "intentionally withheld. Locate every target from Image 1 and use the simplest motor "
+            "primitive justified by the visible control.\n"
             f"{semantic_context}"
             f"Recent execution history:\n{history}\n\n"
             "If the completion policy permits completion and Image 1 already satisfies the success "
@@ -395,7 +524,10 @@ class CodexWindowsAgent:
             "transitions. Never return a one-action wait-only program for a routine animation. "
             "Routine animations are local checkpoints, not reasons to end the batch. Stop before "
             "a loading screen, a "
-            "choice whose correct target cannot be known yet, or the declared stage end. Describe the "
+            "choice whose correct target cannot be known yet. If a semantic stage has already "
+            "reached its state_after, transition to the next matching stage and include that "
+            "stage's first safe actions in the same response; never use an empty incomplete "
+            "decision merely to signal a stage boundary. Describe the "
             "stage goal, expected end state, and observable abort conditions. The local runner will "
             "discard the unexecuted suffix and request a new plan immediately if a motor action "
             "fails. Replan from current pixels rather "
@@ -431,8 +563,8 @@ class CodexWindowsAgent:
         guidance = self.contract.human_guidance
         guidance_payload = guidance.prompt_payload() if guidance is not None else None
         return (
-            "Compiler Agent semantic stage index (derived and reviewable; raw human Trace remains "
-            "stronger evidence). Identify the current stage and return its id: "
+            "Compiler Agent semantic stage index (derived and reviewable from the immutable human "
+            "Trace). Identify the current stage and return its id: "
             f"{json.dumps(experience.stage_index_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
             "Confirmed human guidance has higher priority than the derived interpretation: "
             f"{json.dumps(guidance_payload, ensure_ascii=False, separators=(',', ':'))}\n"
@@ -454,7 +586,7 @@ class CodexWindowsAgent:
             if guidance is not None
             else None
         )
-        stage_programs = self._active_stage_programs()
+        trace_summary = self._stage_trace_summary(self._active_stage_id)
         image_map = [
             {
                 "image": index,
@@ -465,55 +597,124 @@ class CodexWindowsAgent:
             for index, path in enumerate(references[1:], start=3)
         ]
         return (
+            "Compact semantic stage index for boundary recognition and forward transition: "
+            f"{json.dumps(experience.stage_index_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
             "Locally retrieved active-stage experience: "
             f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
-            "Reviewed Trace action programs for the active and next stage. These are strong "
-            "human evidence: preserve their intent and order, adapt current coordinates and "
-            "runtime choices, and do not replay them blindly. Recorded drag and hold actions are "
-            "pointer evidence, not proof that the visible control semantically requires dragging; "
-            "choose the simplest motor primitive supported by the current control and never "
-            "escalate click to hold or drag only because the recording used it: "
-            f"{json.dumps(stage_programs, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Sanitized Trace evidence for this stage contains action categories only, with all "
+            "recorded coordinates, drag paths, hold durations, and fixed wait values removed. It "
+            "describes what the human physically did, not what must be replayed: "
+            f"{json.dumps(trace_summary, ensure_ascii=False, separators=(',', ':'))}\n"
             "Exact human Trace images for this stage after the final success reference: "
             f"{json.dumps(image_map, ensure_ascii=False, separators=(',', ':'))}\n"
             "Confirmed human tricks for this stage: "
             f"{json.dumps(guidance_payload, ensure_ascii=False, separators=(',', ':'))}\n"
         )
 
-    def _active_stage_programs(self) -> list[dict[str, Any]]:
+    def _repair_stage_id(self, rejected: dict[str, Any]) -> str | None:
         experience = self.contract.semantic_experience
-        if experience is None or self._active_stage_id is None:
-            return []
-        active_index = next(
+        if experience is None:
+            return None
+        stage_ids = [stage.stage_id for stage in experience.stages]
+        rejected_stage = rejected.get("stage_id")
+        if rejected_stage in stage_ids and rejected_stage != self._active_stage_id:
+            return str(rejected_stage)
+        if self._active_stage_id in stage_ids:
+            current_index = stage_ids.index(self._active_stage_id)
+            if current_index + 1 < len(stage_ids):
+                return stage_ids[current_index + 1]
+            return self._active_stage_id
+        if rejected_stage in stage_ids:
+            return str(rejected_stage)
+        return stage_ids[0] if stage_ids else None
+
+    def _decision_repair_prompt(
+        self,
+        rejected: dict[str, Any],
+        *,
+        repair_stage_id: str | None,
+    ) -> str:
+        experience = self.contract.semantic_experience
+        candidate_payload = (
+            experience.active_stage_payload(repair_stage_id)
+            if experience is not None
+            else None
+        )
+        guidance = self.contract.human_guidance
+        guidance_payload = (
+            guidance.prompt_payload(repair_stage_id)
+            if guidance is not None
+            else None
+        )
+        trace_summary = self._stage_trace_summary(repair_stage_id)
+        history = self._history[-8:]
+        return (
+            "The immediately preceding decision failed local validation: it declared the task "
+            "incomplete but returned no actions. No action from that invalid decision was executed, "
+            "no new screenshot was captured, and this model thread was not reset. Treat this like a "
+            "coding-agent test failure: keep the valid context, inspect the validation failure, and "
+            "return a corrected decision for the same authoritative Image 1.\n"
+            "Rejected decision summary: "
+            f"{json.dumps(rejected, ensure_ascii=False, separators=(',', ':'))}\n"
+            f"Previously active stage: {self._active_stage_id or 'unknown'}\n"
+            f"Candidate recovery stage: {repair_stage_id or 'unknown'}\n"
+            "Full local context for that candidate stage (a hypothesis that must still match "
+            "Image 1): "
+            f"{json.dumps(candidate_payload, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Confirmed human guidance for the candidate stage: "
+            f"{json.dumps(guidance_payload, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Sanitized human Trace categories for the candidate stage; these express intent, not "
+            "coordinates or a replay script: "
+            f"{json.dumps(trace_summary, ensure_ascii=False, separators=(',', ':'))}\n"
+            "Recent locally verified execution outcomes: "
+            f"{json.dumps(history, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            "Forbidden recovery behavior:\n"
+            "- Do not return task_complete=false with an empty actions array again.\n"
+            "- Do not repeat an already applied interaction when its expected visible effect is "
+            "already present, including clicking a visibly cooling-down or disabled control.\n"
+            "- Do not replay a blocked_or_failed action unchanged unless current pixels visibly "
+            "show that its precondition has changed.\n"
+            "- Do not skip an unresolved choice, invent a target, or mark the task complete unless "
+            "the declared success condition is visibly satisfied.\n\n"
+            "First verify the candidate stage preconditions against Image 1. If they match, set "
+            "stage_id to that stage and return its first safe action sequence. If they do not match, "
+            "continue the stage whose preconditions do match and return a different safe sequence. "
+            "When no input target is visually justified and wait is an allowed skill, return a "
+            "bounded wait rather than guessing a click. Return the complete corrected object matching "
+            "the stricter supplied JSON schema."
+        )
+
+    def _stage_trace_summary(self, stage_id: str | None) -> dict[str, Any]:
+        experience = self.contract.semantic_experience
+        if experience is None or stage_id is None:
+            return {}
+        active = next(
             (
-                index
-                for index, stage in enumerate(experience.stages)
-                if stage.stage_id == self._active_stage_id
+                stage
+                for stage in experience.stages
+                if stage.stage_id == stage_id
             ),
             None,
         )
-        if active_index is None:
-            return []
-        demonstration = self.contract.demonstration
-        allowed_skills = set(self._allowed_skills())
-        programs: list[dict[str, Any]] = []
-        for stage in experience.stages[active_index : active_index + 2]:
-            actions = [
-                action.to_payload()
-                for action in demonstration[
-                    stage.start_action_index : stage.end_action_index + 1
-                ]
-                if action.skill in allowed_skills
-            ]
-            programs.append(
-                {
-                    "stage_id": stage.stage_id,
-                    "name": stage.name,
-                    "action_range": [stage.start_action_index, stage.end_action_index],
-                    "actions": actions,
-                }
-            )
-        return programs
+        if active is None:
+            return {}
+        categories: dict[str, int] = {}
+        for action in self.contract.demonstration[
+            active.start_action_index : active.end_action_index + 1
+        ]:
+            category = {
+                "drag": "unverified_pointer_gesture",
+                "hold_mouse": "unverified_pointer_gesture",
+                "wait": "observed_transition_wait",
+                "click": "pointer_activation",
+            }.get(action.skill, action.skill)
+            categories[category] = categories.get(category, 0) + 1
+        return {
+            "stage_id": active.stage_id,
+            "action_range": [active.start_action_index, active.end_action_index],
+            "observed_categories": categories,
+            "motor_policy": "semantic_intent_only_no_recorded_coordinates",
+        }
 
     def _output_schema(self) -> dict[str, Any]:
         return {
@@ -552,6 +753,15 @@ class CodexWindowsAgent:
             ],
             "additionalProperties": False,
         }
+
+    def _repair_output_schema(self) -> dict[str, Any]:
+        schema = self._output_schema()
+        schema["properties"]["task_complete"] = {
+            "type": "boolean",
+            "enum": [False],
+        }
+        schema["properties"]["actions"]["minItems"] = 1
+        return schema
 
     def _allowed_skills(self) -> tuple[str, ...]:
         if not self.background:
@@ -613,7 +823,25 @@ class CodexWindowsAgent:
         if task_complete and actions:
             raise RuntimeError("Codex marked the task complete while still returning actions")
         if not task_complete and not actions:
-            raise RuntimeError("Codex returned no action for an incomplete task")
+            raise _IncompletePlanWithoutActionsError(
+                "Codex returned no action for an incomplete task",
+                payload={
+                    "task_complete": task_complete,
+                    "action_count": len(raw_actions),
+                    "reason": reason if isinstance(reason, str) else None,
+                    "confidence": confidence
+                    if isinstance(confidence, (int, float))
+                    and not isinstance(confidence, bool)
+                    else None,
+                    "stage_id": stage_id if isinstance(stage_id, str) else "unknown",
+                    "stage_goal": stage_goal
+                    if isinstance(stage_goal, str)
+                    else None,
+                    "expected_end_state": expected_end_state
+                    if isinstance(expected_end_state, str)
+                    else None,
+                },
+            )
         if not isinstance(reason, str) or not reason.strip():
             raise RuntimeError("Codex returned an empty Windows decision reason")
         if (

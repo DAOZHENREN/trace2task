@@ -178,6 +178,7 @@ def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
     assert task_yaml["experience"] == {
         "intent": task.task_id,
         "examples": [task.task_id],
+        "family_id": task.task_id,
         "source": "human_trace",
     }
     assert report["inference"]["action_counts"]["wait"] == 2

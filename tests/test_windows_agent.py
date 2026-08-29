@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,14 @@ import pytest
 import yaml
 
 from trace2task.actions import ActionCall
-from trace2task.windows_agent import CodexWindowsAgent, WindowsAgentPlan
+from trace2task.windows_agent import (
+    MODEL_CURRENT_IMAGE_MAX_EDGE,
+    MODEL_REFERENCE_IMAGE_MAX_EDGE,
+    WINDOWS_DECISION_TIMEOUT_SECONDS,
+    CodexWindowsAgent,
+    WindowsAgentPlan,
+    WindowsPlanTiming,
+)
 from trace2task.windows_control import WindowInfo
 from trace2task.windows_runner import (
     EmergencyStopRequested,
@@ -200,6 +208,55 @@ def _write_taskpack(
     return task_path
 
 
+def _add_followup_semantic_stage(task_path: Path) -> None:
+    experience_path = task_path.with_name("experience.yaml")
+    experience = yaml.safe_load(experience_path.read_text(encoding="utf-8"))
+    first = experience["stages"][0]
+    first["end_action_index"] = 0
+    first["action_intents"] = [
+        {
+            **first["action_intents"][0],
+            "start_action_index": 0,
+            "end_action_index": 0,
+        }
+    ]
+    second = deepcopy(first)
+    second.update(
+        {
+            "id": "complete_target",
+            "name": "Complete target",
+            "start_action_index": 1,
+            "end_action_index": 1,
+            "state_before": deepcopy(first["state_after"]),
+            "state_after": {
+                "description": "The target workflow is complete.",
+                "evidence_frame": "reference/frames/after.png",
+                "visual_anchors": ["Completed target content"],
+            },
+            "action_intents": [
+                {
+                    "start_action_index": 1,
+                    "end_action_index": 1,
+                    "description": "Complete the visible target.",
+                    "target": "Visible completion control",
+                    "provenance": "inferred",
+                    "confidence": 0.8,
+                }
+            ],
+            "preconditions": ["The first stage is visibly complete"],
+            "expected_effects": ["The target workflow completes"],
+        }
+    )
+    experience["stages"] = [first, second]
+    experience_path.write_text(
+        yaml.safe_dump(experience, sort_keys=False),
+        encoding="utf-8",
+    )
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["semantic_experience"]["stage_count"] = 2
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+
+
 class FakeSession:
     def __init__(
         self,
@@ -216,6 +273,7 @@ class FakeSession:
         self.calls = calls
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.timeout_seconds = timeout_seconds
         self.closed = False
         self.reset_count = 0
 
@@ -236,6 +294,10 @@ class FakeSession:
                 "prompt": prompt,
                 "schema": output_schema,
                 "reference_paths": additional_image_paths,
+                "image_sizes": [
+                    pygame.image.load(path).get_size()
+                    for path in (image_path, *additional_image_paths)
+                ],
                 "model": model,
                 "reasoning_effort": reasoning_effort,
             }
@@ -435,12 +497,17 @@ class FakeEmergencyStop:
         self.closed = True
 
 
-def _plan(*actions: ActionCall, complete: bool = False) -> WindowsAgentPlan:
+def _plan(
+    *actions: ActionCall,
+    complete: bool = False,
+    timing: WindowsPlanTiming | None = None,
+) -> WindowsAgentPlan:
     return WindowsAgentPlan(
         task_complete=complete,
         actions=actions,
         reason="Target comparison decision.",
         confidence=0.8,
+        timing=timing or WindowsPlanTiming(),
     )
 
 
@@ -507,13 +574,59 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
-    assert "Recorded demonstration" in calls[0]["prompt"]
-    assert "compiled Trace is mandatory guidance" in calls[0]["prompt"]
-    assert "adapt values, not stage order" in calls[0]["prompt"]
+    assert "Recorded demonstration" not in calls[0]["prompt"]
+    assert '"x":0.5' not in calls[0]["prompt"]
+    assert "Raw demonstration coordinates" in calls[0]["prompt"]
+    assert "The Trace proves observed state transitions" in calls[0]["prompt"]
     assert sessions[0].model == "gpt-5.6-sol"
     assert sessions[0].reasoning_effort == "high"
+    assert sessions[0].timeout_seconds == WINDOWS_DECISION_TIMEOUT_SECONDS
     agent.close()
     assert sessions[0].closed
+
+
+def test_codex_windows_agent_downscales_large_model_images(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+    sessions: list[FakeSession] = []
+    task_path = _write_taskpack(tmp_path, semantic=True)
+    task_dir = task_path.parent
+    large_reference = pygame.Surface((1_900, 1_100))
+    large_reference.fill((30, 120, 70))
+    for path in (
+        task_dir / "reference" / "final.png",
+        task_dir / "reference" / "frames" / "before.png",
+        task_dir / "reference" / "frames" / "after.png",
+    ):
+        pygame.image.save(large_reference, path)
+    contract = load_windows_task(task_path)
+    agent = CodexWindowsAgent(
+        contract,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.5, "y": 0.5}}],
+                    "reason": "Continue.",
+                    "confidence": 0.9,
+                    "stage_id": "open_target",
+                }
+            ],
+            calls,
+            sessions,
+        ),
+    )
+
+    agent.plan(pygame.Surface((1_800, 1_000)))
+
+    assert len(calls[0]["image_sizes"]) == 4
+    assert max(calls[0]["image_sizes"][0]) <= MODEL_CURRENT_IMAGE_MAX_EDGE
+    assert all(
+        max(size) <= MODEL_REFERENCE_IMAGE_MAX_EDGE
+        for size in calls[0]["image_sizes"][1:]
+    )
+    assert calls[0]["image_sizes"][0] == (1_440, 800)
+    assert calls[0]["image_sizes"][1:] == [(1_280, 741)] * 3
 
 
 def test_codex_windows_agent_uses_semantic_stages_and_their_evidence(
@@ -567,14 +680,74 @@ def test_codex_windows_agent_uses_semantic_stages_and_their_evidence(
     assert "action_intents" not in calls[0]["prompt"]
     assert len(calls[1]["reference_paths"]) == 3
     assert "Locally retrieved active-stage experience" in calls[1]["prompt"]
-    assert "Reviewed Trace action programs" in calls[1]["prompt"]
+    assert "Compact semantic stage index" in calls[1]["prompt"]
+    assert "Sanitized Trace evidence" in calls[1]["prompt"]
     assert '"action_range":[0,1]' in calls[1]["prompt"]
-    assert '"skill":"click"' in calls[1]["prompt"]
+    assert '"pointer_activation":1' in calls[1]["prompt"]
+    assert '"x":0.5' not in calls[1]["prompt"]
     assert "runtime_agent_decides" in calls[1]["prompt"]
-    assert "raw human Trace remains stronger evidence" in calls[0]["prompt"]
+    assert "derived and reviewable from the immutable human Trace" in calls[0]["prompt"]
     assert "fresh bounded model session" in calls[1]["prompt"]
     assert "exact stage-boundary images" in calls[1]["prompt"]
     assert "Exact human Trace images for this stage" in calls[1]["prompt"]
+    agent.close()
+
+
+def test_codex_windows_agent_never_exposes_recorded_drag_coordinates(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_taskpack(tmp_path, semantic=True)
+    task_root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task_root["actions"].append("drag")
+    task_path.write_text(yaml.safe_dump(task_root, sort_keys=False), encoding="utf-8")
+    demonstration_path = task_path.with_name("demonstration.json")
+    demonstration = json.loads(demonstration_path.read_text(encoding="utf-8"))
+    demonstration["actions"][1]["action"] = {
+        "skill": "drag",
+        "args": {
+            "start_x": 0.897476,
+            "start_y": 0.744479,
+            "end_x": 0.531546,
+            "end_y": 0.442692,
+            "duration_ms": 602,
+            "button": "left",
+        },
+    }
+    demonstration_path.write_text(json.dumps(demonstration), encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+    agent = CodexWindowsAgent(
+        load_windows_task(task_path),
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.4, "y": 0.5}}],
+                    "reason": "Identify the stage.",
+                    "confidence": 0.9,
+                    "stage_id": "open_target",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.45, "y": 0.5}}],
+                    "reason": "Continue from current pixels.",
+                    "confidence": 0.9,
+                    "stage_id": "open_target",
+                },
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+    agent.plan(pygame.Surface((100, 50)))
+
+    combined = "\n".join(call["prompt"] for call in calls)
+    assert "0.897476" not in combined
+    assert "0.531546" not in combined
+    assert "duration_ms" not in combined
+    assert '"unverified_pointer_gesture":1' in calls[1]["prompt"]
     agent.close()
 
 
@@ -620,6 +793,112 @@ def test_codex_windows_agent_returns_a_complete_stage_program_by_default(
     assert "do not spend a model turn only checking" in calls[0]["prompt"]
     assert "Target 5 to 8 adjacent reviewed actions" in calls[0]["prompt"]
     assert "Never return a one-action wait-only program" in calls[0]["prompt"]
+    agent.close()
+
+
+def test_codex_windows_agent_repairs_empty_stage_boundary_in_same_session(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    sessions: list[FakeSession] = []
+    task_path = _write_taskpack(tmp_path, semantic=True)
+    _add_followup_semantic_stage(task_path)
+    agent = CodexWindowsAgent(
+        load_windows_task(task_path),
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {"skill": "click", "args": {"x": 0.25, "y": 0.75}}
+                    ],
+                    "reason": "Finish the first stage.",
+                    "confidence": 0.9,
+                    "stage_id": "open_target",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [],
+                    "reason": "The first stage ended, but I omitted the transition actions.",
+                    "confidence": 0.8,
+                    "stage_id": "open_target",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {"skill": "click", "args": {"x": 0.75, "y": 0.75}}
+                    ],
+                    "reason": "Transition to the next stage safely.",
+                    "confidence": 0.92,
+                    "stage_id": "complete_target",
+                },
+            ],
+            calls,
+            sessions,
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+    recovered = agent.plan(pygame.Surface((100, 50)))
+
+    assert recovered.stage_id == "complete_target"
+    assert len(recovered.actions) == 1
+    assert len(calls) == 3
+    assert len(sessions) == 1
+    assert sessions[0].reset_count == 1
+    assert "Compact semantic stage index" in calls[1]["prompt"]
+    assert "A stage boundary is not a reason" in calls[1]["prompt"]
+    assert "coding-agent test failure" in calls[2]["prompt"]
+    assert "No action from that invalid decision was executed" in calls[2]["prompt"]
+    assert "Do not repeat an already applied interaction" in calls[2]["prompt"]
+    assert "cooling-down or disabled control" in calls[2]["prompt"]
+    assert "Candidate recovery stage: complete_target" in calls[2]["prompt"]
+    assert "Complete the visible target" in calls[2]["prompt"]
+    assert "The first stage is visibly complete" in calls[2]["prompt"]
+    assert "I omitted the transition actions" in calls[2]["prompt"]
+    assert calls[2]["schema"]["properties"]["actions"]["minItems"] == 1
+    assert calls[2]["schema"]["properties"]["task_complete"]["enum"] == [False]
+    assert calls[2]["reference_paths"] == ()
+    assert len(calls[2]["image_sizes"]) == 1
+    assert recovered.timing.decision_repair_attempts == 1
+    assert recovered.timing.decision_repair_stage_id == "complete_target"
+    agent.close()
+
+
+def test_codex_windows_agent_stops_after_bounded_same_session_repair(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    sessions: list[FakeSession] = []
+    empty = {
+        "task_complete": False,
+        "actions": [],
+        "reason": "The task still needs work.",
+        "confidence": 0.7,
+        "stage_id": "open_target",
+    }
+    agent = CodexWindowsAgent(
+        load_windows_task(_write_taskpack(tmp_path, semantic=True)),
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory([empty, dict(empty)], calls, sessions),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "repeated an empty incomplete decision after same-session repair toward "
+            "stage open_target"
+        ),
+    ):
+        agent.plan(pygame.Surface((100, 50)))
+
+    assert len(calls) == 2
+    assert len(sessions) == 1
+    assert sessions[0].reset_count == 0
+    assert "coding-agent test failure" in calls[1]["prompt"]
+    assert calls[1]["schema"]["properties"]["actions"]["minItems"] == 1
+    assert calls[1]["schema"]["properties"]["task_complete"]["enum"] == [False]
     agent.close()
 
 
@@ -970,7 +1249,18 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     capture = FakeCapture()
     emergency = FakeEmergencyStop()
     click = ActionCall("click", {"x": 0.5, "y": 0.5})
-    agent = ScriptedAgent([_plan(click), _plan(complete=True)])
+    agent = ScriptedAgent(
+        [
+            _plan(
+                click,
+                timing=WindowsPlanTiming(
+                    decision_repair_attempts=1,
+                    decision_repair_stage_id="open_target",
+                ),
+            ),
+            _plan(complete=True),
+        ]
+    )
     statuses: list[str] = []
 
     result = run_windows_agent(
@@ -1004,6 +1294,11 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     assert metadata["parameterized_action_count"] == 1
     assert metadata["planning_ms"] >= 0
     assert any("Requesting a multimodal decision" in status for status in statuses)
+    assert any(
+        "Same-session recovery succeeded" in status
+        and "candidate stage open_target" in status
+        for status in statuses
+    )
     assert any("Received in" in status for status in statuses)
     assert any("click completed" in status for status in statuses)
 

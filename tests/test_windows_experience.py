@@ -130,6 +130,17 @@ def _semantic_response() -> dict[str, Any]:
             "success_condition": "离开初始界面、完成工作流并返回同一锚点。",
             "reason": "示范起点和终点使用同一个可见锚点。",
         },
+        "narration_claims": [
+            {
+                "text": "先打开入口",
+                "type": "strategy",
+                "start_action_index": 0,
+                "end_action_index": 1,
+                "confidence": 0.9,
+                "verdict": "supported",
+                "reason": "口语时间段与入口点击和画面变化一致。",
+            }
+        ],
         "stages": [
             {
                 "id": "open_target",
@@ -286,7 +297,10 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert trace_path.read_bytes() == original_trace
     assert demonstration_path.read_bytes() == original_demonstration
     assert root["semantic_experience"]["source"] == "human_trace"
-    assert experience["source"]["policy"] == "immutable_strong_evidence"
+    assert experience["source"]["policy"] == "immutable_observation_evidence"
+    assert experience["source"]["runtime_motor_policy"] == (
+        "semantic_intent_only_no_recorded_coordinates"
+    )
     assert experience["source"]["narration"] == "reference/narration.json"
     assert experience["compiler"]["policy"] == "replaceable_derived_interpretation"
     assert root["instruction"] == "完成一次目标工作流并回到初始锚点。"
@@ -295,17 +309,20 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert contract.semantic_experience is not None
     assert contract.task.completion_mode == "cycle"
     assert contract.semantic_experience.stages[0].state_after.evidence_frame.endswith(
-        "0001.png"
+        "0002.png"
     )
     assert contract.semantic_experience.stages[1].state_before.evidence_frame.endswith(
-        "0001.png"
+        "0000.png"
     )
+    assert contract.semantic_experience.narration_claims[0].verdict == "supported"
     assert contract.semantic_experience.stages[1].dynamic_decisions[0].generalization == (
         "runtime_agent_decides"
     )
     assert "single trajectory does not prove a general strategy" in calls[0]["prompt"]
-    assert "先打开入口，等待切换，再完成确认并回到起点" in calls[0]["prompt"]
-    assert "start_ms" not in calls[0]["prompt"]
+    assert "先打开入口" in calls[0]["prompt"]
+    assert "等待切换，再完成确认并回到起点" not in calls[0]["prompt"]
+    assert '"start_ms":0.0' in calls[0]["prompt"]
+    assert '"aligned_action_range":[0,2]' in calls[0]["prompt"]
     assert calls[0]["schema"]["properties"]["stages"]["items"]["additionalProperties"] is False
     assert calls[0]["image_path"].name == "contact-sheet-01.png"
     assert "Contact sheet Image 1, cell Frame 1" in calls[0]["prompt"]
