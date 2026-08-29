@@ -4,7 +4,7 @@ import json
 import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from trace2task.codex_agent import resolve_codex_binary
 from trace2task.codex_app_server import (
     CodexAppServerSession,
 )
+from trace2task.narration import load_narration
 
 MAX_EVIDENCE_IMAGES = 12
 CONTACT_SHEET_COLUMNS = 3
@@ -29,6 +30,7 @@ SCREEN_CHANGE_THRESHOLD = 0.12
 TEMPORAL_BOUNDARY_MS = 1_500
 PROVENANCE_VALUES = {"observed", "inferred", "unknown"}
 GENERALIZATION_VALUES = {"demonstrated_only", "runtime_agent_decides", "unknown"}
+COMPLETION_MODES = {"state", "cycle"}
 DEFAULT_COMPILER_MODEL = "gpt-5.6-sol"
 DEFAULT_COMPILER_REASONING_EFFORT = "high"
 
@@ -77,8 +79,12 @@ class ExperienceStage:
 
 @dataclass(frozen=True)
 class SemanticExperience:
+    canonical_instruction: str
     goal: str
     summary: str
+    completion_mode: str
+    completion_success_condition: str
+    completion_reason: str
     stages: tuple[ExperienceStage, ...]
     source_type: str
     model: str
@@ -87,56 +93,102 @@ class SemanticExperience:
     requires_confirmation: bool
     source_path: Path
 
+    @staticmethod
+    def _stage_payload(stage: ExperienceStage) -> dict[str, Any]:
+        return {
+            "id": stage.stage_id,
+            "name": stage.name,
+            "action_range": [stage.start_action_index, stage.end_action_index],
+            "state_before": {
+                "description": stage.state_before.description,
+                "evidence_frame": stage.state_before.evidence_frame,
+                "visual_anchors": list(stage.state_before.visual_anchors),
+            },
+            "action_intents": [
+                {
+                    "action_range": [
+                        intent.start_action_index,
+                        intent.end_action_index,
+                    ],
+                    "description": intent.description,
+                    "target": intent.target,
+                    "provenance": intent.provenance,
+                    "confidence": intent.confidence,
+                }
+                for intent in stage.action_intents
+            ],
+            "preconditions": list(stage.preconditions),
+            "expected_effects": list(stage.expected_effects),
+            "state_after": {
+                "description": stage.state_after.description,
+                "evidence_frame": stage.state_after.evidence_frame,
+                "visual_anchors": list(stage.state_after.visual_anchors),
+            },
+            "dynamic_decisions": [
+                {
+                    "description": decision.description,
+                    "generalization": decision.generalization,
+                    "confidence": decision.confidence,
+                }
+                for decision in stage.dynamic_decisions
+            ],
+            "confidence": stage.confidence,
+        }
+
     def prompt_payload(self) -> dict[str, Any]:
         return {
+            "canonical_instruction": self.canonical_instruction,
             "goal": self.goal,
             "summary": self.summary,
-            "stages": [
+            "completion": {
+                "mode": self.completion_mode,
+                "success_condition": self.completion_success_condition,
+                "reason": self.completion_reason,
+            },
+            "stages": [self._stage_payload(stage) for stage in self.stages],
+        }
+
+    def stage_index_payload(self) -> dict[str, Any]:
+        return {
+            "canonical_instruction": self.canonical_instruction,
+            "goal": self.goal,
+            "summary": self.summary,
+            "completion": {
+                "mode": self.completion_mode,
+                "success_condition": self.completion_success_condition,
+                "reason": self.completion_reason,
+            },
+            "stage_index": [
                 {
                     "id": stage.stage_id,
                     "name": stage.name,
-                    "action_range": [
-                        stage.start_action_index,
-                        stage.end_action_index,
-                    ],
-                    "state_before": {
-                        "description": stage.state_before.description,
-                        "evidence_frame": stage.state_before.evidence_frame,
-                        "visual_anchors": list(stage.state_before.visual_anchors),
-                    },
-                    "action_intents": [
-                        {
-                            "action_range": [
-                                intent.start_action_index,
-                                intent.end_action_index,
-                            ],
-                            "description": intent.description,
-                            "target": intent.target,
-                            "provenance": intent.provenance,
-                            "confidence": intent.confidence,
-                        }
-                        for intent in stage.action_intents
-                    ],
-                    "preconditions": list(stage.preconditions),
-                    "expected_effects": list(stage.expected_effects),
-                    "state_after": {
-                        "description": stage.state_after.description,
-                        "evidence_frame": stage.state_after.evidence_frame,
-                        "visual_anchors": list(stage.state_after.visual_anchors),
-                    },
-                    "dynamic_decisions": [
-                        {
-                            "description": decision.description,
-                            "generalization": decision.generalization,
-                            "confidence": decision.confidence,
-                        }
-                        for decision in stage.dynamic_decisions
-                    ],
+                    "action_range": [stage.start_action_index, stage.end_action_index],
+                    "state_before": stage.state_before.description,
+                    "visual_anchors": list(stage.state_before.visual_anchors),
+                    "state_after": stage.state_after.description,
                     "confidence": stage.confidence,
                 }
                 for stage in self.stages
             ],
         }
+
+    def active_stage_payload(self, stage_id: str | None) -> dict[str, Any] | None:
+        if stage_id is None:
+            return None
+        for index, stage in enumerate(self.stages):
+            if stage.stage_id != stage_id:
+                continue
+            payload: dict[str, Any] = {"active_stage": self._stage_payload(stage)}
+            if index + 1 < len(self.stages):
+                next_stage = self.stages[index + 1]
+                payload["next_stage"] = {
+                    "id": next_stage.stage_id,
+                    "name": next_stage.name,
+                    "state_before": next_stage.state_before.description,
+                    "visual_anchors": list(next_stage.state_before.visual_anchors),
+                }
+            return payload
+        return None
 
     def evidence_paths(self, task_root: Path) -> tuple[Path, ...]:
         relative_paths = [
@@ -216,10 +268,27 @@ def _validate_semantic_payload(
     task_id: str,
     action_count: int,
     allowed_frames: set[str],
-) -> tuple[str, str, tuple[ExperienceStage, ...]]:
+) -> tuple[str, str, str, str, str, str, tuple[ExperienceStage, ...]]:
     root = _mapping(payload, "Compiler Agent output")
     goal = _string(root.get("goal"), "goal")
     summary = _string(root.get("summary"), "summary")
+    canonical_instruction = _string(
+        root.get("canonical_instruction", goal), "canonical_instruction"
+    )
+    raw_completion = root.get("completion")
+    if raw_completion is None:
+        completion_mode = "state"
+        completion_success_condition = goal
+        completion_reason = "Legacy semantic experience uses a terminal state verifier."
+    else:
+        completion = _mapping(raw_completion, "completion")
+        completion_mode = _string(completion.get("mode"), "completion.mode")
+        if completion_mode not in COMPLETION_MODES:
+            raise ValueError("completion.mode must be state or cycle")
+        completion_success_condition = _string(
+            completion.get("success_condition"), "completion.success_condition"
+        )
+        completion_reason = _string(completion.get("reason"), "completion.reason")
     raw_stages = root.get("stages")
     if not isinstance(raw_stages, list) or not 1 <= len(raw_stages) <= MAX_SEMANTIC_STAGES:
         raise ValueError(f"Compiler Agent must return 1-{MAX_SEMANTIC_STAGES} stages")
@@ -348,7 +417,41 @@ def _validate_semantic_payload(
         raise ValueError(
             f"Semantic stages cover {expected_stage_start} of {action_count} actions for {task_id}"
         )
-    return goal, summary, tuple(stages)
+    return (
+        canonical_instruction,
+        goal,
+        summary,
+        completion_mode,
+        completion_success_condition,
+        completion_reason,
+        tuple(stages),
+    )
+
+
+def _align_stage_frames(
+    stages: Sequence[ExperienceStage],
+    timeline: Sequence[Mapping[str, Any]],
+) -> tuple[ExperienceStage, ...]:
+    """Bind semantic ranges to their exact preserved Trace boundary frames."""
+
+    aligned: list[ExperienceStage] = []
+    for stage in stages:
+        before_frame = _string(
+            timeline[stage.start_action_index].get("before_frame"),
+            f"{stage.stage_id}.aligned_state_before",
+        )
+        after_frame = _string(
+            timeline[stage.end_action_index].get("after_frame"),
+            f"{stage.stage_id}.aligned_state_after",
+        )
+        aligned.append(
+            replace(
+                stage,
+                state_before=replace(stage.state_before, evidence_frame=before_frame),
+                state_after=replace(stage.state_after, evidence_frame=after_frame),
+            )
+        )
+    return tuple(aligned)
 
 
 def _state_payload(state: ExperienceState) -> dict[str, Any]:
@@ -362,19 +465,25 @@ def _state_payload(state: ExperienceState) -> dict[str, Any]:
 def _experience_document(
     *,
     task_id: str,
+    canonical_instruction: str,
     goal: str,
     summary: str,
+    completion_mode: str,
+    completion_success_condition: str,
+    completion_reason: str,
     stages: Sequence[ExperienceStage],
     model: str,
     reasoning_effort: str,
+    narration_available: bool,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "0.1",
+        "schema_version": "0.2",
         "task_id": task_id,
         "source": {
             "type": "human_trace",
             "trace": "reference/trace.jsonl",
             "demonstration": "demonstration.json",
+            "narration": "reference/narration.json" if narration_available else None,
             "policy": "immutable_strong_evidence",
         },
         "compiler": {
@@ -385,8 +494,14 @@ def _experience_document(
             "compiled_at": datetime.now(UTC).isoformat(),
             "policy": "replaceable_derived_interpretation",
         },
+        "canonical_instruction": canonical_instruction,
         "goal": goal,
         "summary": summary,
+        "completion": {
+            "mode": completion_mode,
+            "success_condition": completion_success_condition,
+            "reason": completion_reason,
+        },
         "stages": [
             {
                 "id": stage.stage_id,
@@ -448,7 +563,15 @@ def load_semantic_experience(
         for path in (task_root / "reference" / "frames").glob("*.png")
         if path.is_file()
     }
-    goal, summary, stages = _validate_semantic_payload(
+    (
+        canonical_instruction,
+        goal,
+        summary,
+        completion_mode,
+        completion_success_condition,
+        completion_reason,
+        stages,
+    ) = _validate_semantic_payload(
         root,
         task_id=task_id,
         action_count=action_count,
@@ -465,8 +588,12 @@ def load_semantic_experience(
     if (review_status == "draft") != requires_confirmation:
         raise ValueError("Semantic experience draft and confirmation state disagree")
     return SemanticExperience(
+        canonical_instruction=canonical_instruction,
         goal=goal,
         summary=summary,
+        completion_mode=completion_mode,
+        completion_success_condition=completion_success_condition,
+        completion_reason=completion_reason,
         stages=stages,
         source_type=source_type,
         model=_string(compiler.get("model"), "experience.compiler.model"),
@@ -651,8 +778,19 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
     return {
         "type": "object",
         "properties": {
+            "canonical_instruction": {"type": "string", "minLength": 1},
             "goal": {"type": "string", "minLength": 1},
             "summary": {"type": "string", "minLength": 1},
+            "completion": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": sorted(COMPLETION_MODES)},
+                    "success_condition": {"type": "string", "minLength": 1},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+                "required": ["mode", "success_condition", "reason"],
+                "additionalProperties": False,
+            },
             "stages": {
                 "type": "array",
                 "minItems": 1,
@@ -766,7 +904,7 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
                 },
             },
         },
-        "required": ["goal", "summary", "stages"],
+        "required": ["canonical_instruction", "goal", "summary", "completion", "stages"],
         "additionalProperties": False,
     }
 
@@ -778,7 +916,20 @@ def _prompt(
     timeline: Sequence[Mapping[str, Any]],
     evidence_map: str,
     boundary_hints: Sequence[Mapping[str, Any]],
+    narration: Mapping[str, Any] | None,
 ) -> str:
+    narration_context = (
+        json.dumps(
+            {
+                "transcript": narration.get("transcript", ""),
+                "transcription_engine": narration.get("transcription_engine", "unknown"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if narration is not None
+        else "unavailable"
+    )
     return (
         "You are the offline multimodal Trace Compiler Agent for Trace2Task. You do not "
         "execute the task. Convert one successful human demonstration into a grounded, "
@@ -787,6 +938,15 @@ def _prompt(
         f"Human task name: {task_id}\n"
         f"Current generic task instruction: {task_instruction}\n"
         f"Evidence contact-sheet map:\n{evidence_map}\n\n"
+        "Optional task-level human narration is authoritative evidence for intent, reasons, tricks, and "
+        "cycle semantics, while the preserved Trace and pixels remain authoritative for what "
+        "actually occurred. Narration timestamps are intentionally not action-aligned in this "
+        "version. Do not invent an action merely because it was narrated:\n"
+        f"{narration_context}\n\n"
+        "Return a concise canonical_instruction suitable for the runtime Agent. Also classify "
+        "completion as state or cycle. A cycle starts and ends at the same visual anchor; if the "
+        "initial screen already matches that anchor, it is not complete until the run visibly "
+        "leaves it and later returns.\n\n"
         "Partition every action index exactly once into contiguous stages. Within every stage, "
         "partition every action index exactly once into contiguous action_intents. Describe only "
         "visually grounded states, observable preconditions, action intent, and expected visible "
@@ -817,11 +977,21 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     temporary.replace(experience_path)
 
     task_data = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
+    task_data["instruction"] = document["canonical_instruction"]
+    completion = _mapping(document.get("completion"), "experience completion")
+    verifier = _mapping(task_data.get("verifier"), "task.verifier")
+    verifier["expected"] = completion["success_condition"]
+    verifier["completion"] = {
+        "mode": completion["mode"],
+        "require_departure_from_reference": completion["mode"] == "cycle",
+        "reason": completion["reason"],
+    }
     task_data["semantic_experience"] = {
         "path": "experience.yaml",
         "stage_count": len(document["stages"]),
         "source": "human_trace",
     }
+    previous_guidance = task_data.pop("human_guidance", None)
     review = _mapping(task_data.get("review"), "task.review")
     review["status"] = "draft"
     review["requires_confirmation"] = True
@@ -833,6 +1003,16 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     )
     if isinstance(checklist, list) and semantic_check not in checklist:
         checklist.append(semantic_check)
+    guidance_check = (
+        "The semantic stage structure changed, so previously confirmed human guidance was "
+        "deactivated. Generate and review a new guidance revision before relying on it."
+    )
+    if (
+        previous_guidance is not None
+        and isinstance(checklist, list)
+        and guidance_check not in checklist
+    ):
+        checklist.append(guidance_check)
     task_path.write_text(
         yaml.safe_dump(task_data, sort_keys=False, allow_unicode=True, width=100),
         encoding="utf-8",
@@ -861,6 +1041,7 @@ def compile_windows_semantic_experience(
     task_instruction = _string(task_data.get("instruction"), "task.instruction")
     timeline, all_frames, boundary_hints = _prepare_timeline(source_path.parent)
     evidence_frames = _sample_frames(all_frames)
+    narration = load_narration(source_path.parent / "reference" / "narration.json")
     original_evidence_paths = tuple(
         (source_path.parent / frame).resolve() for frame in evidence_frames
     )
@@ -880,6 +1061,7 @@ def compile_windows_semantic_experience(
             timeline=timeline,
             evidence_map=evidence_map,
             boundary_hints=boundary_hints,
+            narration=narration,
         )
         executable = binary_resolver(codex_bin)
         session = session_factory(
@@ -907,22 +1089,36 @@ def compile_windows_semantic_experience(
                 )
                 try:
                     payload = json.loads(output.strip())
-                    goal, summary, stages = _validate_semantic_payload(
+                    (
+                        canonical_instruction,
+                        goal,
+                        summary,
+                        completion_mode,
+                        completion_success_condition,
+                        completion_reason,
+                        stages,
+                    ) = _validate_semantic_payload(
                         payload,
                         task_id=task_id,
                         action_count=len(timeline),
                         allowed_frames=set(evidence_frames),
                     )
+                    stages = _align_stage_frames(stages, timeline)
                 except (json.JSONDecodeError, TypeError, ValueError) as error:
                     last_error = error
                     continue
                 document = _experience_document(
                     task_id=task_id,
+                    canonical_instruction=canonical_instruction,
                     goal=goal,
                     summary=summary,
+                    completion_mode=completion_mode,
+                    completion_success_condition=completion_success_condition,
+                    completion_reason=completion_reason,
                     stages=stages,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    narration_available=narration is not None,
                 )
                 experience_path = _attach_experience(source_path, document)
                 loaded = load_semantic_experience(

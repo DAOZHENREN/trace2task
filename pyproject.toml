@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trace2task"
-version = "0.7.2"
+version = "0.12.1"
 description = "Record a workflow and turn it into a resettable, verifiable agent task."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "DAOZHENREN" }]
 dependencies = [
+  "faster-whisper>=1.1,<2",
   "numpy>=2.0",
   "pygame>=2.6,<3",
   "pyyaml>=6.0,<7",

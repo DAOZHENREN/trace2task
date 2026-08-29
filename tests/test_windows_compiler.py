@@ -119,6 +119,21 @@ def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
     tmp_path: Path,
 ) -> None:
     trace_path, _, _ = _write_windows_trace(tmp_path)
+    (trace_path.parent / "narration.json").write_text(
+        json.dumps(
+            {
+                "transcript": "这是人工讲解",
+                "segments": [],
+                "audio": {
+                    "path": "narration.webm",
+                    "mime_type": "audio/webm",
+                    "bytes": 5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (trace_path.parent / "narration.webm").write_bytes(b"audio")
 
     result = compile_trace(trace_path, tmp_path / "compiled")
     task_path = Path(result.task_path)
@@ -168,6 +183,13 @@ def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
     assert report["inference"]["action_counts"]["wait"] == 2
     assert report["inference"]["verifier"]["success_source"] == "human F8 marker"
     assert (task_path.parent / "reference" / "trace.jsonl").is_file()
+    assert (task_path.parent / "reference" / "narration.json").is_file()
+    compiled_narration = json.loads(
+        (task_path.parent / "reference" / "narration.json").read_text(encoding="utf-8")
+    )
+    assert compiled_narration["audio"] is None
+    assert compiled_narration["audio_archived_with_source_trace"] is True
+    assert not (task_path.parent / "reference" / "narration.webm").exists()
     assert len(list((task_path.parent / "reference" / "frames").glob("*.png"))) == 14
 
 

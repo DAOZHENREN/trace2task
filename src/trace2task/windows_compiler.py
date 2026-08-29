@@ -604,6 +604,21 @@ def _copy_reference_bundle(
     frames_dir.mkdir(parents=True)
     shutil.copy2(trace_path, reference_dir / "trace.jsonl")
     shutil.copy2(metadata_path, reference_dir / "metadata.json")
+    narration_manifest = trace_path.with_name("narration.json")
+    if narration_manifest.is_file():
+        try:
+            narration_data = json.loads(narration_manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("Narration manifest is not valid JSON") from error
+        if not isinstance(narration_data, dict):
+            raise TypeError("Narration manifest must be an object")
+        audio_archived = isinstance(narration_data.get("audio"), dict)
+        narration_data["audio"] = None
+        narration_data["audio_archived_with_source_trace"] = audio_archived
+        (reference_dir / narration_manifest.name).write_text(
+            json.dumps(narration_data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     for frame_path in dict.fromkeys(frame_paths):
         shutil.copy2(frame_path, frames_dir / frame_path.name)
 

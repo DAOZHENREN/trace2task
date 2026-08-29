@@ -28,11 +28,16 @@ class ScriptedTransport:
         self.closed = True
 
 
-def completed_turn(turn_id: str, text: str) -> dict[str, Any]:
+def completed_turn(
+    turn_id: str,
+    text: str,
+    *,
+    thread_id: str = "thread-1",
+) -> dict[str, Any]:
     return {
         "method": "turn/completed",
         "params": {
-            "threadId": "thread-1",
+            "threadId": thread_id,
             "turn": {
                 "id": turn_id,
                 "status": "completed",
@@ -79,7 +84,13 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
         additional_image_paths=(reference_path,),
         output_schema=schema,
     )
-    second = session.run_turn(prompt="second", image_path=image_path, output_schema=schema)
+    second = session.run_turn(
+        prompt="second",
+        image_path=image_path,
+        output_schema=schema,
+        model="gpt-5.6-sol",
+        reasoning_effort="max",
+    )
 
     assert first == '{"actions":["move_right"]}'
     assert second == '{"actions":["interact"]}'
@@ -112,11 +123,56 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
     }
     assert first_turn["outputSchema"] == schema
     assert first_turn["effort"] == "high"
+    assert second_turn["model"] == "gpt-5.6-sol"
+    assert second_turn["effort"] == "max"
     assert first_turn["sandboxPolicy"] == {"type": "readOnly", "networkAccess": False}
+    assert session.last_turn_metrics is not None
+    assert session.last_turn_metrics.prompt_chars == len("second")
+    assert session.last_turn_metrics.image_count == 1
+    assert session.last_turn_metrics.thread_reused is True
+    assert session.last_turn_metrics.thread_generation == 1
 
     session.close()
     session.close()
     assert transport.closed
+
+
+def test_session_resets_only_the_thread_and_keeps_the_codex_process(tmp_path: Path) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+            completed_turn("turn-1", "first"),
+            {"id": 4, "result": {"thread": {"id": "thread-2"}}},
+            {"id": 5, "result": {"turn": {"id": "turn-2"}}},
+            completed_turn("turn-2", "second", thread_id="thread-2"),
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-terra",
+        cwd=tmp_path,
+        transport_factory=lambda executable: transport,
+    )
+    image_path = tmp_path / "observation.png"
+    image_path.write_bytes(b"png")
+
+    session.run_turn(prompt="first", image_path=image_path, output_schema={})
+    session.reset_thread()
+    session.run_turn(prompt="second", image_path=image_path, output_schema={})
+
+    assert [message.get("method") for message in transport.sent] == [
+        "initialize",
+        "initialized",
+        "thread/start",
+        "turn/start",
+        "thread/start",
+        "turn/start",
+    ]
+    assert session.last_turn_metrics is not None
+    assert session.last_turn_metrics.thread_reused is False
+    assert session.last_turn_metrics.thread_generation == 2
 
 
 def test_session_rejects_unknown_reasoning_effort(tmp_path: Path) -> None:

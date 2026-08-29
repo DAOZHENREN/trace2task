@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
@@ -21,6 +22,18 @@ CODEX_MODELS = (
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
+
+
+@dataclass(frozen=True)
+class CodexTurnMetrics:
+    total_ms: float
+    thread_start_ms: float
+    request_ack_ms: float
+    completion_wait_ms: float
+    prompt_chars: int
+    image_count: int
+    thread_reused: bool
+    thread_generation: int
 
 
 class AppServerTransport(Protocol):
@@ -180,7 +193,10 @@ class CodexAppServerSession:
         self._transport = transport_factory(codex_executable)
         self._request_id = 0
         self._thread_id: str | None = None
+        self._thread_generation = 0
+        self._initialized = False
         self._pending_messages: deque[dict[str, Any]] = deque()
+        self.last_turn_metrics: CodexTurnMetrics | None = None
         self._closed = False
 
     @property
@@ -190,17 +206,19 @@ class CodexAppServerSession:
     def start(self) -> str:
         if self._thread_id is not None:
             return self._thread_id
-        self._request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "trace2task",
-                    "title": "Trace2Task",
-                    "version": __version__,
+        if not self._initialized:
+            self._request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "trace2task",
+                        "title": "Trace2Task",
+                        "version": __version__,
+                    }
                 }
-            },
-        )
-        self._transport.send({"method": "initialized", "params": {}})
+            )
+            self._transport.send({"method": "initialized", "params": {}})
+            self._initialized = True
         params: dict[str, Any] = {
             "cwd": str(self.cwd),
             "approvalPolicy": "never",
@@ -215,7 +233,15 @@ class CodexAppServerSession:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise TypeError("Codex App Server returned no thread id")
         self._thread_id = thread["id"]
+        self._thread_generation += 1
         return self._thread_id
+
+    def reset_thread(self) -> None:
+        """Start the next turn in a fresh ephemeral thread without restarting Codex."""
+
+        if self._closed:
+            raise RuntimeError("Cannot reset a closed Codex App Server session")
+        self._thread_id = None
 
     def run_turn(
         self,
@@ -224,8 +250,20 @@ class CodexAppServerSession:
         image_path: Path,
         output_schema: dict[str, Any],
         additional_image_paths: tuple[Path, ...] = (),
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
+        total_started = time.perf_counter()
+        active_effort = reasoning_effort or self.reasoning_effort
+        if active_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(
+                "Codex reasoning effort must be one of "
+                f"{', '.join(CODEX_REASONING_EFFORTS)}"
+            )
+        thread_reused = self._thread_id is not None
+        thread_started = time.perf_counter()
         thread_id = self.start()
+        thread_start_ms = (time.perf_counter() - thread_started) * 1000
         deadline = time.monotonic() + self.timeout_seconds
         image_paths = (image_path, *additional_image_paths)
         params: dict[str, Any] = {
@@ -241,19 +279,23 @@ class CodexAppServerSession:
                     for current_path in image_paths
                 ),
             ],
-            "effort": self.reasoning_effort,
+            "effort": active_effort,
             "summary": "none",
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
             "outputSchema": output_schema,
         }
-        if self.model:
-            params["model"] = self.model
+        active_model = model or self.model
+        if active_model:
+            params["model"] = active_model
+        request_started = time.perf_counter()
         result = self._request("turn/start", params, deadline=deadline)
+        request_ack_ms = (time.perf_counter() - request_started) * 1000
         turn = result.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
             raise TypeError("Codex App Server returned no turn id")
         turn_id = turn["id"]
+        completion_started = time.perf_counter()
 
         while True:
             message = self._receive(deadline)
@@ -289,6 +331,16 @@ class CodexAppServerSession:
             ]
             if not responses:
                 raise RuntimeError("Codex completed the turn without a final agent message")
+            self.last_turn_metrics = CodexTurnMetrics(
+                total_ms=(time.perf_counter() - total_started) * 1000,
+                thread_start_ms=thread_start_ms,
+                request_ack_ms=request_ack_ms,
+                completion_wait_ms=(time.perf_counter() - completion_started) * 1000,
+                prompt_chars=len(prompt),
+                image_count=len(image_paths),
+                thread_reused=thread_reused,
+                thread_generation=self._thread_generation,
+            )
             return responses[-1]
 
     def _request(

@@ -79,6 +79,28 @@
             </div>
             <div class="agent-settings-help">只影响每次任务的规划与执行；不会改变已经编译的经验。</div>
 
+            <div class="execution-options">
+              <div>
+                <label class="field-label" for="input-mode">输入模式</label>
+                <div class="select-wrap">
+                  <select id="input-mode">
+                    <option value="foreground" selected>前台执行 · 兼容性最好</option>
+                    <option value="background">后台执行 · 可同时使用电脑</option>
+                  </select>
+                </div>
+              </div>
+              <label class="toggle-option" for="adaptive-reasoning">
+                <input id="adaptive-reasoning" type="checkbox" checked>
+                <span>
+                  <strong>困难步骤自动升级</strong>
+                  <small>低置信度或未知阶段时临时提高模型与思考强度</small>
+                </span>
+              </label>
+            </div>
+            <div class="agent-settings-help" id="input-mode-help">
+              前台执行会聚焦目标窗口；适用于游戏、模拟器和不接受后台消息的应用。
+            </div>
+
             <label class="field-label instruction-label" for="instruction">本次指令</label>
             <textarea
               id="instruction"
@@ -156,10 +178,18 @@
             </div>
             <div class="agent-settings-help">录制结束后，Compiler Agent 会自动理解阶段与动作意图。</div>
 
+            <label class="toggle-option narration-toggle" for="record-narration">
+              <input id="record-narration" type="checkbox" checked>
+              <span>
+                <strong>同时录制人工讲解</strong>
+                <small>浏览器录音；F8 后由本地 Whisper Turbo 转写，检查文字后再交给 Compiler Agent</small>
+              </span>
+            </label>
+
             <div class="record-flow">
               <div><span>1</span><p>点击开始后自动切换到目标窗口</p></div>
-              <div><span>2</span><p>正常完成一次人工示范</p></div>
-              <div><span>3</span><p>按 F8 成功并自动生成语义经验；F9 取消</p></div>
+              <div><span>2</span><p>正常示范，同时说清意图、诀窍和完成条件</p></div>
+              <div><span>3</span><p>按 F8 成功；检查讲解后生成语义经验，F9 取消</p></div>
             </div>
 
             <div class="form-error hidden" id="record-error" role="alert"></div>
@@ -167,6 +197,23 @@
               <span class="button-icon">●</span>
               开始录制
             </button>
+
+            <div class="narration-review hidden" id="narration-review">
+              <div class="field-row">
+                <label class="field-label" for="narration-transcript">讲解转写（可修改）</label>
+                <span id="narration-status">等待录制结束</span>
+              </div>
+              <textarea
+                id="narration-transcript"
+                maxlength="20000"
+                rows="7"
+                placeholder="例如：这里先关闭能量不足提示；每回合先点攻击，再根据克制关系选卡……"
+              ></textarea>
+              <p>Turbo 首次使用会下载约 1.6 GB 模型；时间片只是辅助线索，原始 Trace 和截图仍是发生了什么的强证据。</p>
+              <button class="button primary full-button" id="narration-submit" type="button">
+                确认讲解并开始编译
+              </button>
+            </div>
 
             <div class="safety-note">
               <span class="safety-icon">i</span>
@@ -207,6 +254,27 @@
               </div>
             </div>
 
+            <div class="compiler-settings-panel revision-settings-panel">
+              <div class="compiler-settings-copy">
+                <strong>经验修订模型（教练）</strong>
+                <p>结合本次运行和你的反馈生成 trick 草稿；确认前不会修改正在使用的经验。</p>
+              </div>
+              <div class="agent-settings compiler-agent-settings">
+                <div>
+                  <label class="field-label" for="revision-model">Revision Agent 模型</label>
+                  <div class="select-wrap">
+                    <select id="revision-model"></select>
+                  </div>
+                </div>
+                <div>
+                  <label class="field-label" for="revision-reasoning-effort">修订思考强度</label>
+                  <div class="select-wrap">
+                    <select id="revision-reasoning-effort"></select>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <div class="library-heading">
               <h3>任务经验</h3>
               <span id="taskpack-count">0 项</span>
@@ -214,7 +282,7 @@
             <div class="library-list" id="taskpack-list"></div>
 
             <div class="library-heading recordings-heading">
-              <h3>候选经验</h3>
+              <h3>可反馈运行</h3>
               <span id="candidate-count">0 项</span>
             </div>
             <div class="library-list compact" id="candidate-list"></div>
@@ -271,6 +339,7 @@
 
               <div class="result-panel hidden" id="result-panel">
                 <div class="log-heading"><span>运行结果</span></div>
+                <div id="job-performance"></div>
                 <pre id="job-result"></pre>
               </div>
             </div>

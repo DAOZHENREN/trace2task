@@ -15,6 +15,9 @@ class TaskPack:
     environment_adapter: str
     verifier_type: str
     expected_result: str
+    completion_mode: str
+    require_departure_from_reference: bool
+    completion_reason: str
     max_actions: int
     review_status: str
     requires_confirmation: bool
@@ -45,6 +48,18 @@ def load_taskpack(path: Path) -> TaskPack:
     environment_adapter = environment.get("adapter")
     verifier_type = verifier.get("type")
     expected_result = verifier.get("expected")
+    completion = verifier.get("completion")
+    if completion is None:
+        completion_mode = "state"
+        require_departure_from_reference = False
+        completion_reason = "Legacy task completes when the reviewed reference state is reached."
+    else:
+        completion_mapping = _require_mapping(completion, "verifier.completion")
+        completion_mode = completion_mapping.get("mode")
+        require_departure_from_reference = completion_mapping.get(
+            "require_departure_from_reference"
+        )
+        completion_reason = completion_mapping.get("reason")
     max_actions = limits.get("max_actions")
     review = root.get("review")
     if review is None:
@@ -81,6 +96,14 @@ def load_taskpack(path: Path) -> TaskPack:
         raise ValueError("Task pack verifier must define a non-empty string 'type'")
     if not isinstance(expected_result, str) or not expected_result.strip():
         raise ValueError("Task pack verifier must define a non-empty string 'expected'")
+    if completion_mode not in {"state", "cycle"}:
+        raise ValueError("Task pack verifier completion mode must be 'state' or 'cycle'")
+    if not isinstance(require_departure_from_reference, bool):
+        raise TypeError("Task pack verifier departure policy must be a boolean")
+    if completion_mode == "state" and require_departure_from_reference:
+        raise ValueError("State completion cannot require departure from the reference")
+    if not isinstance(completion_reason, str) or not completion_reason.strip():
+        raise ValueError("Task pack verifier completion reason must be a non-empty string")
     if not isinstance(max_actions, int) or isinstance(max_actions, bool) or max_actions <= 0:
         raise ValueError("Task pack limits.max_actions must be a positive integer")
     if review_status not in {"draft", "confirmed"}:
@@ -104,6 +127,9 @@ def load_taskpack(path: Path) -> TaskPack:
         environment_adapter=environment_adapter.strip(),
         verifier_type=verifier_type.strip(),
         expected_result=expected_result.strip(),
+        completion_mode=completion_mode,
+        require_departure_from_reference=require_departure_from_reference,
+        completion_reason=" ".join(completion_reason.split()),
         max_actions=max_actions,
         review_status=review_status,
         requires_confirmation=requires_confirmation,

@@ -189,8 +189,8 @@ def build_parser() -> argparse.ArgumentParser:
     windows_agent.add_argument(
         "--plan-horizon",
         type=int,
-        default=4,
-        help="Maximum locally executed action batch per model decision (default: 4).",
+        default=12,
+        help="Maximum actions in one stage program per model decision (default: 12).",
     )
     windows_agent.add_argument("--max-actions", type=int)
     windows_agent.add_argument("--output", type=Path, default=Path("runs"))

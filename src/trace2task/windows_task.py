@@ -11,6 +11,7 @@ from trace2task.actions import WINDOWS_MOTOR_SKILLS, ActionCall
 from trace2task.taskpack import TaskPack, load_taskpack
 from trace2task.windows_control import WindowSelector
 from trace2task.windows_experience import SemanticExperience, load_semantic_experience
+from trace2task.windows_guidance import HumanGuidance, load_human_guidance
 
 WINDOWS_ADAPTER = "trace2task.windows"
 
@@ -22,6 +23,7 @@ class WindowsTaskContract:
     demonstration: tuple[ActionCall, ...]
     reference_frame: Path
     semantic_experience: SemanticExperience | None = None
+    human_guidance: HumanGuidance | None = None
     runtime_instruction: str | None = None
 
     @property
@@ -40,6 +42,7 @@ class WindowsTaskContract:
             demonstration=self.demonstration,
             reference_frame=self.reference_frame,
             semantic_experience=self.semantic_experience,
+            human_guidance=self.human_guidance,
             runtime_instruction=normalized,
         )
 
@@ -142,10 +145,32 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
             raise ValueError(
                 "Task pack and semantic experience confirmation states do not match"
             )
+    human_guidance: HumanGuidance | None = None
+    guidance_config = root.get("human_guidance")
+    if guidance_config is not None:
+        if semantic_experience is None:
+            raise ValueError("Human guidance requires a semantic experience")
+        guidance_mapping = _mapping(guidance_config, "human_guidance")
+        guidance_path = _contained_file(
+            source_path,
+            guidance_mapping.get("path"),
+            "human_guidance.path",
+        )
+        stage_ids = {stage.stage_id for stage in semantic_experience.stages}
+        human_guidance = load_human_guidance(
+            guidance_path,
+            task_id=task.task_id,
+            stage_ids=stage_ids,
+        )
+        if guidance_mapping.get("revision") != human_guidance.revision:
+            raise ValueError("Windows human_guidance.revision does not match guidance.yaml")
+        if guidance_mapping.get("rule_count") != len(human_guidance.rules):
+            raise ValueError("Windows human_guidance.rule_count does not match guidance.yaml")
     return WindowsTaskContract(
         task=task,
         selector=selector,
         demonstration=tuple(actions),
         reference_frame=reference_frame,
         semantic_experience=semantic_experience,
+        human_guidance=human_guidance,
     )

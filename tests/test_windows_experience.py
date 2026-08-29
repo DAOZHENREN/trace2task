@@ -122,8 +122,14 @@ def _write_taskpack(tmp_path: Path) -> Path:
 
 def _semantic_response() -> dict[str, Any]:
     return {
+        "canonical_instruction": "完成一次目标工作流并回到初始锚点。",
         "goal": "完成示范工作流",
         "summary": "进入目标界面，等待转换，然后完成确认。",
+        "completion": {
+            "mode": "cycle",
+            "success_condition": "离开初始界面、完成工作流并返回同一锚点。",
+            "reason": "示范起点和终点使用同一个可见锚点。",
+        },
         "stages": [
             {
                 "id": "open_target",
@@ -149,7 +155,7 @@ def _semantic_response() -> dict[str, Any]:
                 "expected_effects": ["界面开始切换"],
                 "state_after": {
                     "description": "入口已触发",
-                    "evidence_frame": "reference/frames/0001.png",
+                    "evidence_frame": "reference/frames/0002.png",
                     "visual_anchors": ["入口画面发生变化"],
                 },
                 "dynamic_decisions": [],
@@ -162,7 +168,7 @@ def _semantic_response() -> dict[str, Any]:
                 "end_action_index": 3,
                 "state_before": {
                     "description": "等待后的目标界面",
-                    "evidence_frame": "reference/frames/0002.png",
+                    "evidence_frame": "reference/frames/0000.png",
                     "visual_anchors": ["目标控件已经出现"],
                 },
                 "action_intents": [
@@ -232,6 +238,19 @@ class FakeSession:
 
 def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path) -> None:
     task_path = _write_taskpack(tmp_path)
+    (task_path.parent / "reference" / "narration.json").write_text(
+        json.dumps(
+            {
+                "transcript": "先打开入口，等待切换，再完成确认并回到起点。",
+                "segments": [
+                    {"start_ms": 0, "end_ms": 800, "text": "先打开入口"}
+                ],
+                "transcription_engine": "browser_web_speech",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     trace_path = task_path.parent / "reference" / "trace.jsonl"
     demonstration_path = task_path.parent / "demonstration.json"
     original_trace = trace_path.read_bytes()
@@ -268,12 +287,25 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert demonstration_path.read_bytes() == original_demonstration
     assert root["semantic_experience"]["source"] == "human_trace"
     assert experience["source"]["policy"] == "immutable_strong_evidence"
+    assert experience["source"]["narration"] == "reference/narration.json"
     assert experience["compiler"]["policy"] == "replaceable_derived_interpretation"
+    assert root["instruction"] == "完成一次目标工作流并回到初始锚点。"
+    assert root["verifier"]["completion"]["mode"] == "cycle"
+    assert root["verifier"]["completion"]["require_departure_from_reference"] is True
     assert contract.semantic_experience is not None
+    assert contract.task.completion_mode == "cycle"
+    assert contract.semantic_experience.stages[0].state_after.evidence_frame.endswith(
+        "0001.png"
+    )
+    assert contract.semantic_experience.stages[1].state_before.evidence_frame.endswith(
+        "0001.png"
+    )
     assert contract.semantic_experience.stages[1].dynamic_decisions[0].generalization == (
         "runtime_agent_decides"
     )
     assert "single trajectory does not prove a general strategy" in calls[0]["prompt"]
+    assert "先打开入口，等待切换，再完成确认并回到起点" in calls[0]["prompt"]
+    assert "start_ms" not in calls[0]["prompt"]
     assert calls[0]["schema"]["properties"]["stages"]["items"]["additionalProperties"] is False
     assert calls[0]["image_path"].name == "contact-sheet-01.png"
     assert "Contact sheet Image 1, cell Frame 1" in calls[0]["prompt"]

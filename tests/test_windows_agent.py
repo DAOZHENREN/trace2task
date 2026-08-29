@@ -24,7 +24,11 @@ def _write_taskpack(
     *,
     confirmed: bool = False,
     semantic: bool = False,
+    guidance: bool = False,
+    cycle: bool = False,
 ) -> Path:
+    if guidance and not semantic:
+        raise ValueError("guidance test fixture requires semantic experience")
     task_dir = tmp_path / ("confirmed-task" if confirmed else "draft-task")
     reference_dir = task_dir / "reference"
     reference_dir.mkdir(parents=True)
@@ -80,6 +84,12 @@ def _write_taskpack(
             "requires_confirmation": not confirmed,
         },
     }
+    if cycle:
+        task["verifier"]["completion"] = {
+            "mode": "cycle",
+            "require_departure_from_reference": True,
+            "reason": "The workflow must leave and return to the same anchor.",
+        }
     if semantic:
         task["semantic_experience"] = {
             "path": "experience.yaml",
@@ -150,6 +160,41 @@ def _write_taskpack(
         (task_dir / "experience.yaml").write_text(
             yaml.safe_dump(experience, sort_keys=False), encoding="utf-8"
         )
+    if guidance:
+        task["human_guidance"] = {
+            "path": "guidance.yaml",
+            "revision": 1,
+            "rule_count": 1,
+        }
+        (task_dir / "guidance.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "schema_version": "0.1",
+                    "task_id": "windows-smoke",
+                    "status": "confirmed",
+                    "revision": 1,
+                    "summary": "Avoid redundant replanning after a stable click.",
+                    "rules": [
+                        {
+                            "id": "trick-01",
+                            "stage_id": "open_target",
+                            "when": "The target is stable.",
+                            "prefer": "Click once and wait for the expected content.",
+                            "avoid": ["Replanning immediately after the click"],
+                            "replan_when": ["Expected content does not appear"],
+                            "expected_effect": "The target opens efficiently.",
+                            "priority": "high",
+                        }
+                    ],
+                    "revision_agent": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "high",
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
     task_path = task_dir / "task.yaml"
     task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
     return task_path
@@ -172,6 +217,7 @@ class FakeSession:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.closed = False
+        self.reset_count = 0
 
     def run_turn(
         self,
@@ -180,6 +226,8 @@ class FakeSession:
         image_path: Path,
         output_schema: dict[str, Any],
         additional_image_paths: tuple[Path, ...] = (),
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         assert image_path.is_file()
         assert all(path.is_file() for path in additional_image_paths)
@@ -188,9 +236,14 @@ class FakeSession:
                 "prompt": prompt,
                 "schema": output_schema,
                 "reference_paths": additional_image_paths,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
             }
         )
         return json.dumps(next(self.responses))
+
+    def reset_thread(self) -> None:
+        self.reset_count += 1
 
     def close(self) -> None:
         self.closed = True
@@ -295,6 +348,23 @@ class FakeBackend:
         self.events.append(("window_text", handle, text))
 
 
+class FailSecondCursorBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cursor_calls = 0
+
+    def set_cursor_position(self, x: int, y: int) -> None:
+        self.cursor_calls += 1
+        if self.cursor_calls == 2:
+            raise RuntimeError("simulated motor anomaly")
+        super().set_cursor_position(x, y)
+
+
+class AlwaysFailCursorBackend(FakeBackend):
+    def set_cursor_position(self, x: int, y: int) -> None:
+        raise RuntimeError("persistent motor anomaly")
+
+
 class FakeCapture:
     def __init__(self) -> None:
         self.calls = 0
@@ -306,11 +376,25 @@ class FakeCapture:
         return surface
 
 
+class ColorSequenceCapture:
+    def __init__(self, colors: list[tuple[int, int, int]]) -> None:
+        self.colors = colors
+        self.calls = 0
+
+    def capture(self, window: WindowInfo) -> pygame.Surface:
+        color = self.colors[min(self.calls, len(self.colors) - 1)]
+        self.calls += 1
+        surface = pygame.Surface((window.client_width, window.client_height))
+        surface.fill(color)
+        return surface
+
+
 class ScriptedAgent:
     def __init__(self, plans: list[WindowsAgentPlan]) -> None:
         self.plans = iter(plans)
         self.replans = 0
         self.observations: list[tuple[ActionCall, bool]] = []
+        self.completion_rejections: list[str] = []
         self.closed = False
 
     def plan(self, surface: pygame.Surface) -> WindowsAgentPlan:
@@ -319,6 +403,9 @@ class ScriptedAgent:
 
     def observe_transition(self, action: ActionCall, applied: bool) -> None:
         self.observations.append((action, applied))
+
+    def observe_completion_rejected(self, reason: str) -> None:
+        self.completion_rejections.append(reason)
 
     def close(self) -> None:
         self.closed = True
@@ -416,7 +503,7 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert plan.actions == (ActionCall("click", {"x": 0.25, "y": 0.75}),)
     assert calls[0]["reference_paths"] == (contract.reference_frame,)
     assert calls[1]["reference_paths"] == ()
-    assert "do not ask for them again" in calls[1]["prompt"]
+    assert "Continue the current semantic stage" in calls[1]["prompt"]
     assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
@@ -450,6 +537,193 @@ def test_codex_windows_agent_uses_semantic_stages_and_their_evidence(
                     ],
                     "reason": "Follow the grounded stage.",
                     "confidence": 0.9,
+                    "stage_id": "open_target",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {
+                            "skill": "click",
+                            "args": {"x": 0.5, "y": 0.5, "button": "left"},
+                        }
+                    ],
+                    "reason": "Continue the active stage.",
+                    "confidence": 0.92,
+                    "stage_id": "open_target",
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    first = agent.plan(pygame.Surface((100, 50)))
+    agent.plan(pygame.Surface((100, 50)))
+
+    assert contract.semantic_experience is not None
+    assert first.stage_id == "open_target"
+    assert len(calls[0]["reference_paths"]) == 3
+    assert "semantic stage index" in calls[0]["prompt"]
+    assert "action_intents" not in calls[0]["prompt"]
+    assert len(calls[1]["reference_paths"]) == 3
+    assert "Locally retrieved active-stage experience" in calls[1]["prompt"]
+    assert "Reviewed Trace action programs" in calls[1]["prompt"]
+    assert '"action_range":[0,1]' in calls[1]["prompt"]
+    assert '"skill":"click"' in calls[1]["prompt"]
+    assert "runtime_agent_decides" in calls[1]["prompt"]
+    assert "raw human Trace remains stronger evidence" in calls[0]["prompt"]
+    assert "fresh bounded model session" in calls[1]["prompt"]
+    assert "exact stage-boundary images" in calls[1]["prompt"]
+    assert "Exact human Trace images for this stage" in calls[1]["prompt"]
+    agent.close()
+
+
+def test_codex_windows_agent_returns_a_complete_stage_program_by_default(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(_write_taskpack(tmp_path, semantic=True))
+    actions = [
+        {"skill": "click", "args": {"x": 0.1 * index, "y": 0.5}}
+        for index in range(1, 6)
+    ]
+    agent = CodexWindowsAgent(
+        contract,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": actions,
+                    "reason": "Execute the stable stage.",
+                    "confidence": 0.94,
+                    "stage_id": "open_target",
+                    "stage_goal": "Open the target through the stable sequence.",
+                    "expected_end_state": "The target content is open.",
+                    "abort_conditions": ["The target disappears"],
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    plan = agent.plan(pygame.Surface((100, 50)))
+
+    assert len(plan.actions) == 5
+    assert plan.stage_goal == "Open the target through the stable sequence."
+    assert plan.expected_end_state == "The target content is open."
+    assert plan.abort_conditions == ("The target disappears",)
+    assert calls[0]["schema"]["properties"]["actions"]["maxItems"] == 12
+    assert "one complete stage program" in calls[0]["prompt"]
+    assert "adaptive local visual checkpoint" in calls[0]["prompt"]
+    assert "do not spend a model turn only checking" in calls[0]["prompt"]
+    assert "Target 5 to 8 adjacent reviewed actions" in calls[0]["prompt"]
+    assert "Never return a one-action wait-only program" in calls[0]["prompt"]
+    agent.close()
+
+
+def test_codex_windows_agent_bounds_context_with_stage_thread_resets(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    sessions: list[FakeSession] = []
+    contract = load_windows_task(_write_taskpack(tmp_path, semantic=True))
+    response = {
+        "task_complete": False,
+        "actions": [{"skill": "click", "args": {"x": 0.5, "y": 0.5}}],
+        "reason": "Continue the active stage.",
+        "confidence": 0.95,
+        "stage_id": "open_target",
+    }
+    agent = CodexWindowsAgent(
+        contract,
+        plan_horizon=1,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory([dict(response) for _ in range(6)], calls, sessions),
+    )
+
+    plans = [agent.plan(pygame.Surface((100, 50))) for _ in range(6)]
+
+    assert len(plans) == 6
+    assert len(sessions) == 1
+    assert sessions[0].reset_count == 2
+    assert agent.session_resets == 2
+    assert plans[1].timing.session_reset_reason == "stage_change"
+    assert plans[5].timing.session_reset_reason == "context_limit"
+    assert "fresh bounded model session" in calls[5]["prompt"]
+    assert len(calls[5]["reference_paths"]) == 3
+    agent.close()
+
+
+def test_codex_windows_agent_temporarily_escalates_unknown_low_confidence_stage(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(_write_taskpack(tmp_path, semantic=True))
+    agent = CodexWindowsAgent(
+        contract,
+        model="gpt-5.6-luna",
+        reasoning_effort="low",
+        plan_horizon=1,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.2, "y": 0.2}}],
+                    "reason": "The current stage is unclear.",
+                    "confidence": 0.6,
+                    "stage_id": "unknown",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.3, "y": 0.3}}],
+                    "reason": "Recovered the active stage.",
+                    "confidence": 0.95,
+                    "stage_id": "open_target",
+                },
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.4, "y": 0.4}}],
+                    "reason": "Continue cheaply.",
+                    "confidence": 0.95,
+                    "stage_id": "open_target",
+                },
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    agent.plan(pygame.Surface((100, 50)))
+    agent.plan(pygame.Surface((100, 50)))
+    agent.plan(pygame.Surface((100, 50)))
+
+    assert [(call["model"], call["reasoning_effort"]) for call in calls] == [
+        ("gpt-5.6-luna", "low"),
+        ("gpt-5.6-sol", "high"),
+        ("gpt-5.6-luna", "low"),
+    ]
+    agent.close()
+
+
+def test_codex_windows_agent_injects_confirmed_human_tricks(tmp_path: Path) -> None:
+    calls: list[dict[str, Any]] = []
+    contract = load_windows_task(
+        _write_taskpack(tmp_path, semantic=True, guidance=True)
+    )
+    agent = CodexWindowsAgent(
+        contract,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [{"skill": "click", "args": {"x": 0.5, "y": 0.5}}],
+                    "reason": "Follow the confirmed trick.",
+                    "confidence": 0.95,
+                    "stage_id": "open_target",
                 }
             ],
             calls,
@@ -459,11 +733,9 @@ def test_codex_windows_agent_uses_semantic_stages_and_their_evidence(
 
     agent.plan(pygame.Surface((100, 50)))
 
-    assert contract.semantic_experience is not None
-    assert len(calls[0]["reference_paths"]) == 3
-    assert "Compiler Agent semantic experience" in calls[0]["prompt"]
-    assert "runtime_agent_decides" in calls[0]["prompt"]
-    assert "raw human Trace remains stronger evidence" in calls[0]["prompt"]
+    assert contract.human_guidance is not None
+    assert "Confirmed human guidance has higher priority" in calls[0]["prompt"]
+    assert "Click once and wait for the expected content" in calls[0]["prompt"]
     agent.close()
 
 
@@ -736,6 +1008,41 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     assert any("click completed" in status for status in statuses)
 
 
+def test_cycle_task_must_leave_initial_reference_before_completion(
+    tmp_path: Path,
+) -> None:
+    reference_color = (30, 120, 70)
+    departed_color = (180, 30, 40)
+    click = ActionCall("click", {"x": 0.5, "y": 0.5})
+    agent = ScriptedAgent(
+        [_plan(complete=True), _plan(click), _plan(complete=True)]
+    )
+    capture = ColorSequenceCapture(
+        [reference_color, reference_color, departed_color, reference_color]
+    )
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True, cycle=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=capture,
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+    )
+    trace_events = [
+        json.loads(line)
+        for line in Path(result.trace_path).read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.task_complete is True
+    assert result.executed_actions == 1
+    assert agent.completion_rejections == [
+        "cycle run started at the reference anchor and has not visibly left it"
+    ]
+    assert any(event["type"] == "completion_rejected" for event in trace_events)
+
+
 def test_confirmed_windows_agent_can_execute_in_background_without_focus(
     tmp_path: Path,
 ) -> None:
@@ -763,6 +1070,182 @@ def test_confirmed_windows_agent_can_execute_in_background_without_focus(
         ("window_mouse", 7, 50, 25, "left", True, False),
         ("window_mouse", 7, 50, 25, "left", False, False),
     ]
+
+
+def test_motor_anomaly_discards_batch_suffix_and_replans_immediately(
+    tmp_path: Path,
+) -> None:
+    backend = FailSecondCursorBackend()
+    first = ActionCall("click", {"x": 0.1, "y": 0.5})
+    failed = ActionCall("click", {"x": 0.2, "y": 0.5})
+    discarded = ActionCall("click", {"x": 0.3, "y": 0.5})
+    recovery = ActionCall("click", {"x": 0.8, "y": 0.5})
+    agent = ScriptedAgent(
+        [_plan(first, failed, discarded), _plan(recovery), _plan(complete=True)]
+    )
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=backend,
+        capture=FakeCapture(),
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
+    )
+
+    assert result.task_complete
+    assert result.executed_actions == 2
+    assert result.batch_count == 2
+    assert result.planned_actions == 4
+    assert result.interrupted_batches == 1
+    assert result.average_batch_size == 2.0
+    assert result.max_batch_size == 3
+    assert agent.observations == [
+        (first, True),
+        (failed, False),
+        (recovery, True),
+    ]
+    assert all(event != ("cursor", 130, 225) for event in backend.events)
+    assert any("replanning immediately" in status for status in statuses)
+
+
+def test_local_visual_checkpoints_keep_a_long_batch_running(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    capture = ColorSequenceCapture(
+        [
+            (10, 10, 10),
+            (10, 10, 10),
+            (10, 10, 10),
+            (80, 80, 80),
+            (80, 80, 80),
+            (80, 80, 80),
+            (150, 150, 150),
+            (150, 150, 150),
+            (150, 150, 150),
+            (150, 150, 150),
+        ]
+    )
+    first_click = ActionCall("click", {"x": 0.25, "y": 0.5})
+    first_wait = ActionCall("wait", {"duration_ms": 100})
+    second_click = ActionCall("click", {"x": 0.75, "y": 0.5})
+    second_wait = ActionCall("wait", {"duration_ms": 100})
+    agent = ScriptedAgent(
+        [
+            _plan(first_click, first_wait, second_click, second_wait),
+            _plan(complete=True),
+        ]
+    )
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=backend,
+        capture=capture,
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+    )
+
+    assert result.task_complete
+    assert result.executed_actions == 4
+    assert result.batch_count == 1
+    assert result.average_batch_size == 4.0
+    assert result.visual_checkpoints == 2
+    assert result.visual_checkpoint_failures == 0
+    assert result.visual_stability_wait_ms >= 400
+    assert agent.observations == [
+        (first_click, True),
+        (first_wait, True),
+        (second_click, True),
+        (second_wait, True),
+    ]
+
+
+def test_trailing_wait_uses_local_wait_until_before_replanning(tmp_path: Path) -> None:
+    wait = ActionCall("wait", {"duration_ms": 100})
+    agent = ScriptedAgent([_plan(wait), _plan(complete=True)])
+    emergency = FakeEmergencyStop()
+    capture = ColorSequenceCapture([(40, 40, 40)] * 20)
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=capture,
+        emergency_stop=emergency,
+        agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
+    )
+
+    assert result.task_complete
+    assert result.local_wait_until_count == 1
+    assert result.local_wait_until_ms >= 1_400
+    assert result.wait_only_plans == 1
+    assert result.short_batch_count == 1
+    assert result.performance["local_wait_until_ms"] == result.local_wait_until_ms
+    assert result.stage_timings[0]["local_wait_until_ms"] == result.local_wait_until_ms
+    assert any("local wait-until" in status for status in statuses)
+
+
+def test_no_visual_response_discards_the_rest_of_the_batch(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    capture = ColorSequenceCapture([(20, 20, 20)] * 8)
+    click = ActionCall("click", {"x": 0.5, "y": 0.5})
+    wait = ActionCall("wait", {"duration_ms": 100})
+    discarded = ActionCall("click", {"x": 0.8, "y": 0.5})
+    agent = ScriptedAgent(
+        [_plan(click, wait, discarded), _plan(complete=True)]
+    )
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=backend,
+        capture=capture,
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
+    )
+    trace_events = [
+        json.loads(line)
+        for line in Path(result.trace_path).read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.task_complete
+    assert result.executed_actions == 2
+    assert result.interrupted_batches == 1
+    assert result.visual_checkpoints == 1
+    assert result.visual_checkpoint_failures == 1
+    assert agent.observations == [(click, True), (wait, True), (click, False)]
+    assert backend.events.count(("cursor", 180, 225)) == 0
+    assert any(event["type"] == "windows_visual_checkpoint_failed" for event in trace_events)
+    assert any("Visual checkpoint failed" in status for status in statuses)
+
+
+def test_three_consecutive_motor_anomalies_stop_recovery(tmp_path: Path) -> None:
+    click = ActionCall("click", {"x": 0.5, "y": 0.5})
+    agent = ScriptedAgent([_plan(click), _plan(click), _plan(click)])
+
+    with pytest.raises(RuntimeError, match="recovery limit"):
+        run_windows_agent(
+            _write_taskpack(tmp_path, confirmed=True),
+            execute=True,
+            output_root=tmp_path / "runs",
+            backend=AlwaysFailCursorBackend(),
+            capture=FakeCapture(),
+            emergency_stop=FakeEmergencyStop(),
+            agent_factory=lambda contract: agent,
+        )
+
+    assert agent.observations == [(click, False), (click, False), (click, False)]
+    assert agent.closed
 
 
 def test_emergency_stop_before_action_prevents_injection(tmp_path: Path) -> None:

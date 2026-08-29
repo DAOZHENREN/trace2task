@@ -49,7 +49,7 @@ To watch the comparison:
 uv run trace2task demo --show
 ```
 
-## Local web console and semantic Trace compiler (v0.7.2)
+## Local web console and iterative Trace experience (v0.12.1)
 
 Version 0.7.0 adds the offline multimodal Compiler Agent. Version 0.7.1 makes manual compilation a
 visible background job: the activity panel responds immediately, concurrent duplicate requests are
@@ -61,6 +61,62 @@ reasoning controls are visible in **Local experience**, shared with the recordin
 to Sol + high for a stronger one-time interpretation. Runtime planning and execution keep their own
 Terra + low defaults. Each semantic experience card records and displays the model and effort that
 compiled it, so a stronger teacher can guide a faster student without coupling their settings.
+Version 0.8.0 adds a human-feedback revision loop, stage-scoped runtime retrieval, adaptive
+reasoning, and an explicit background-input mode. A successful run remains evidence rather than an
+automatic replacement: the user writes a concrete improvement, a separately configured Revision
+Agent produces conditional trick rules, and those rules affect execution only after review and
+confirmation. Confirmed revisions are versioned under the task pack and can be inspected locally.
+Version 0.9.0 changes runtime decisions from short next-step suggestions into Trace-grounded stage
+programs of up to 12 actions. On later turns the Agent receives the semantic active/next stages plus
+their exact reviewed human action ranges, then returns a stage goal, expected end state, observable
+abort conditions, and an ordered action batch. A recoverable motor exception immediately interrupts
+the batch, discards its unexecuted suffix, captures the new state, and replans in the same model
+session. Three consecutive motor failures stop the task; window-safety failures and F9 remain fatal.
+Version 0.9.1 makes every planned `wait` an adaptive local visual checkpoint. After the requested
+minimum delay, the runner samples the target for up to four more seconds until it stabilizes. It
+compares the stable pixels around the preceding pointer action with the pre-action state; an ignored
+click now interrupts the remaining batch and replans even when Windows reported successful input.
+The runtime prompt treats routine animation as a local checkpoint rather than a reason to spend a
+model turn, and asks for longer interaction/wait sequences when the next Trace-grounded target is
+already predictable. Recorded drag/hold gestures remain evidence but no longer imply that a current
+button semantically requires the same primitive.
+Version 0.10.0 makes human guidance cumulative across reviewed runs. The Revision Agent now returns
+incremental `keep`, `add`, `update`, `deprecate`, or `conflict` operations against stable rule IDs;
+rules omitted from a round are retained automatically. Trace2Task applies the operations
+deterministically, stores the merged snapshot as the next active revision, and preserves every
+older snapshot under `guidance-revisions/`. Conflicts block confirmation instead of silently
+overwriting confirmed guidance. The web console shows the base and proposed revision plus every
+rule-level change before the user enables it.
+Version 0.10.1 exposes the evidence behind that merge in the task card. The guidance timeline lists
+every preserved revision, its human feedback, complete rule snapshot, and V0.10 rule operations.
+Pre-V0.10 revisions are explicitly labeled as legacy whole-snapshot replacements, so the console
+does not imply that older V0.8/V0.9 guidance was cumulatively merged when it was not.
+Version 0.10.2 rejects any legacy whole-snapshot draft that would replace an existing confirmed
+revision. The browser also checks an explicit incremental-guidance capability and blocks revision
+actions when an older long-running web backend still needs to be restarted.
+Version 0.11.0 targets runtime latency. A final `wait` now becomes a bounded local wait-until gate
+that requires sustained visual stability before another model turn. Runtime conversations move to a
+fresh ephemeral thread when the semantic stage changes and after four turns in one stage, while the
+Codex process remains alive. The planner explicitly targets five-to-eight Trace-grounded actions
+when continuation is predictable. Every run records request acceptance, model completion wait,
+frame encoding, capture, parsing, explicit wait, local wait-until, and motor timings; the web console
+shows both the aggregate and per-stage timeline.
+Version 0.12.0 introduces narrated Trace compilation. The recording page can archive microphone
+audio and browser speech-to-text beside the original Trace, then pauses after F8 so the transcript
+can be corrected before the Compiler Agent runs. The compiler consumes one compact task-level
+transcript rather than repeatedly injecting audio or duplicate timestamp segments, and emits a
+canonical task instruction plus an explicit terminal-state or cycle completion policy. Semantic
+stage ranges are still inferred by the teacher model, but their before/after images are bound
+deterministically to the exact preserved Trace action boundaries. For cycle tasks that begin on the
+same visual anchor used as the success reference, the local runner rejects completion until the
+window has visibly left that anchor at least once.
+Version 0.12.1 replaces browser speech recognition as the final narration source with local
+`faster-whisper` Turbo. Browser recognition remains a live draft during the demonstration; after
+F8, the audio is archived locally and Turbo produces timestamped Chinese text for human review.
+The model is downloaded once into `.cache/faster-whisper/` on first use and then reused. CUDA with
+FP16 is preferred; machines without usable CUDA 12/cuDNN 9 libraries automatically fall back to
+CPU INT8 instead of blocking compilation. A failed local transcription preserves the browser draft
+so the user can still correct it and continue.
 
 The loopback-only browser console runs the Compiler Agent after a successful Windows recording. The
 recording is still compiled deterministically into motor evidence,
@@ -99,6 +155,10 @@ The V0.7 artifact separates evidence from interpretation:
   evidence.
 - `experience.yaml` is a replaceable Compiler Agent interpretation. Every stage covers a contiguous
   range of demonstrated actions and cites preserved evidence frames.
+- `guidance.yaml` is the latest merged snapshot of confirmed human tricks, while
+  `guidance-revisions/` preserves every accepted snapshot. Each V0.10 revision records its parent
+  and incremental rule operations. Recompiling the semantic stage structure deactivates old
+  guidance without deleting its revision files.
 - Strategy that one demonstration cannot prove is marked `runtime_agent_decides` or `unknown`
   instead of becoming a fixed rule.
 - Confirming a task pack confirms both its deterministic motor contract and the reviewed semantic
@@ -111,16 +171,42 @@ The V0.7 artifact separates evidence from interpretation:
   improve difficult visual planning at the cost of a longer wait.
 - **经验编译模型（教师）** independently selects the one-time semantic Compiler Agent. Sol + high
   is the default; changing the runtime Agent never changes this setting or an existing experience.
+- **经验修订模型（教练）** compares a completed run with natural-language human feedback and
+  creates a reviewable incremental merge draft. Existing rules remain unless the draft explicitly
+  updates or deprecates them; rule conflicts cannot be confirmed. Its generated combined summary
+  can be lightly edited and saved in the console before confirmation, while the model summary
+  remains preserved for provenance. Confirmation activates a new merged version; rejection or
+  failure leaves the current experience untouched.
+- **困难步骤自动升级** starts with the selected runtime model and effort, then temporarily steps
+  up both after an unknown semantic stage, low-confidence plan, or failed motor action. A recovered
+  high-confidence stage returns to the selected fast profile.
+- **阶段批量执行** asks for up to 12 actions per model turn, while respecting semantic stage
+  boundaries and observation-dependent branches. Live logs show each batch, interruption point,
+  discarded suffix, and immediate replan; saved feedback runs show average actions per batch and
+  interruption counts so speed improvements are measurable.
+- **本地视觉检查** extends planned waits only until the window becomes stable, then verifies that
+  the preceding click/drag region actually changed. The feedback-run card shows checkpoint and
+  failure counts; a failed checkpoint enters the same bounded replanning path as a motor exception.
+- **后台执行** sends directed mouse, keyboard, and text messages without taking focus. The target
+  must stay visible and unminimized, support background capture, and accept Win32 messages. Games,
+  emulators, Raw Input, DirectInput, and GPU-only windows may reject it and should use foreground.
 - **开始执行** requires a confirmed task pack, shows an explicit confirmation, and retains F9 as
   the emergency stop.
 - **录制经验** lists visible local windows, selects the Compiler Agent model and effort, starts a
-  human demonstration, and uses `F8` to mark success or `F9` to cancel. A successful trace is
-  compiled automatically into a draft motor task and semantic experience.
+  human demonstration, and uses `F8` to mark success or `F9` to cancel. Optional narrated recording
+  captures the microphone plus a temporary browser transcript; after F8 local Whisper Turbo
+  replaces that draft with a stronger editable transcript. The first run downloads about 1.6 GB of
+  model data. Audio remains in the raw recording archive, while the task pack receives only the
+  compact transcript confirmed for the Compiler Agent.
 - **本地经验** lists both task packs and raw recordings. It can open their folders in Explorer,
-  confirm reviewed drafts, and upgrade legacy WeChat examples with reusable messaging actions.
-- A successful executed run is saved under `runs/candidates/` as a **待审核候选经验**, including
+  confirm reviewed drafts, inspect the active human-guidance summary and every loaded rule, and
+  upgrade legacy WeChat examples with reusable messaging actions. New recording names are unique
+  across raw recordings and task experiences; compilation also rejects a different Trace that
+  would create a duplicate task name.
+- An executed run that produced a trace is saved under `runs/candidates/` as a **可反馈运行**, including
   its source Trace, runtime instruction, execution trace, selection rationale, and run metrics. It
-  never changes or promotes a confirmed task pack automatically.
+  never changes or promotes a confirmed task pack automatically. Recording and feedback-run cards
+  show their local creation time so same-named legacy assets remain distinguishable and deletable.
 - Only one desktop-control job can run at a time. Job state and progress logs are polled in the
   browser while the Python service owns execution.
 - The server always binds to `127.0.0.1`; it has no LAN-facing mode or remote authentication.
@@ -192,6 +278,8 @@ under `taskpacks/generated/` containing:
 ├── compiler-report.json
 ├── demonstration.json       # Windows task packs
 ├── experience.yaml          # V0.7 replaceable semantic interpretation
+├── guidance.yaml            # V0.8 active confirmed human tricks
+├── guidance-revisions/      # V0.8 accepted guidance history
 └── reference/
     ├── metadata.json
     ├── trace.jsonl
