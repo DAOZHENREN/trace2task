@@ -319,6 +319,8 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
         "runtime_agent_decides"
     )
     assert "single trajectory does not prove a general strategy" in calls[0]["prompt"]
+    assert "Multi-action batching, plan horizon" in calls[0]["prompt"]
+    assert "do not encode them" in calls[0]["prompt"]
     assert "先打开入口" in calls[0]["prompt"]
     assert "等待切换，再完成确认并回到起点" not in calls[0]["prompt"]
     assert '"start_ms":0.0' in calls[0]["prompt"]
@@ -335,3 +337,106 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert confirmed.review_status == "confirmed"
     assert confirmed_experience["review"]["status"] == "confirmed"
     assert load_windows_task(task_path).semantic_experience is not None
+
+
+def test_compiler_separates_trace_episodes_from_non_linear_runtime_graph(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_taskpack(tmp_path)
+    response = _semantic_response()
+    response["state_graph"] = {
+        "entry_state_id": "ready",
+        "states": [
+            {
+                "id": "ready",
+                "name": "准备操作",
+                "description": "目标入口可见。",
+                "preconditions": ["目标入口可见"],
+                "visual_anchors": ["入口"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.9,
+            },
+            {
+                "id": "choose",
+                "name": "动态选择",
+                "description": "运行时选项可见。",
+                "preconditions": ["选项已经出现"],
+                "visual_anchors": ["可选项"],
+                "evidence_stage_ids": ["finish_target"],
+                "confidence": 0.8,
+            },
+        ],
+        "transitions": [
+            {
+                "id": "ready_to_choose",
+                "source_state_id": "ready",
+                "target_type": "state",
+                "target_id": "choose",
+                "condition": "入口已触发且选项出现。",
+                "action_goal": "打开选项界面。",
+                "expected_effects": ["选项可见"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.9,
+            },
+            {
+                "id": "choose_to_ready",
+                "source_state_id": "choose",
+                "target_type": "state",
+                "target_id": "ready",
+                "condition": "选择无效且入口重新出现。",
+                "action_goal": "回到入口重新判断。",
+                "expected_effects": ["入口重新可见"],
+                "evidence_stage_ids": ["open_target", "finish_target"],
+                "confidence": 0.7,
+            },
+            {
+                "id": "choose_to_success",
+                "source_state_id": "choose",
+                "target_type": "terminal",
+                "target_id": "success",
+                "condition": "完成界面可见。",
+                "action_goal": "停止执行。",
+                "expected_effects": ["任务完成"],
+                "evidence_stage_ids": ["finish_target"],
+                "confidence": 0.95,
+            },
+        ],
+        "terminals": [
+            {
+                "id": "success",
+                "kind": "success",
+                "name": "任务完成",
+                "condition": "完成界面可见。",
+                "visual_anchors": ["完成界面"],
+                "evidence_frame": "reference/frames/0003.png",
+                "confidence": 0.95,
+            }
+        ],
+    }
+
+    result = compile_windows_semantic_experience(
+        task_path,
+        binary_resolver=lambda requested: requested,
+        session_factory=lambda executable, **kwargs: FakeSession(
+            executable,
+            responses=iter([response]),
+            calls=[],
+            **kwargs,
+        ),
+    )
+    experience = load_windows_task(task_path).semantic_experience
+    document = yaml.safe_load(
+        (task_path.parent / "experience.yaml").read_text(encoding="utf-8")
+    )
+
+    assert result.stage_count == 2
+    assert experience is not None
+    assert experience.state_ids == ("ready", "choose")
+    assert any(
+        edge.source_state_id == "choose" and edge.target_id == "ready"
+        for edge in experience.transitions
+    )
+    assert experience.terminal_ids == ("success",)
+    assert document["schema_version"] == "0.4"
+    assert document["stages"][0]["id"] == "open_target"
+    assert document["state_graph"]["states"][0]["id"] == "ready"

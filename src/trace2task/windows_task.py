@@ -141,6 +141,20 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
             raise ValueError(
                 "Windows semantic_experience.stage_count does not match experience.yaml"
             )
+        declared_states = semantic_mapping.get("state_count")
+        if declared_states is not None and declared_states != len(
+            semantic_experience.states
+        ):
+            raise ValueError(
+                "Windows semantic_experience.state_count does not match experience.yaml"
+            )
+        declared_transitions = semantic_mapping.get("transition_count")
+        if declared_transitions is not None and declared_transitions != len(
+            semantic_experience.transitions
+        ):
+            raise ValueError(
+                "Windows semantic_experience.transition_count does not match experience.yaml"
+            )
         if task.requires_confirmation != semantic_experience.requires_confirmation:
             raise ValueError(
                 "Task pack and semantic experience confirmation states do not match"
@@ -156,11 +170,16 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
             guidance_mapping.get("path"),
             "human_guidance.path",
         )
-        stage_ids = {stage.stage_id for stage in semantic_experience.stages}
+        stage_ids = set(semantic_experience.state_ids)
         human_guidance = load_human_guidance(
             guidance_path,
             task_id=task.task_id,
             stage_ids=stage_ids,
+            transition_ids={
+                transition.transition_id
+                for transition in semantic_experience.transitions
+            },
+            terminal_ids=set(semantic_experience.terminal_ids),
         )
         if guidance_mapping.get("revision") != human_guidance.revision:
             raise ValueError("Windows human_guidance.revision does not match guidance.yaml")

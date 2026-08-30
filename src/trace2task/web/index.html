@@ -233,14 +233,17 @@
               <button class="text-button" id="refresh-library" type="button">刷新</button>
             </div>
 
-            <div class="compiler-settings-panel">
+            <details class="compiler-settings-panel compact-settings-panel">
+              <summary>
+                <span>经验模型设置（教师 / 教练）</span>
+                <small id="experience-model-summary">Sol · 最强 / High · 深入</small>
+              </summary>
               <div class="compiler-settings-copy">
-                <strong>经验编译模型（教师）</strong>
-                <p>强模型只在把 Trace 编译为语义经验时调用；执行模型在“执行任务”页单独选择。</p>
+                <p>同一套模型同时用于 Trace 编译、人工反馈融合和任务状态图修订；执行模型仍在“执行任务”页单独选择。</p>
               </div>
               <div class="agent-settings compiler-agent-settings">
                 <div>
-                  <label class="field-label" for="compiler-model">Compiler Agent 模型</label>
+                  <label class="field-label" for="compiler-model">经验 Agent 模型</label>
                   <div class="select-wrap">
                     <select id="compiler-model"></select>
                   </div>
@@ -252,28 +255,7 @@
                   </div>
                 </div>
               </div>
-            </div>
-
-            <div class="compiler-settings-panel revision-settings-panel">
-              <div class="compiler-settings-copy">
-                <strong>经验修订模型（教练）</strong>
-                <p>结合本次运行和你的反馈生成 trick 草稿；确认前不会修改正在使用的经验。</p>
-              </div>
-              <div class="agent-settings compiler-agent-settings">
-                <div>
-                  <label class="field-label" for="revision-model">Revision Agent 模型</label>
-                  <div class="select-wrap">
-                    <select id="revision-model"></select>
-                  </div>
-                </div>
-                <div>
-                  <label class="field-label" for="revision-reasoning-effort">修订思考强度</label>
-                  <div class="select-wrap">
-                    <select id="revision-reasoning-effort"></select>
-                  </div>
-                </div>
-              </div>
-            </div>
+            </details>
 
             <div class="library-heading">
               <h3>任务经验</h3>
@@ -345,6 +327,20 @@
             </div>
           </section>
         </div>
+
+        <section class="card task-detail-card hidden" id="task-detail-panel" aria-live="polite">
+          <div class="task-detail-heading">
+            <button class="text-button task-detail-back" id="task-detail-back" type="button">← 返回任务经验</button>
+            <div>
+              <p class="section-kicker">任务经验详情</p>
+              <h2 id="task-detail-title">—</h2>
+              <p id="task-detail-meta"></p>
+            </div>
+          </div>
+          <div class="library-tags task-detail-tags" id="task-detail-tags"></div>
+          <div class="task-detail-body" id="task-detail-body"></div>
+          <div class="library-actions task-detail-actions" id="task-detail-actions"></div>
+        </section>
       </main>
 
       <footer>

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -32,7 +33,12 @@ from trace2task.codex_app_server import (
 )
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.experience import route_experience
-from trace2task.narration import archive_narration, save_narration_audio
+from trace2task.narration import (
+    MAX_NARRATION_AUDIO_BYTES,
+    NARRATION_AUDIO_EXTENSIONS,
+    archive_narration,
+    save_narration_audio,
+)
 from trace2task.speech_transcription import TurboTranscriber
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import Win32Backend, WindowSelector, list_window_records
@@ -46,15 +52,23 @@ from trace2task.windows_guidance import (
     DEFAULT_REVISION_REASONING_EFFORT,
     activate_guidance_revision,
     compile_guidance_revision,
+    guidance_scope_payload,
     update_guidance_proposal_summary,
 )
 from trace2task.windows_recording import InputSnapshot, Win32InputMonitor, record_window_trace
 from trace2task.windows_runner import (
     EmergencyStopRequested,
     Win32EmergencyStop,
+    WindowsAgentRunFailed,
     run_windows_agent,
 )
 from trace2task.windows_task import WINDOWS_ADAPTER, load_windows_task
+from trace2task.windows_task_model import (
+    DEFAULT_TASK_MODEL_REVISION_MODEL,
+    DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT,
+    activate_task_model_revision,
+    compile_task_model_revision,
+)
 
 MAX_REQUEST_BYTES = 16_384
 MAX_NARRATION_REQUEST_BYTES = 30 * 1024 * 1024
@@ -91,9 +105,13 @@ def _decode_narration_audio(value: object) -> bytes | None:
 def _guidance_rule_record(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
+    try:
+        scope = guidance_scope_payload(value)
+    except (TypeError, ValueError):
+        return None
     return {
         "id": str(value.get("id") or ""),
-        "stage_id": str(value.get("stage_id") or ""),
+        "scope": scope,
         "when": str(value.get("when") or ""),
         "prefer": str(value.get("prefer") or ""),
         "avoid": [str(item) for item in value.get("avoid", []) if isinstance(item, str)],
@@ -136,7 +154,7 @@ def _guidance_history(active_path: Path, *, task_id: str) -> list[dict[str, Any]
                     "operation": str(operation.get("operation") or ""),
                     "target_rule_id": str(operation.get("target_rule_id") or ""),
                     "result_rule_id": str(operation.get("result_rule_id") or ""),
-                    "stage_id": str(operation.get("stage_id") or ""),
+                    "scope": guidance_scope_payload(operation),
                     "reason": str(operation.get("reason") or ""),
                 }
                 for operation in raw_operations
@@ -176,6 +194,47 @@ def _guidance_history(active_path: Path, *, task_id: str) -> list[dict[str, Any]
         )
         if active_revision is not None:
             revisions[active_revision]["is_active"] = True
+    return [revisions[revision] for revision in sorted(revisions, reverse=True)]
+
+
+def _task_model_history(active_path: Path) -> list[dict[str, Any]]:
+    revision_dir = active_path.parent / "experience-revisions"
+    paths = list(revision_dir.glob("revision-*.yaml")) if revision_dir.is_dir() else []
+    paths.append(active_path)
+    revisions: dict[int, dict[str, Any]] = {}
+    for path in paths:
+        try:
+            root = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(root, dict):
+            continue
+        revision_data = (
+            root.get("task_model_revision")
+            if isinstance(root.get("task_model_revision"), dict)
+            else {}
+        )
+        revision = revision_data.get("revision", 0)
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            continue
+        graph = root.get("state_graph") if isinstance(root.get("state_graph"), dict) else {}
+        legacy_stage_count = len(root.get("stages", []))
+        state_count = len(graph.get("states", [])) or legacy_stage_count
+        transition_count = len(graph.get("transitions", [])) or legacy_stage_count
+        terminal_count = len(graph.get("terminals", [])) or (1 if legacy_stage_count else 0)
+        operations = revision_data.get("operations")
+        revisions[revision] = {
+            "revision": revision,
+            "parent_revision": revision_data.get("parent_revision"),
+            "summary": str(root.get("summary") or ""),
+            "state_count": state_count,
+            "transition_count": transition_count,
+            "terminal_count": terminal_count,
+            "operations": operations if isinstance(operations, list) else [],
+            "feedback": str(revision_data.get("feedback") or ""),
+            "confirmed_at": str(revision_data.get("confirmed_at") or ""),
+            "is_active": path.resolve() == active_path.resolve(),
+        }
     return [revisions[revision] for revision in sorted(revisions, reverse=True)]
 
 
@@ -398,8 +457,60 @@ class WebConsoleController:
                                 "model": semantic.model,
                                 "reasoning_effort": semantic.reasoning_effort,
                                 "stage_count": len(semantic.stages),
+                                "state_count": len(semantic.states),
+                                "transition_count": len(semantic.transitions),
+                                "terminal_count": len(semantic.terminal_states),
+                                "entry_state_id": semantic.entry_state_id,
+                                "revision": int(
+                                    (
+                                        yaml.safe_load(path.read_text(encoding="utf-8"))
+                                        .get("semantic_experience", {})
+                                        .get("revision", 0)
+                                    )
+                                    or 0
+                                ),
+                                "history": _task_model_history(semantic.source_path),
                                 "motor_policy": "semantic_intent_only_no_recorded_coordinates",
                                 "narration_claims": semantic.narration_audit_payload(),
+                                "states": [
+                                    {
+                                        "id": state.state_id,
+                                        "name": state.name,
+                                        "description": state.description,
+                                        "preconditions": list(state.preconditions),
+                                        "visual_anchors": list(state.visual_anchors),
+                                        "evidence_stage_ids": list(
+                                            state.evidence_stage_ids
+                                        ),
+                                        "confidence": state.confidence,
+                                        "outgoing": [
+                                            {
+                                                "id": transition.transition_id,
+                                                "target_type": transition.target_type,
+                                                "target_id": transition.target_id,
+                                                "condition": transition.condition,
+                                                "action_goal": transition.action_goal,
+                                            }
+                                            for transition in semantic.outgoing_transitions(
+                                                state.state_id
+                                            )
+                                        ],
+                                    }
+                                    for state in semantic.states
+                                ],
+                                "terminals": [
+                                    {
+                                        "id": terminal.terminal_id,
+                                        "kind": terminal.kind,
+                                        "name": terminal.name,
+                                        "condition": terminal.condition,
+                                        "visual_anchors": list(
+                                            terminal.visual_anchors
+                                        ),
+                                        "confidence": terminal.confidence,
+                                    }
+                                    for terminal in semantic.terminal_states
+                                ],
                                 "stages": [
                                     {
                                         "id": stage.stage_id,
@@ -456,7 +567,10 @@ class WebConsoleController:
                                 "rules": [
                                     {
                                         "id": rule.rule_id,
-                                        "stage_id": rule.stage_id,
+                                        "scope": {
+                                            "type": rule.scope_type,
+                                            "id": rule.scope_id,
+                                        },
                                         "when": rule.when,
                                         "prefer": rule.prefer,
                                         "avoid": list(rule.avoid),
@@ -563,6 +677,11 @@ class WebConsoleController:
             }:
                 continue
             revision = data.get("revision") if isinstance(data.get("revision"), dict) else None
+            task_model_revision = (
+                data.get("task_model_revision")
+                if isinstance(data.get("task_model_revision"), dict)
+                else None
+            )
             records.append(
                 (
                     path.stat().st_mtime,
@@ -577,6 +696,7 @@ class WebConsoleController:
                         "outcome": data.get("outcome") or {},
                         "metrics": data.get("metrics") or {},
                         "revision": revision,
+                        "task_model_revision": task_model_revision,
                         "local_path": path.parent.relative_to(
                             self.project_root
                         ).as_posix(),
@@ -799,6 +919,40 @@ class WebConsoleController:
             "job": job.snapshot(),
             "transcription": asdict(transcription),
         }
+
+    def transcribe_dictation(
+        self,
+        *,
+        audio_base64: object,
+        mime_type: object,
+        context: object = "",
+    ) -> dict[str, Any]:
+        audio = _decode_narration_audio(audio_base64)
+        if not audio:
+            raise ValueError("没有可供语音输入转写的音频")
+        if len(audio) > MAX_NARRATION_AUDIO_BYTES:
+            raise ValueError(
+                f"语音输入音频不能超过 {MAX_NARRATION_AUDIO_BYTES} 字节"
+            )
+        if not isinstance(mime_type, str) or mime_type not in NARRATION_AUDIO_EXTENSIONS:
+            raise ValueError("语音输入音频格式不受支持")
+        if not isinstance(context, str):
+            raise TypeError("语音输入上下文必须是字符串")
+        normalized_context = " ".join(context.split())[:500]
+        suffix = NARRATION_AUDIO_EXTENSIONS[mime_type]
+        with tempfile.TemporaryDirectory(prefix="trace2task-dictation-") as directory:
+            audio_path = Path(directory) / f"dictation{suffix}"
+            audio_path.write_bytes(audio)
+            transcription = self.narration_transcriber.transcribe(
+                audio_path,
+                cache_dir=self.project_root / ".cache" / "faster-whisper",
+                initial_prompt=(
+                    "这是 Trace2Task 中文桌面 Agent 控制台的语音输入，可能包含任务指令、"
+                    "应用名、人名、游戏术语、操作反馈和界面状态。"
+                    + (f" 当前输入框用途：{normalized_context}。" if normalized_context else "")
+                ),
+            )
+        return {"transcription": asdict(transcription)}
 
     def submit_recording_narration(
         self,
@@ -1033,7 +1187,79 @@ class WebConsoleController:
                 self.project_root,
                 candidate_path,
                 task_id=contract.task.task_id,
-                stage_ids={stage.stage_id for stage in contract.semantic_experience.stages},
+                stage_ids=set(contract.semantic_experience.state_ids),
+                transition_ids={
+                    transition.transition_id
+                    for transition in contract.semantic_experience.transitions
+                },
+                terminal_ids=set(contract.semantic_experience.terminal_ids),
+            )
+            load_windows_task(task_path)
+            return result
+
+    def start_task_model_revision(
+        self,
+        raw_path: str,
+        feedback: str,
+        *,
+        model: str = DEFAULT_TASK_MODEL_REVISION_MODEL,
+        reasoning_effort: str = DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT,
+    ) -> dict[str, Any]:
+        candidate_path = self._resolve_candidate_manifest(raw_path)
+        normalized_feedback = " ".join(feedback.split())
+        if not normalized_feedback:
+            raise ValueError("请输入要修正的阶段、状态、转移或结束条件")
+        if len(normalized_feedback) > 2_000:
+            raise ValueError("任务结构反馈不能超过 2000 个字符")
+        if model not in CODEX_MODELS:
+            raise ValueError(f"不支持的模型：{model}")
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+        if not isinstance(candidate, dict):
+            raise TypeError("候选经验格式无效")
+        task_path = self._resolve_task_path(str(candidate.get("source_task") or ""))
+        contract = load_windows_task(task_path)
+        if contract.semantic_experience is None:
+            raise ValueError("这份任务还没有可修订的语义任务模型")
+        with self._lock:
+            self._require_idle()
+            job = ConsoleJob(
+                job_id=uuid.uuid4().hex,
+                task_path=task_path.relative_to(self.project_root).as_posix(),
+                task_id=contract.task.task_id,
+                instruction=normalized_feedback,
+                mode="task_model_revision",
+                kind="task_model_revision",
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            job.logs.append(
+                "结构反馈已接收，Task Model Revision Agent 正在生成有向状态图草稿。"
+            )
+            self._jobs[job.job_id] = job
+            self._active_job_id = job.job_id
+        thread = threading.Thread(
+            target=self._run_task_model_revision,
+            args=(job, candidate_path, task_path),
+            name=f"trace2task-task-model-{job.job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return job.snapshot()
+
+    def confirm_task_model_revision(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            candidate_path = self._resolve_candidate_manifest(raw_path)
+            candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
+            if not isinstance(candidate, dict):
+                raise TypeError("候选经验格式无效")
+            task_path = self._resolve_task_path(str(candidate.get("source_task") or ""))
+            result = activate_task_model_revision(
+                self.project_root,
+                candidate_path,
+                task_path,
             )
             load_windows_task(task_path)
             return result
@@ -1261,11 +1487,31 @@ class WebConsoleController:
         target_contract = load_windows_task(target_task)
         if source_contract.human_guidance is None or target_contract.semantic_experience is None:
             return None
-        target_stage_ids = {
-            stage.stage_id for stage in target_contract.semantic_experience.stages
+        target_scope_ids = {
+            "state": set(target_contract.semantic_experience.state_ids),
+            "transition": {
+                transition.transition_id
+                for transition in target_contract.semantic_experience.transitions
+            },
+            "terminal": set(target_contract.semantic_experience.terminal_ids),
         }
         source_guidance = source_contract.human_guidance.source_path
         target_guidance = target_contract.human_guidance
+
+        def scope_is_supported(value: dict[str, Any]) -> bool:
+            try:
+                scope = guidance_scope_payload(value)
+            except (TypeError, ValueError):
+                return False
+            return scope["type"] == "global" or scope["id"] in target_scope_ids.get(
+                scope["type"], set()
+            )
+
+        def canonical_scoped_copy(value: dict[str, Any]) -> dict[str, Any]:
+            copied = deepcopy(value)
+            copied["scope"] = guidance_scope_payload(value)
+            copied.pop("stage_id", None)
+            return copied
 
         def inherited_document(path: Path) -> dict[str, Any] | None:
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -1273,10 +1519,10 @@ class WebConsoleController:
                 return None
             document = deepcopy(raw)
             rules = [
-                deepcopy(rule)
+                canonical_scoped_copy(rule)
                 for rule in document.get("rules", [])
                 if isinstance(rule, dict)
-                and rule.get("stage_id") in target_stage_ids | {"global"}
+                and scope_is_supported(rule)
             ]
             if not rules:
                 return None
@@ -1285,10 +1531,10 @@ class WebConsoleController:
             operations = document.get("operations")
             if isinstance(operations, list):
                 document["operations"] = [
-                    operation
+                    canonical_scoped_copy(operation)
                     for operation in operations
                     if isinstance(operation, dict)
-                    and operation.get("stage_id") in target_stage_ids | {"global"}
+                    and scope_is_supported(operation)
                 ]
             document["inheritance"] = {
                 "family_id": family_id,
@@ -1436,6 +1682,79 @@ class WebConsoleController:
                 trash_root=self.task_root / ".trash",
                 kind="taskpack",
             )
+
+    def delete_human_guidance(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            task_path = self._resolve_task_path(raw_path)
+            task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+            if not isinstance(task, dict):
+                raise TypeError("任务经验格式无效")
+            pointer = task.get("human_guidance")
+            if pointer is None:
+                raise ValueError("这份任务没有可删除的人工反馈经验")
+            if not isinstance(pointer, dict):
+                raise TypeError("人工反馈经验配置格式无效")
+            raw_guidance_path = pointer.get("path")
+            if not isinstance(raw_guidance_path, str) or not raw_guidance_path.strip():
+                raise ValueError("人工反馈经验路径无效")
+            task_dir = task_path.parent.resolve()
+            guidance_path = (task_dir / raw_guidance_path).resolve()
+            if (
+                not guidance_path.is_relative_to(task_dir)
+                or not guidance_path.is_file()
+            ):
+                raise ValueError("人工反馈经验不在当前任务目录中")
+
+            trash_root = self.task_root / ".trash" / "guidance"
+            trash_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+            destination = trash_root / f"{stamp}-{task_dir.name}"
+            destination.mkdir()
+            revisions_path = task_dir / "guidance-revisions"
+            moved: list[tuple[Path, Path]] = []
+            try:
+                trashed_guidance = destination / guidance_path.name
+                guidance_path.replace(trashed_guidance)
+                moved.append((trashed_guidance, guidance_path))
+                if revisions_path.is_dir():
+                    trashed_revisions = destination / revisions_path.name
+                    revisions_path.replace(trashed_revisions)
+                    moved.append((trashed_revisions, revisions_path))
+                (destination / "restore.json").write_text(
+                    json.dumps(
+                        {
+                            "kind": "human_guidance",
+                            "task_path": task_path.relative_to(self.project_root).as_posix(),
+                            "guidance_pointer": pointer,
+                            "deleted_at": _now(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                task.pop("human_guidance", None)
+                temporary = task_path.with_suffix(f"{task_path.suffix}.tmp")
+                temporary.write_text(
+                    yaml.safe_dump(task, sort_keys=False, allow_unicode=True, width=100),
+                    encoding="utf-8",
+                )
+                temporary.replace(task_path)
+            except Exception:
+                for trashed, original in reversed(moved):
+                    if trashed.exists() and not original.exists():
+                        trashed.replace(original)
+                shutil.rmtree(destination, ignore_errors=True)
+                raise
+            load_windows_task(task_path)
+            return {
+                "deleted": True,
+                "kind": "human_guidance",
+                "task_path": task_path.relative_to(self.project_root).as_posix(),
+                "trash_path": destination.relative_to(self.project_root).as_posix(),
+                "recoverable": True,
+            }
 
     def delete_recording(self, raw_path: str) -> dict[str, Any]:
         with self._lock:
@@ -1793,6 +2112,51 @@ class WebConsoleController:
                 log=f"修订失败：{type(error).__name__}: {error}",
             )
 
+    def _run_task_model_revision(
+        self,
+        job: ConsoleJob,
+        candidate_path: Path,
+        task_path: Path,
+    ) -> None:
+        self._update(
+            job,
+            status="running",
+            log="正在对照原始 Trace 片段、当前状态图、运行日志与人工结构反馈。",
+        )
+        try:
+            contract = load_windows_task(task_path)
+            experience = contract.semantic_experience
+            if experience is None:
+                raise ValueError("这份任务还没有语义经验")
+            result = compile_task_model_revision(
+                self.project_root,
+                candidate_path,
+                task_path,
+                experience=experience,
+                reference_frame=contract.reference_frame,
+                feedback=job.instruction,
+                model=job.model,
+                reasoning_effort=job.reasoning_effort,
+            )
+            message = (
+                "任务状态图草稿已生成，但存在 Guidance 映射冲突，暂不能确认。"
+                if result.blocking_issue_count
+                else "任务状态图草稿与结构差异已生成；确认前不会影响当前任务。"
+            )
+            self._update(
+                job,
+                status="completed",
+                result=_jsonable(result),
+                log=message,
+            )
+        except Exception as error:  # noqa: BLE001 - expose revision failure in UI
+            self._update(
+                job,
+                status="failed",
+                error=f"{type(error).__name__}: {error}",
+                log=f"任务结构修订失败：{type(error).__name__}: {error}",
+            )
+
     def _run_job(self, job: ConsoleJob, task_path: Path, execute: bool) -> None:
         self._update(job, status="running", log="任务已启动。")
         try:
@@ -1809,7 +2173,12 @@ class WebConsoleController:
             }
             if execute and self.runner is run_windows_agent:
                 kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
-            result = self.runner(task_path, **kwargs)
+            run_failure: Exception | None = None
+            try:
+                result = self.runner(task_path, **kwargs)
+            except WindowsAgentRunFailed as error:
+                result = error.result
+                run_failure = error.cause
             payload = _jsonable(result)
             if not isinstance(payload, dict):
                 payload = {"value": payload}
@@ -1833,6 +2202,16 @@ class WebConsoleController:
                             job,
                             log=f"本次{outcome_label}已保存为待反馈运行。",
                         )
+            if run_failure is not None:
+                error_text = f"{type(run_failure).__name__}: {run_failure}"
+                self._update(
+                    job,
+                    status="failed",
+                    result=payload,
+                    error=error_text,
+                    log=f"运行失败：{error_text}",
+                )
+                return
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
             self._update(job, status=final_status, result=payload, log="任务运行结束。")
         except Exception as error:  # noqa: BLE001 - job failures must become UI state
@@ -1866,6 +2245,13 @@ class WebConsoleController:
         candidate_dir = self.candidate_root / directory_name
         candidate_dir.mkdir(parents=True, exist_ok=False)
         candidate_id = f"candidate-{job.job_id[:12]}"
+        outcome = {
+            "task_complete": payload.get("task_complete") is True,
+            "stop_reason": payload.get("stop_reason"),
+        }
+        failure_message = payload.get("failure_message")
+        if isinstance(failure_message, str) and failure_message.strip():
+            outcome["failure_message"] = failure_message.strip()
         manifest = {
             "schema_version": "0.1",
             "candidate_id": candidate_id,
@@ -1879,10 +2265,7 @@ class WebConsoleController:
             "reasoning_effort": job.reasoning_effort,
             "input_mode": "background" if job.background else "foreground",
             "adaptive_reasoning": job.adaptive_reasoning,
-            "outcome": {
-                "task_complete": payload.get("task_complete") is True,
-                "stop_reason": payload.get("stop_reason"),
-            },
+            "outcome": outcome,
             "selection": {
                 "mode": job.selection_mode,
                 "confidence": job.selection_confidence,
@@ -1963,6 +2346,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "narration_claim_audit": True,
                         "coordinate_isolation": True,
                         "experience_family_inheritance": True,
+                        "directed_task_graph": True,
+                        "task_model_revision": True,
+                        "task_model_history": True,
+                        "graph_native_guidance": True,
+                        "independent_guidance_delete": True,
+                        "system_multi_action_planning": True,
+                        "voice_dictation": True,
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
@@ -1982,6 +2372,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "revision_defaults": {
                             "model": DEFAULT_REVISION_MODEL,
                             "reasoning_effort": DEFAULT_REVISION_REASONING_EFFORT,
+                        },
+                        "task_model_revision_defaults": {
+                            "model": DEFAULT_TASK_MODEL_REVISION_MODEL,
+                            "reasoning_effort": (
+                                DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT
+                            ),
                         },
                     },
                 }
@@ -2032,7 +2428,11 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 max_bytes=(
                     MAX_NARRATION_REQUEST_BYTES
                     if parsed.path
-                    in {"/api/recordings/narration", "/api/recordings/transcribe"}
+                    in {
+                        "/api/recordings/narration",
+                        "/api/recordings/transcribe",
+                        "/api/transcribe",
+                    }
                     else MAX_REQUEST_BYTES
                 )
             )
@@ -2091,6 +2491,15 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     )
                 )
                 return
+            if parsed.path == "/api/transcribe":
+                self._json(
+                    self.controller.transcribe_dictation(
+                        audio_base64=payload.get("audio_base64"),
+                        mime_type=payload.get("mime_type"),
+                        context=payload.get("context", ""),
+                    )
+                )
+                return
             if parsed.path == "/api/taskpacks/upgrade":
                 self._json(self.controller.upgrade_taskpack(payload.get("task_path", "")))
                 return
@@ -2114,6 +2523,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/taskpacks/delete":
                 self._json(self.controller.delete_taskpack(payload.get("task_path", "")))
                 return
+            if parsed.path == "/api/taskpacks/guidance/delete":
+                self._json(
+                    self.controller.delete_human_guidance(
+                        payload.get("task_path", "")
+                    )
+                )
+                return
             if parsed.path == "/api/recordings/delete":
                 self._json(
                     self.controller.delete_recording(payload.get("trace_path", ""))
@@ -2135,6 +2551,29 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         ),
                     ),
                     status=HTTPStatus.ACCEPTED,
+                )
+                return
+            if parsed.path == "/api/candidates/task-model/revise":
+                self._json(
+                    self.controller.start_task_model_revision(
+                        payload.get("path", ""),
+                        payload.get("feedback", ""),
+                        model=payload.get(
+                            "model", DEFAULT_TASK_MODEL_REVISION_MODEL
+                        ),
+                        reasoning_effort=payload.get(
+                            "reasoning_effort",
+                            DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT,
+                        ),
+                    ),
+                    status=HTTPStatus.ACCEPTED,
+                )
+                return
+            if parsed.path == "/api/candidates/task-model/confirm":
+                self._json(
+                    self.controller.confirm_task_model_revision(
+                        payload.get("path", "")
+                    )
                 )
                 return
             if parsed.path == "/api/candidates/revisions/confirm":

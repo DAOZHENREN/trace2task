@@ -21,7 +21,9 @@ from trace2task.windows_agent import (
 )
 from trace2task.windows_control import WindowInfo
 from trace2task.windows_runner import (
+    LOCAL_WAIT_UNTIL_MAX_EXTRA_MS,
     EmergencyStopRequested,
+    WindowsAgentRunFailed,
     run_windows_agent,
 )
 from trace2task.windows_task import load_windows_task
@@ -257,6 +259,90 @@ def _add_followup_semantic_stage(task_path: Path) -> None:
     task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
 
 
+def _replace_linear_stage_with_directed_state_graph(task_path: Path) -> None:
+    experience_path = task_path.with_name("experience.yaml")
+    experience = yaml.safe_load(experience_path.read_text(encoding="utf-8"))
+    experience["schema_version"] = "0.4"
+    experience["state_graph"] = {
+        "entry_state_id": "ready",
+        "states": [
+            {
+                "id": "ready",
+                "name": "Ready",
+                "description": "The target is ready for an interaction.",
+                "preconditions": ["The visible target is ready"],
+                "visual_anchors": ["Visible target"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.9,
+            },
+            {
+                "id": "retry",
+                "name": "Retry",
+                "description": "The target remains closed after an attempt.",
+                "preconditions": ["The target is still closed"],
+                "visual_anchors": ["Visible target"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.75,
+            },
+        ],
+        "transitions": [
+            {
+                "id": "ready_to_retry",
+                "source_state_id": "ready",
+                "target_type": "state",
+                "target_id": "retry",
+                "condition": "The first attempt has no visible effect.",
+                "action_goal": "Check and retry the target.",
+                "expected_effects": ["The target reacts"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.75,
+            },
+            {
+                "id": "retry_to_ready",
+                "source_state_id": "retry",
+                "target_type": "state",
+                "target_id": "ready",
+                "condition": "The ready target is visible again.",
+                "action_goal": "Return to the ready state.",
+                "expected_effects": ["The ready target is recognized"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.75,
+            },
+            {
+                "id": "retry_to_success",
+                "source_state_id": "retry",
+                "target_type": "terminal",
+                "target_id": "success",
+                "condition": "The target is visibly open.",
+                "action_goal": "Stop after verification.",
+                "expected_effects": ["The task is complete"],
+                "evidence_stage_ids": ["open_target"],
+                "confidence": 0.9,
+            },
+        ],
+        "terminals": [
+            {
+                "id": "success",
+                "kind": "success",
+                "name": "Complete",
+                "condition": "The target is visibly open.",
+                "visual_anchors": ["Open target content"],
+                "evidence_frame": "reference/frames/after.png",
+                "confidence": 0.9,
+            }
+        ],
+    }
+    experience_path.write_text(
+        yaml.safe_dump(experience, sort_keys=False),
+        encoding="utf-8",
+    )
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["semantic_experience"].update(
+        {"state_count": 2, "transition_count": 3, "terminal_count": 1}
+    )
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+
+
 class FakeSession:
     def __init__(
         self,
@@ -445,6 +531,19 @@ class ColorSequenceCapture:
 
     def capture(self, window: WindowInfo) -> pygame.Surface:
         color = self.colors[min(self.calls, len(self.colors) - 1)]
+        self.calls += 1
+        surface = pygame.Surface((window.client_width, window.client_height))
+        surface.fill(color)
+        return surface
+
+
+class CyclingColorCapture:
+    def __init__(self, colors: list[tuple[int, int, int]]) -> None:
+        self.colors = colors
+        self.calls = 0
+
+    def capture(self, window: WindowInfo) -> pygame.Surface:
+        color = self.colors[self.calls % len(self.colors)]
         self.calls += 1
         surface = pygame.Surface((window.client_width, window.client_height))
         surface.fill(color)
@@ -788,11 +887,11 @@ def test_codex_windows_agent_returns_a_complete_stage_program_by_default(
     assert plan.expected_end_state == "The target content is open."
     assert plan.abort_conditions == ("The target disappears",)
     assert calls[0]["schema"]["properties"]["actions"]["maxItems"] == 12
-    assert "one complete stage program" in calls[0]["prompt"]
     assert "adaptive local visual checkpoint" in calls[0]["prompt"]
-    assert "do not spend a model turn only checking" in calls[0]["prompt"]
-    assert "Target 5 to 8 adjacent reviewed actions" in calls[0]["prompt"]
-    assert "Never return a one-action wait-only program" in calls[0]["prompt"]
+    assert "System multi-action planning policy" in calls[0]["prompt"]
+    assert "executor policy, not task-specific Trace" in calls[0]["prompt"]
+    assert "target 5 to 8 adjacent actions" in calls[0]["prompt"]
+    assert "one-action wait-only program" in calls[0]["prompt"]
     agent.close()
 
 
@@ -849,7 +948,9 @@ def test_codex_windows_agent_repairs_empty_stage_boundary_in_same_session(
     assert sessions[0].reset_count == 1
     assert "Compact semantic stage index" in calls[1]["prompt"]
     assert "A stage boundary is not a reason" in calls[1]["prompt"]
+    assert "System multi-action planning policy" in calls[1]["prompt"]
     assert "coding-agent test failure" in calls[2]["prompt"]
+    assert "System multi-action planning policy" in calls[2]["prompt"]
     assert "No action from that invalid decision was executed" in calls[2]["prompt"]
     assert "Do not repeat an already applied interaction" in calls[2]["prompt"]
     assert "cooling-down or disabled control" in calls[2]["prompt"]
@@ -1484,7 +1585,99 @@ def test_trailing_wait_uses_local_wait_until_before_replanning(tmp_path: Path) -
     assert result.short_batch_count == 1
     assert result.performance["local_wait_until_ms"] == result.local_wait_until_ms
     assert result.stage_timings[0]["local_wait_until_ms"] == result.local_wait_until_ms
-    assert any("local wait-until" in status for status in statuses)
+    assert any("local decision-ready" in status for status in statuses)
+
+
+def test_trailing_wait_tolerates_small_persistent_animation(tmp_path: Path) -> None:
+    wait = ActionCall("wait", {"duration_ms": 100})
+    agent = ScriptedAgent([_plan(wait), _plan(complete=True)])
+    capture = CyclingColorCapture(
+        [
+            (40, 40, 40),
+            (42, 42, 42),
+            (44, 44, 44),
+            (46, 46, 46),
+            (48, 48, 48),
+            (50, 50, 50),
+            (52, 52, 52),
+            (54, 54, 54),
+            (62, 62, 62),
+        ]
+    )
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=capture,
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
+    )
+
+    assert result.task_complete
+    assert result.local_wait_until_ms == 1_400
+    assert result.interrupted_batches == 0
+    assert result.visual_checkpoint_failures == 0
+    assert any("ready=True" in status for status in statuses)
+
+
+def test_trailing_wait_motion_timeout_replans_without_failure(tmp_path: Path) -> None:
+    wait = ActionCall("wait", {"duration_ms": 100})
+    agent = ScriptedAgent([_plan(wait), _plan(complete=True)])
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=CyclingColorCapture([(0, 0, 0), (255, 255, 255)]),
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+        status_callback=statuses.append,
+    )
+    trace_events = [
+        json.loads(line)
+        for line in Path(result.trace_path).read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert result.task_complete
+    assert result.local_wait_until_ms == LOCAL_WAIT_UNTIL_MAX_EXTRA_MS
+    assert result.interrupted_batches == 0
+    assert result.visual_checkpoint_failures == 0
+    assert agent.observations == [(wait, True)]
+    assert not any(
+        event["type"] == "windows_visual_checkpoint_failed"
+        for event in trace_events
+    )
+    assert any("without marking the completed action as failed" in status for status in statuses)
+
+
+def test_trailing_wait_still_rejects_a_click_with_no_visual_response(
+    tmp_path: Path,
+) -> None:
+    click = ActionCall("click", {"x": 0.5, "y": 0.5})
+    wait = ActionCall("wait", {"duration_ms": 100})
+    agent = ScriptedAgent([_plan(click, wait), _plan(complete=True)])
+
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=True),
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=ColorSequenceCapture([(20, 20, 20)] * 30),
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: agent,
+    )
+
+    assert result.task_complete
+    assert result.local_wait_until_count == 0
+    assert result.interrupted_batches == 1
+    assert result.visual_checkpoint_failures == 1
+    assert agent.observations == [(click, True), (wait, True), (click, False)]
 
 
 def test_no_visual_response_discards_the_rest_of_the_batch(tmp_path: Path) -> None:
@@ -1528,7 +1721,7 @@ def test_three_consecutive_motor_anomalies_stop_recovery(tmp_path: Path) -> None
     click = ActionCall("click", {"x": 0.5, "y": 0.5})
     agent = ScriptedAgent([_plan(click), _plan(click), _plan(click)])
 
-    with pytest.raises(RuntimeError, match="recovery limit"):
+    with pytest.raises(WindowsAgentRunFailed, match="recovery limit") as failure:
         run_windows_agent(
             _write_taskpack(tmp_path, confirmed=True),
             execute=True,
@@ -1539,6 +1732,17 @@ def test_three_consecutive_motor_anomalies_stop_recovery(tmp_path: Path) -> None
             agent_factory=lambda contract: agent,
         )
 
+    result = failure.value.result
+    metadata = json.loads(
+        Path(result.trace_path).with_name("metadata.json").read_text(encoding="utf-8")
+    )
+    assert not result.task_complete
+    assert result.stop_reason == "failed:RuntimeError"
+    assert result.failure_message == (
+        "Stage batch recovery limit reached after 3 consecutive motor failures"
+    )
+    assert Path(result.trace_path).is_file()
+    assert metadata["failure_message"] == result.failure_message
     assert agent.observations == [(click, False), (click, False), (click, False)]
     assert agent.closed
 
@@ -1584,3 +1788,44 @@ def test_immediate_emergency_stop_returns_before_focus_or_trace(tmp_path: Path) 
     assert result.trace_path is None
     assert backend.events == []
     assert emergency.closed and agent.closed
+
+
+def test_runtime_planner_uses_graph_state_ids_instead_of_trace_episode_order(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    task_path = _write_taskpack(tmp_path, semantic=True)
+    _replace_linear_stage_with_directed_state_graph(task_path)
+    contract = load_windows_task(task_path)
+    agent = CodexWindowsAgent(
+        contract,
+        plan_horizon=1,
+        binary_resolver=lambda requested: requested,
+        session_factory=_session_factory(
+            [
+                {
+                    "task_complete": False,
+                    "actions": [
+                        {"skill": "click", "args": {"x": 0.5, "y": 0.5}}
+                    ],
+                    "reason": "Use the legal ready-state transition.",
+                    "confidence": 0.9,
+                    "stage_id": "ready",
+                }
+            ],
+            calls,
+            [],
+        ),
+    )
+
+    plan = agent.plan(pygame.Surface((100, 50)))
+
+    assert plan.stage_id == "ready"
+    assert calls[0]["schema"]["properties"]["stage_id"]["enum"] == [
+        "ready",
+        "retry",
+        "unknown",
+    ]
+    assert "open_target" not in calls[0]["schema"]["properties"]["stage_id"]["enum"]
+    assert "ready_to_retry" in calls[0]["prompt"]
+    assert "loops and backward transitions" in calls[0]["prompt"]

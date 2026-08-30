@@ -49,7 +49,9 @@ def _window_selector_from_args(args: argparse.Namespace) -> WindowSelector:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="trace2task",
-        description="Record a small game task, replay it, or solve it with a visual replanning agent.",
+        description=(
+            "Turn reviewed human Windows demonstrations into adaptive multimodal Agent tasks."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)

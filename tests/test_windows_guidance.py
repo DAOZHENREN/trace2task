@@ -11,9 +11,144 @@ import yaml
 from trace2task.windows_guidance import (
     activate_guidance_revision,
     compile_guidance_revision,
+    load_human_guidance,
     update_guidance_proposal_summary,
 )
 from trace2task.windows_task import load_windows_task
+from trace2task.windows_task_model import (
+    activate_task_model_revision,
+    compile_task_model_revision,
+)
+
+
+def test_guidance_graph_scopes_retrieve_only_the_active_neighborhood(
+    tmp_path: Path,
+) -> None:
+    rules = []
+    for index, (scope_type, scope_id) in enumerate(
+        (
+            ("global", "global"),
+            ("state", "battle"),
+            ("state", "menu"),
+            ("transition", "battle-to-result"),
+            ("transition", "menu-to-battle"),
+            ("terminal", "success"),
+            ("terminal", "failure"),
+        ),
+        start=1,
+    ):
+        rules.append(
+            {
+                "id": f"trick-{index:04d}",
+                "scope": {"type": scope_type, "id": scope_id},
+                "when": f"condition {index}",
+                "prefer": f"preference {index}",
+                "avoid": [],
+                "replan_when": [],
+                "expected_effect": f"effect {index}",
+                "priority": "high",
+            }
+        )
+    path = tmp_path / "guidance.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "task_id": "graph-task",
+                "status": "confirmed",
+                "revision": 2,
+                "summary": "Graph-native tricks.",
+                "rules": rules,
+                "revision_agent": {
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    guidance = load_human_guidance(
+        path,
+        task_id="graph-task",
+        stage_ids={"menu", "battle"},
+        transition_ids={"menu-to-battle", "battle-to-result"},
+        terminal_ids={"success", "failure"},
+    )
+    payload = guidance.prompt_payload(
+        "battle",
+        transition_ids=["battle-to-result"],
+        terminal_ids=["success"],
+    )
+    bootstrap_payload = guidance.prompt_payload()
+
+    assert payload["active_context"] == {
+        "state_id": "battle",
+        "eligible_transition_ids": ["battle-to-result"],
+        "candidate_terminal_ids": ["success"],
+    }
+    assert [rule["scope"] for rule in payload["rules"]] == [
+        {"type": "global", "id": "global"},
+        {"type": "state", "id": "battle"},
+        {"type": "transition", "id": "battle-to-result"},
+        {"type": "terminal", "id": "success"},
+    ]
+    assert bootstrap_payload["active_context"] is None
+    assert len(bootstrap_payload["rules"]) == 7
+    assert payload["rules"][1] == {
+        "id": "trick-0002",
+        "scope": {"type": "state", "id": "battle"},
+        "when": "condition 2",
+        "prefer": "preference 2",
+        "avoid": [],
+        "replan_when": [],
+        "expected_effect": "effect 2",
+        "priority": "high",
+    }
+
+
+def test_legacy_stage_guidance_loads_as_state_scope(tmp_path: Path) -> None:
+    path = tmp_path / "guidance.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "task_id": "legacy-task",
+                "status": "confirmed",
+                "revision": 1,
+                "summary": "Legacy guidance.",
+                "rules": [
+                    {
+                        "id": "trick-0001",
+                        "stage_id": "battle",
+                        "when": "Battle is visible.",
+                        "prefer": "Use the active control.",
+                        "avoid": [],
+                        "replan_when": [],
+                        "expected_effect": "Battle advances.",
+                        "priority": "high",
+                    }
+                ],
+                "revision_agent": {
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    guidance = load_human_guidance(
+        path,
+        task_id="legacy-task",
+        stage_ids={"battle"},
+    )
+
+    assert guidance.rules[0].stage_id == "battle"
+    assert guidance.rules[0].prompt_payload()["scope"] == {
+        "type": "state",
+        "id": "battle",
+    }
 
 
 def _write_semantic_task(root: Path) -> Path:
@@ -190,7 +325,7 @@ class FakeRevisionSession:
                     {
                         "operation": "add",
                         "target_rule_id": "",
-                        "stage_id": "open_target",
+                        "scope": {"type": "state", "id": "open_target"},
                         "when": "The target is stable and visibly clickable.",
                         "prefer": "Click once and wait for the expected content.",
                         "avoid": ["Requesting a new plan before the UI can change"],
@@ -217,6 +352,93 @@ class ConfiguredRevisionSession(FakeRevisionSession):
         return json.dumps(self.response)
 
 
+class TaskModelRevisionSession(FakeRevisionSession):
+    def run_turn(self, **kwargs: Any) -> str:
+        self.call = kwargs
+        return json.dumps(
+            {
+                "canonical_instruction": "Open the target and recover until it is visibly open.",
+                "goal": "Open the target efficiently.",
+                "summary": "Use a directed state graph with an explicit verification loop.",
+                "completion": {
+                    "mode": "state",
+                    "success_condition": "Target is visibly open.",
+                    "reason": "The open content is a separate success terminal.",
+                },
+                "state_graph": {
+                    "entry_state_id": "open_target",
+                    "states": [
+                        {
+                            "id": "open_target",
+                            "name": "Open target",
+                            "description": "Target is visible and not yet open.",
+                            "preconditions": ["Target is visible"],
+                            "visual_anchors": ["target"],
+                            "evidence_stage_ids": ["open_target"],
+                            "confidence": 0.9,
+                        },
+                        {
+                            "id": "verify_target",
+                            "name": "Verify result",
+                            "description": "The click was issued and the result must be checked.",
+                            "preconditions": ["A target interaction was attempted"],
+                            "visual_anchors": ["target or open content"],
+                            "evidence_stage_ids": ["open_target"],
+                            "confidence": 0.8,
+                        },
+                    ],
+                    "transitions": [
+                        {
+                            "id": "open_to_verify",
+                            "source_state_id": "open_target",
+                            "target_type": "state",
+                            "target_id": "verify_target",
+                            "condition": "The visible target was clicked once.",
+                            "action_goal": "Open the target once.",
+                            "expected_effects": ["The content begins to open"],
+                            "evidence_stage_ids": ["open_target"],
+                            "confidence": 0.9,
+                        },
+                        {
+                            "id": "verify_to_retry",
+                            "source_state_id": "verify_target",
+                            "target_type": "state",
+                            "target_id": "open_target",
+                            "condition": "The target remains visibly closed after a bounded wait.",
+                            "action_goal": "Return to the visible target and retry safely.",
+                            "expected_effects": ["The closed target is recognized again"],
+                            "evidence_stage_ids": ["open_target"],
+                            "confidence": 0.75,
+                        },
+                        {
+                            "id": "verify_to_success",
+                            "source_state_id": "verify_target",
+                            "target_type": "terminal",
+                            "target_id": "success",
+                            "condition": "Open content is visible.",
+                            "action_goal": "Stop when success is verified.",
+                            "expected_effects": ["The task is complete"],
+                            "evidence_stage_ids": ["open_target"],
+                            "confidence": 0.95,
+                        },
+                    ],
+                    "terminals": [
+                        {
+                            "id": "success",
+                            "kind": "success",
+                            "name": "Target open",
+                            "condition": "Open content is visible.",
+                            "visual_anchors": ["open content"],
+                            "evidence_frame": "reference/frames/after.png",
+                            "confidence": 0.95,
+                        }
+                    ],
+                },
+                "guidance_scope_mappings": [],
+            }
+        )
+
+
 def _operation(
     operation: str,
     *,
@@ -227,7 +449,7 @@ def _operation(
     return {
         "operation": operation,
         "target_rule_id": target_rule_id,
-        "stage_id": "open_target",
+        "scope": {"type": "state", "id": "open_target"},
         "when": "The target is stable and visibly clickable.",
         "prefer": prefer,
         "avoid": ["Requesting a new plan before the UI can change"],
@@ -268,6 +490,8 @@ def test_human_feedback_creates_reviewable_revision_then_activates_it(tmp_path: 
     assert len(sessions[0].call["additional_image_paths"]) == 3
     assert "点击后不要马上重新规划" in sessions[0].call["prompt"]
     assert "Current confirmed guidance revision: 0" in sessions[0].call["prompt"]
+    assert "task-independent system policy" in sessions[0].call["prompt"]
+    assert "Do not add or update a task rule" in sessions[0].call["prompt"]
     assert not (task_path.parent / "guidance.yaml").exists()
 
     edited = update_guidance_proposal_summary(
@@ -536,3 +760,206 @@ def test_legacy_snapshot_draft_cannot_overwrite_confirmed_guidance(tmp_path: Pat
     assert active is not None
     assert active.revision == 1
     assert active.rules[0].prefer == "Click once and wait for the expected content."
+
+
+def test_human_feedback_revises_task_structure_without_rewriting_trace(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_semantic_task(tmp_path)
+    candidate_path = _write_candidate(tmp_path, task_path, candidate_id="task-model")
+    contract = load_windows_task(task_path)
+    assert contract.semantic_experience is not None
+    original_demonstration = (task_path.parent / "demonstration.json").read_bytes()
+    sessions: list[TaskModelRevisionSession] = []
+
+    def factory(executable: str, **kwargs: Any) -> TaskModelRevisionSession:
+        session = TaskModelRevisionSession(executable, **kwargs)
+        sessions.append(session)
+        return session
+
+    proposal = compile_task_model_revision(
+        tmp_path,
+        candidate_path,
+        task_path,
+        experience=contract.semantic_experience,
+        reference_frame=contract.reference_frame,
+        feedback="完成不是最后一个编号阶段；失败时允许从验证状态回到打开状态。",
+        session_factory=factory,
+        binary_resolver=lambda requested: requested,
+    )
+
+    assert proposal.base_revision == 0
+    assert proposal.proposed_revision == 1
+    assert proposal.blocking_issue_count == 0
+    assert proposal.operation_count >= 4
+    assert sessions[0].closed is True
+    assert sessions[0].call is not None
+    assert "Raw Trace episodes are immutable evidence" in sessions[0].call["prompt"]
+    assert not (task_path.parent / "experience-revisions").exists()
+
+    activated = activate_task_model_revision(tmp_path, candidate_path, task_path)
+    loaded = load_windows_task(task_path)
+    assert loaded.semantic_experience is not None
+    assert activated["revision"] == 1
+    assert loaded.semantic_experience.entry_state_id == "open_target"
+    assert set(loaded.semantic_experience.state_ids) == {
+        "open_target",
+        "verify_target",
+    }
+    assert any(
+        transition.source_state_id == "verify_target"
+        and transition.target_id == "open_target"
+        for transition in loaded.semantic_experience.transitions
+    )
+    assert all(
+        terminal.terminal_id not in loaded.semantic_experience.state_ids
+        for terminal in loaded.semantic_experience.terminal_states
+    )
+    assert (task_path.parent / "experience-revisions" / "revision-0000.yaml").is_file()
+    assert (task_path.parent / "experience-revisions" / "revision-0001.yaml").is_file()
+    assert (task_path.parent / "demonstration.json").read_bytes() == original_demonstration
+
+
+def test_task_model_revision_blocks_removed_guidance_state_without_mapping(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_semantic_task(tmp_path)
+    guidance = {
+        "schema_version": "0.2",
+        "task_id": "example-task",
+        "status": "confirmed",
+        "revision": 1,
+        "summary": "Open the visible target once.",
+        "rules": [
+            {
+                "id": "trick-0001",
+                "stage_id": "open_target",
+                "when": "The target is visible.",
+                "prefer": "Click once.",
+                "avoid": ["Repeated clicks"],
+                "replan_when": ["The target remains closed"],
+                "expected_effect": "The target opens.",
+                "priority": "high",
+            }
+        ],
+        "revision_agent": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+    }
+    (task_path.parent / "guidance.yaml").write_text(
+        yaml.safe_dump(guidance, sort_keys=False),
+        encoding="utf-8",
+    )
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["human_guidance"] = {
+        "path": "guidance.yaml",
+        "revision": 1,
+        "rule_count": 1,
+    }
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+    candidate_path = _write_candidate(tmp_path, task_path, candidate_id="mapping-block")
+    contract = load_windows_task(task_path)
+    assert contract.semantic_experience is not None
+    base_session = TaskModelRevisionSession("codex")
+    response = json.loads(base_session.run_turn())
+    response["state_graph"]["entry_state_id"] = "renamed_target"
+    response["state_graph"]["states"][0]["id"] = "renamed_target"
+    for transition in response["state_graph"]["transitions"]:
+        if transition["source_state_id"] == "open_target":
+            transition["source_state_id"] = "renamed_target"
+        if transition["target_id"] == "open_target":
+            transition["target_id"] = "renamed_target"
+
+    proposal = compile_task_model_revision(
+        tmp_path,
+        candidate_path,
+        task_path,
+        experience=contract.semantic_experience,
+        reference_frame=contract.reference_frame,
+        feedback="把入口状态改名，但暂时没有说明旧诀窍应该迁移到哪里。",
+        session_factory=lambda executable, **kwargs: ConfiguredRevisionSession(
+            executable,
+            response,
+            **kwargs,
+        ),
+        binary_resolver=lambda requested: requested,
+    )
+
+    assert proposal.blocking_issue_count == 1
+    with pytest.raises(ValueError, match="mapping conflicts"):
+        activate_task_model_revision(tmp_path, candidate_path, task_path)
+    assert not (task_path.parent / "experience-revisions").exists()
+
+
+def test_task_model_revision_migrates_transition_scoped_guidance(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_semantic_task(tmp_path)
+    initial = load_windows_task(task_path)
+    assert initial.semantic_experience is not None
+    old_transition_id = initial.semantic_experience.transitions[0].transition_id
+    guidance = {
+        "schema_version": "0.3",
+        "task_id": "example-task",
+        "status": "confirmed",
+        "revision": 1,
+        "summary": "Use the opening edge once.",
+        "rules": [
+            {
+                "id": "trick-0001",
+                "scope": {"type": "transition", "id": old_transition_id},
+                "when": "The visible target is ready to open.",
+                "prefer": "Take the opening transition once.",
+                "avoid": ["Repeated clicks"],
+                "replan_when": ["The expected verification state does not appear"],
+                "expected_effect": "The task reaches verification.",
+                "priority": "high",
+            }
+        ],
+        "revision_agent": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+    }
+    (task_path.parent / "guidance.yaml").write_text(
+        yaml.safe_dump(guidance, sort_keys=False),
+        encoding="utf-8",
+    )
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["human_guidance"] = {
+        "path": "guidance.yaml",
+        "revision": 1,
+        "rule_count": 1,
+    }
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+    candidate_path = _write_candidate(tmp_path, task_path, candidate_id="transition-map")
+    contract = load_windows_task(task_path)
+    assert contract.semantic_experience is not None
+    response = json.loads(TaskModelRevisionSession("codex").run_turn())
+    response["guidance_scope_mappings"] = [
+        {
+            "from_type": "transition",
+            "from_id": old_transition_id,
+            "to_type": "transition",
+            "to_id": "open_to_verify",
+            "reason": "The revised edge represents the same opening intent.",
+        }
+    ]
+
+    proposal = compile_task_model_revision(
+        tmp_path,
+        candidate_path,
+        task_path,
+        experience=contract.semantic_experience,
+        reference_frame=contract.reference_frame,
+        feedback="把旧的打开诀窍迁移到新的打开到验证转移。",
+        session_factory=lambda executable, **kwargs: ConfiguredRevisionSession(
+            executable,
+            response,
+            **kwargs,
+        ),
+        binary_resolver=lambda requested: requested,
+    )
+
+    assert proposal.blocking_issue_count == 0
+    activated = activate_task_model_revision(tmp_path, candidate_path, task_path)
+    loaded = load_windows_task(task_path)
+    assert activated["guidance_revision"] == 2
+    assert loaded.human_guidance is not None
+    assert loaded.human_guidance.rules[0].scope_type == "transition"
+    assert loaded.human_guidance.rules[0].scope_id == "open_to_verify"

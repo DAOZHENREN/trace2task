@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import statistics
 import time
 from collections.abc import Callable
 from ctypes import wintypes
@@ -44,8 +45,11 @@ VISUAL_STABILITY_MAX_EXTRA_MS = 4_000
 VISUAL_STABILITY_THRESHOLD = 0.012
 VISUAL_NO_RESPONSE_THRESHOLD = 0.004
 VISUAL_RESPONSE_SKILLS = {"click", "double_click", "hold_mouse", "drag"}
-LOCAL_WAIT_UNTIL_MAX_EXTRA_MS = 30_000
-LOCAL_WAIT_UNTIL_STABLE_SAMPLES = 8
+LOCAL_WAIT_UNTIL_MAX_EXTRA_MS = 15_000
+LOCAL_WAIT_UNTIL_WINDOW_SAMPLES = 8
+LOCAL_WAIT_UNTIL_REQUIRED_SAMPLES = 6
+LOCAL_WAIT_UNTIL_SAMPLE_THRESHOLD = 0.020
+LOCAL_WAIT_UNTIL_MEDIAN_THRESHOLD = 0.015
 CYCLE_REFERENCE_MATCH_THRESHOLD = 0.08
 
 
@@ -273,6 +277,113 @@ def _wait_for_visual_stability(
     )
 
 
+def _wait_for_visual_response(
+    *,
+    session: WindowSession,
+    capture: WindowFrameCapture,
+    emergency_stop: EmergencyStop,
+    background: bool,
+    initial_surface: pygame.Surface,
+    response_baseline: pygame.Surface,
+    response_action: ActionCall,
+    max_extra_wait_ms: int = VISUAL_STABILITY_MAX_EXTRA_MS,
+) -> tuple[pygame.Surface, VisualCheckpointResult]:
+    """Wait only for evidence that the preceding pointer action had an effect."""
+    previous = initial_surface
+    latest = initial_surface
+    extra_wait_ms = 0
+    sample_count = 0
+    capture_ms = 0.0
+    stability_difference = 1.0
+    response_difference = 0.0
+    region = _action_region(response_action, response_baseline.get_size())
+    if region is None:
+        raise ValueError("Visual response checks require a pointer action region")
+    max_samples = max_extra_wait_ms // VISUAL_STABILITY_SAMPLE_MS
+    for sample_index in range(max_samples + 1):
+        emergency_stop.raise_if_requested()
+        window = session.require_available() if background else session.require_foreground()
+        latest, sample_capture_ms = _capture_with_timing(capture, window)
+        capture_ms += sample_capture_ms
+        sample_count += 1
+        stability_difference = _surface_difference(previous, latest)
+        response_difference = _surface_difference(
+            response_baseline,
+            latest,
+            region=region,
+        )
+        if response_difference > VISUAL_NO_RESPONSE_THRESHOLD:
+            break
+        previous = latest
+        if sample_index < max_samples:
+            emergency_stop.sleep(VISUAL_STABILITY_SAMPLE_MS / 1_000)
+            extra_wait_ms += VISUAL_STABILITY_SAMPLE_MS
+    return latest, VisualCheckpointResult(
+        stable=stability_difference <= VISUAL_STABILITY_THRESHOLD,
+        response_changed=response_difference > VISUAL_NO_RESPONSE_THRESHOLD,
+        stability_difference=stability_difference,
+        response_difference=response_difference,
+        extra_wait_ms=extra_wait_ms,
+        samples=sample_count,
+        capture_ms=capture_ms,
+    )
+
+
+def _wait_until_decision_ready(
+    *,
+    session: WindowSession,
+    capture: WindowFrameCapture,
+    emergency_stop: EmergencyStop,
+    background: bool,
+    initial_surface: pygame.Surface,
+    max_extra_wait_ms: int = LOCAL_WAIT_UNTIL_MAX_EXTRA_MS,
+) -> tuple[pygame.Surface, VisualCheckpointResult]:
+    """Tolerate small persistent animation while waiting for a readable layout."""
+    previous = initial_surface
+    latest = initial_surface
+    recent_differences: list[float] = []
+    extra_wait_ms = 0
+    sample_count = 0
+    capture_ms = 0.0
+    stability_difference = 1.0
+    ready = False
+    max_samples = max_extra_wait_ms // VISUAL_STABILITY_SAMPLE_MS
+    for sample_index in range(max_samples + 1):
+        emergency_stop.raise_if_requested()
+        window = session.require_available() if background else session.require_foreground()
+        latest, sample_capture_ms = _capture_with_timing(capture, window)
+        capture_ms += sample_capture_ms
+        sample_count += 1
+        stability_difference = _surface_difference(previous, latest)
+        recent_differences.append(stability_difference)
+        recent_differences = recent_differences[-LOCAL_WAIT_UNTIL_WINDOW_SAMPLES:]
+        if len(recent_differences) == LOCAL_WAIT_UNTIL_WINDOW_SAMPLES:
+            low_motion_samples = sum(
+                difference <= LOCAL_WAIT_UNTIL_SAMPLE_THRESHOLD
+                for difference in recent_differences
+            )
+            ready = (
+                low_motion_samples >= LOCAL_WAIT_UNTIL_REQUIRED_SAMPLES
+                and statistics.median(recent_differences)
+                <= LOCAL_WAIT_UNTIL_MEDIAN_THRESHOLD
+            )
+            if ready:
+                break
+        previous = latest
+        if sample_index < max_samples:
+            emergency_stop.sleep(VISUAL_STABILITY_SAMPLE_MS / 1_000)
+            extra_wait_ms += VISUAL_STABILITY_SAMPLE_MS
+    return latest, VisualCheckpointResult(
+        stable=ready,
+        response_changed=None,
+        stability_difference=stability_difference,
+        response_difference=None,
+        extra_wait_ms=extra_wait_ms,
+        samples=sample_count,
+        capture_ms=capture_ms,
+    )
+
+
 @dataclass(frozen=True)
 class WindowsAgentResult:
     mode: str
@@ -303,6 +414,16 @@ class WindowsAgentResult:
     session_resets: int
     performance: dict[str, object]
     stage_timings: list[dict[str, object]]
+    failure_message: str | None = None
+
+
+class WindowsAgentRunFailed(RuntimeError):
+    """Expose a persisted failed run without pretending that execution succeeded."""
+
+    def __init__(self, result: WindowsAgentResult, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.result = result
+        self.cause = cause
 
 
 AgentFactory = Callable[[WindowsTaskContract], WindowsPlanningAgent]
@@ -608,7 +729,17 @@ def run_windows_agent(
                     "stability_threshold": VISUAL_STABILITY_THRESHOLD,
                     "no_response_threshold": VISUAL_NO_RESPONSE_THRESHOLD,
                     "local_wait_until_max_extra_ms": LOCAL_WAIT_UNTIL_MAX_EXTRA_MS,
-                    "local_wait_until_stable_samples": LOCAL_WAIT_UNTIL_STABLE_SAMPLES,
+                    "local_wait_until_window_samples": LOCAL_WAIT_UNTIL_WINDOW_SAMPLES,
+                    "local_wait_until_required_samples": (
+                        LOCAL_WAIT_UNTIL_REQUIRED_SAMPLES
+                    ),
+                    "local_wait_until_sample_threshold": (
+                        LOCAL_WAIT_UNTIL_SAMPLE_THRESHOLD
+                    ),
+                    "local_wait_until_median_threshold": (
+                        LOCAL_WAIT_UNTIL_MEDIAN_THRESHOLD
+                    ),
+                    "local_wait_until_timeout_policy": "replan_without_failure",
                 },
             },
         )
@@ -803,45 +934,63 @@ def run_windows_agent(
                 visual_checkpoint: VisualCheckpointResult | None = None
                 local_wait_checkpoint: VisualCheckpointResult | None = None
                 if action.skill == "wait":
-                    surface, visual_checkpoint = _wait_for_visual_stability(
-                        session=session,
-                        capture=active_capture,
-                        emergency_stop=active_emergency,
-                        background=background,
-                        initial_surface=surface,
-                        response_baseline=pending_visual_baseline,
-                        response_action=pending_visual_action,
-                    )
-                    visual_checkpoints += 1
-                    visual_stability_wait_ms += visual_checkpoint.extra_wait_ms
-                    total_capture_ms += visual_checkpoint.capture_ms
-                    observe_cycle_progress(surface)
-                    active_stage["capture_ms"] = (
-                        float(active_stage["capture_ms"]) + visual_checkpoint.capture_ms
-                    )
-                    status_callback(
-                        f"[checkpoint {visual_checkpoints}] stable={visual_checkpoint.stable}, "
-                        f"changed={visual_checkpoint.response_changed}, "
-                        f"extra_wait={visual_checkpoint.extra_wait_ms}ms."
-                    )
+                    final_wait = batch_action_index == batch_size
                     if (
-                        batch_action_index == batch_size
-                        and visual_checkpoint.response_changed is not False
+                        final_wait
+                        and pending_visual_baseline is not None
+                        and pending_visual_action is not None
                     ):
-                        status_callback(
-                            "[local wait-until] Final wait reached; holding locally for a "
-                            "sustained stable frame before the next model call."
-                        )
-                        surface, local_wait_checkpoint = _wait_for_visual_stability(
+                        surface, visual_checkpoint = _wait_for_visual_response(
                             session=session,
                             capture=active_capture,
                             emergency_stop=active_emergency,
                             background=background,
                             initial_surface=surface,
-                            response_baseline=None,
-                            response_action=None,
-                            max_extra_wait_ms=LOCAL_WAIT_UNTIL_MAX_EXTRA_MS,
-                            stable_samples_required=LOCAL_WAIT_UNTIL_STABLE_SAMPLES,
+                            response_baseline=pending_visual_baseline,
+                            response_action=pending_visual_action,
+                        )
+                    elif not final_wait:
+                        surface, visual_checkpoint = _wait_for_visual_stability(
+                            session=session,
+                            capture=active_capture,
+                            emergency_stop=active_emergency,
+                            background=background,
+                            initial_surface=surface,
+                            response_baseline=pending_visual_baseline,
+                            response_action=pending_visual_action,
+                        )
+                    visual_checkpoints += 1
+                    if visual_checkpoint is not None:
+                        visual_stability_wait_ms += visual_checkpoint.extra_wait_ms
+                        total_capture_ms += visual_checkpoint.capture_ms
+                        observe_cycle_progress(surface)
+                        active_stage["capture_ms"] = (
+                            float(active_stage["capture_ms"])
+                            + visual_checkpoint.capture_ms
+                        )
+                        status_callback(
+                            f"[checkpoint {visual_checkpoints}] "
+                            f"stable={visual_checkpoint.stable}, "
+                            f"changed={visual_checkpoint.response_changed}, "
+                            f"extra_wait={visual_checkpoint.extra_wait_ms}ms."
+                        )
+                    if (
+                        final_wait
+                        and (
+                            visual_checkpoint is None
+                            or visual_checkpoint.response_changed is not False
+                        )
+                    ):
+                        status_callback(
+                            "[local decision-ready] Final wait reached; tolerating small "
+                            "persistent animation before the next model call."
+                        )
+                        surface, local_wait_checkpoint = _wait_until_decision_ready(
+                            session=session,
+                            capture=active_capture,
+                            emergency_stop=active_emergency,
+                            background=background,
+                            initial_surface=surface,
                         )
                         local_wait_until_count += 1
                         local_wait_until_ms += local_wait_checkpoint.extra_wait_ms
@@ -856,10 +1005,15 @@ def run_windows_agent(
                             + local_wait_checkpoint.extra_wait_ms
                         )
                         status_callback(
-                            "[local wait-until] "
-                            f"stable={local_wait_checkpoint.stable}, "
+                            "[local decision-ready] "
+                            f"ready={local_wait_checkpoint.stable}, "
                             f"extra_wait={local_wait_checkpoint.extra_wait_ms}ms."
                         )
+                        if not local_wait_checkpoint.stable:
+                            status_callback(
+                                "[local decision-ready] Timed out; replanning from the "
+                                "latest frame without marking the completed action as failed."
+                            )
                 else:
                     window = (
                         session.require_available()
@@ -906,8 +1060,6 @@ def run_windows_agent(
                     failure_reason: str | None = None
                     if visual_checkpoint.response_changed is False:
                         failure_reason = "expected visual response did not appear"
-                    elif local_wait_checkpoint is not None and not local_wait_checkpoint.stable:
-                        failure_reason = "local wait-until did not stabilize before timeout"
                     elif local_wait_checkpoint is None and not visual_checkpoint.stable:
                         failure_reason = "visual state did not stabilize before timeout"
                     if failure_reason is not None:
@@ -959,7 +1111,7 @@ def run_windows_agent(
         status_callback(f"Execution stopped: {type(error).__name__}: {error}")
         if writer is not None:
             performance, stage_timings = performance_snapshot()
-            writer.finish(
+            trace = writer.finish(
                 success=False,
                 extra={
                     "parameterized_action_count": executed_actions,
@@ -987,6 +1139,40 @@ def run_windows_agent(
                 },
             )
             writer = None
+            result = WindowsAgentResult(
+                mode="windows_agent",
+                task_id=contract.task.task_id,
+                execute=True,
+                task_complete=False,
+                executed_actions=executed_actions,
+                replans=agent.replans,
+                stop_reason=stop_reason,
+                proposed_actions=last_proposed,
+                trace_path=str(trace.trace_path),
+                input_mode="background" if background else "foreground",
+                model=model,
+                reasoning_effort=reasoning_effort,
+                planning_ms=total_planning_ms,
+                batch_count=batch_count,
+                planned_actions=planned_actions,
+                interrupted_batches=interrupted_batches,
+                average_batch_size=round(planned_actions / batch_count, 2)
+                if batch_count
+                else 0.0,
+                max_batch_size=max_batch_size,
+                visual_checkpoints=visual_checkpoints,
+                visual_checkpoint_failures=visual_checkpoint_failures,
+                visual_stability_wait_ms=visual_stability_wait_ms,
+                local_wait_until_count=local_wait_until_count,
+                local_wait_until_ms=local_wait_until_ms,
+                wait_only_plans=wait_only_plans,
+                short_batch_count=short_batch_count,
+                session_resets=getattr(agent, "session_resets", 0),
+                performance=performance,
+                stage_timings=stage_timings,
+                failure_message=str(error),
+            )
+            raise WindowsAgentRunFailed(result, error) from error
         raise
     finally:
         active_emergency.close()

@@ -16,6 +16,7 @@ import yaml
 from trace2task import web_console
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
+from trace2task.windows_runner import WindowsAgentRunFailed
 
 
 def _write_windows_task(
@@ -333,6 +334,7 @@ class SuccessfulResult:
             }
         ]
     )
+    failure_message: str | None = None
 
 
 def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path: Path) -> None:
@@ -538,6 +540,46 @@ def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Pat
     assert candidates[0]["outcome"] == {
         "task_complete": False,
         "stop_reason": "action_limit",
+    }
+
+
+def test_failed_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
+    task_path = _write_windows_task(tmp_path)
+    root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    root["actions"].extend(["type_text", "press_key"])
+    task_path.write_text(yaml.safe_dump(root, allow_unicode=True), encoding="utf-8")
+    trace_path = tmp_path / "runs" / "failed-agent" / "trace.jsonl"
+    trace_path.parent.mkdir(parents=True)
+    trace_path.write_text('{"seq": 0}\n', encoding="utf-8")
+    failure_message = "Stage batch recovery limit reached after 3 consecutive failures"
+    result = SuccessfulResult(
+        task_complete=False,
+        stop_reason="failed:RuntimeError",
+        trace_path=str(trace_path),
+        failure_message=failure_message,
+    )
+
+    def runner(*args: object, **kwargs: object) -> SuccessfulResult:
+        raise WindowsAgentRunFailed(result, RuntimeError(failure_message))
+
+    controller = WebConsoleController(tmp_path, runner=runner)
+    job = controller.start_job(
+        task_path=task_path.relative_to(tmp_path).as_posix(),
+        instruction="尝试一次并反馈失败原因",
+        execute=True,
+    )
+    completed = controller.wait(job["job_id"])
+    candidates = controller.list_candidates()
+
+    assert completed["status"] == "failed"
+    assert completed["error"] == f"RuntimeError: {failure_message}"
+    assert completed["result"]["candidate_experience"]["status"] == "pending_review"
+    assert any("未完成运行已保存为待反馈运行" in log for log in completed["logs"])
+    assert len(candidates) == 1
+    assert candidates[0]["outcome"] == {
+        "task_complete": False,
+        "stop_reason": "failed:RuntimeError",
+        "failure_message": failure_message,
     }
 
 
@@ -802,6 +844,52 @@ def test_narrated_recording_uses_local_turbo_before_human_review(
     assert narration["transcription_engine"] == "faster_whisper:turbo"
 
 
+def test_voice_dictation_reuses_local_turbo_without_archiving_audio(
+    tmp_path: Path,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeTranscriber:
+        def transcribe(
+            self,
+            audio_path: Path,
+            *,
+            cache_dir: Path,
+            initial_prompt: str,
+        ) -> LocalTranscription:
+            seen["audio_path"] = audio_path
+            assert audio_path.read_bytes() == b"webm"
+            assert cache_dir == tmp_path / ".cache" / "faster-whisper"
+            assert "人工运行反馈" in initial_prompt
+            return LocalTranscription(
+                transcript="失败后跳过这个技能，改用普通攻击。",
+                segments=[],
+                language="zh",
+                language_probability=0.99,
+                model="turbo",
+                device="cuda",
+                compute_type="float16",
+            )
+
+    controller = WebConsoleController(
+        tmp_path,
+        runner=lambda *args, **kwargs: FakeResult(),
+        narration_transcriber=FakeTranscriber(),
+    )
+
+    result = controller.transcribe_dictation(
+        audio_base64=base64.b64encode(b"webm").decode("ascii"),
+        mime_type="audio/webm",
+        context="人工运行反馈",
+    )
+
+    assert result["transcription"]["transcript"] == (
+        "失败后跳过这个技能，改用普通攻击。"
+    )
+    assert not Path(seen["audio_path"]).exists()
+    assert not list(tmp_path.rglob("dictation.webm"))
+
+
 def test_taskpack_listing_exposes_active_human_guidance(tmp_path: Path) -> None:
     _write_windows_task(tmp_path, semantic=True, guidance=True)
     controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
@@ -813,7 +901,7 @@ def test_taskpack_listing_exposes_active_human_guidance(tmp_path: Path) -> None:
     assert guidance["rules"] == [
         {
             "id": "trick-01",
-            "stage_id": "send_message",
+            "scope": {"type": "state", "id": "send_message"},
             "when": "联系人搜索结果已经出现。",
             "prefer": "单击正确联系人并等待输入框出现。",
             "avoid": ["连续重复点击联系人"],
@@ -853,7 +941,7 @@ def test_taskpack_listing_exposes_guidance_fusion_history(tmp_path: Path) -> Non
     )
     second_rule = {
         "id": "trick-0002",
-        "stage_id": "send_message",
+        "scope": {"type": "state", "id": "send_message"},
         "when": "消息已经输入。",
         "prefer": "检查文本后再发送。",
         "avoid": ["发送错误文本"],
@@ -873,7 +961,7 @@ def test_taskpack_listing_exposes_guidance_fusion_history(tmp_path: Path) -> Non
                 "operation": "add",
                 "target_rule_id": "",
                 "result_rule_id": "trick-0002",
-                "stage_id": "send_message",
+            "scope": {"type": "state", "id": "send_message"},
                 "reason": "人工反馈要求发送前检查文本。",
             }
         ],
@@ -910,7 +998,7 @@ def test_taskpack_listing_exposes_guidance_fusion_history(tmp_path: Path) -> Non
         "operation": "add",
         "target_rule_id": "",
         "result_rule_id": "trick-0002",
-        "stage_id": "send_message",
+        "scope": {"type": "state", "id": "send_message"},
         "reason": "人工反馈要求发送前检查文本。",
     }
     assert history[0]["rule_count"] == 2
@@ -1220,6 +1308,41 @@ def test_web_deletes_local_assets_recoverably_and_rejects_outside_paths(
         controller.delete_candidate("runs")
 
 
+def test_human_guidance_is_deleted_without_deleting_the_task_or_trace(
+    tmp_path: Path,
+) -> None:
+    task_path = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    task_dir = task_path.parent
+    revisions = task_dir / "guidance-revisions"
+    revisions.mkdir()
+    shutil.copy2(task_dir / "guidance.yaml", revisions / "revision-0001.yaml")
+    demonstration_before = (task_dir / "demonstration.json").read_bytes()
+    experience_before = (task_dir / "experience.yaml").read_bytes()
+    controller = WebConsoleController(
+        tmp_path,
+        runner=lambda *args, **kwargs: FakeResult(),
+    )
+
+    result = controller.delete_human_guidance(
+        task_path.relative_to(tmp_path).as_posix()
+    )
+
+    assert result["kind"] == "human_guidance"
+    assert result["recoverable"] is True
+    assert task_path.is_file()
+    assert (task_dir / "demonstration.json").read_bytes() == demonstration_before
+    assert (task_dir / "experience.yaml").read_bytes() == experience_before
+    assert not (task_dir / "guidance.yaml").exists()
+    assert not revisions.exists()
+    trash = tmp_path / result["trash_path"]
+    assert (trash / "guidance.yaml").is_file()
+    assert (trash / "guidance-revisions" / "revision-0001.yaml").is_file()
+    assert (trash / "restore.json").is_file()
+    listed = controller.list_taskpacks()
+    assert len(listed) == 1
+    assert listed[0]["human_guidance"] is None
+
+
 def test_web_server_serves_console_state_and_job_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1297,12 +1420,27 @@ def test_web_server_serves_console_state_and_job_api(
     assert "同时录制人工讲解" in html
     assert "经验与录制" in html
     assert "执行 Agent 模型" in html
-    assert "经验编译模型（教师）" in html
     assert "后台执行 · 可同时使用电脑" in html
-    assert "经验修订模型（教练）" in html
+    assert "经验模型设置（教师 / 教练）" in html
+    assert "任务经验详情" in html
     assert "经验摘要（确认前可编辑）" in javascript
+    assert "删除人工反馈经验" in javascript
+    assert "删除整个任务" in javascript
+    assert "#task/" in javascript
+    assert "查看详情" in javascript
+    assert "运行 Agent 实际读取什么" in javascript
+    assert "Agent 当前使用" in javascript
+    assert "Agent 使用对象" in javascript
+    assert "历史存档，Agent 不读取" in javascript
+    assert "重新规划条件 replan_when" in javascript
+    assert "系统执行策略 · 多动作规划" in javascript
+    assert "所有任务共用" in javascript
+    assert "/api/taskpacks/guidance/delete" in javascript
     assert "/api/recordings/narration" in javascript
     assert "/api/recordings/transcribe" in javascript
+    assert "/api/transcribe" in javascript
+    assert "语音输入" in javascript
+    assert "不保存录音" in javascript
     assert state["taskpacks"][0]["process_name"] == "Weixin.exe"
     assert evidence_bytes.startswith(b"\x89PNG")
     assert state["recordings"] == []
@@ -1316,6 +1454,13 @@ def test_web_server_serves_console_state_and_job_api(
         "narration_claim_audit": True,
         "coordinate_isolation": True,
         "experience_family_inheritance": True,
+        "directed_task_graph": True,
+        "task_model_revision": True,
+        "task_model_history": True,
+        "graph_native_guidance": True,
+        "independent_guidance_delete": True,
+        "system_multi_action_planning": True,
+        "voice_dictation": True,
     }
     assert route["task_id"] == "wechat-example"
     assert summary_result["summary"] == "人工微调后的摘要"

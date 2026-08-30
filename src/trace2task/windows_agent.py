@@ -300,27 +300,9 @@ class CodexWindowsAgent:
                     }
                     evidence = tuple(evidence[index] for index in sorted(indexes))
             else:
-                active = next(
-                    (
-                        stage
-                        for stage in experience.stages
-                        if stage.stage_id == self._active_stage_id
-                    ),
-                    None,
-                )
-                evidence = (
-                    (
-                        (
-                            experience.source_path.parent
-                            / active.state_before.evidence_frame
-                        ).resolve(),
-                        (
-                            experience.source_path.parent
-                            / active.state_after.evidence_frame
-                        ).resolve(),
-                    )
-                    if active is not None
-                    else ()
+                evidence = experience.evidence_paths_for_state(
+                    self._active_stage_id,
+                    experience.source_path.parent,
                 )
             for path in evidence:
                 if path not in paths:
@@ -409,6 +391,22 @@ class CodexWindowsAgent:
             reset_reason = "initial"
         return self._get_session(), reset_reason, fresh_context
 
+    def _system_planning_policy(self) -> str:
+        return (
+            "System multi-action planning policy (applies identically to every task; this is "
+            "executor policy, not task-specific Trace or human guidance):\n"
+            f"- When the task is incomplete, return one ordered program of 1 to "
+            f"{self.plan_horizon} actions, not merely the next click.\n"
+            "- When the current pixels and reviewed state make the continuation predictable, "
+            "target 5 to 8 adjacent actions in the same response.\n"
+            "- Keep necessary adaptive wait checkpoints and the predictable actions after them in "
+            "the same program; never return a one-action wait-only program for routine animation.\n"
+            "- Do not pad the program with guessed actions. Stop before a loading result, changed "
+            "screen, or choice whose correct target depends on pixels that are not visible yet.\n"
+            "- The local runner interrupts the unexecuted suffix immediately when an action fails "
+            "or an expected visual response does not appear.\n"
+        )
+
     def _prompt(
         self,
         *,
@@ -421,12 +419,12 @@ class CodexWindowsAgent:
         if self._turn_index > 0:
             stage_context = self._active_stage_context(reference_paths)
             session_intro = (
-                "This is a fresh bounded model session for the current semantic stage. No prior "
+                "This is a fresh bounded model session for the current semantic state. No prior "
                 "messages are available; the compact authoritative stage context and exact "
                 "stage-boundary images below are self-contained. Image 1 is the current target "
                 "client area and Image 2 is the final success reference.\n"
                 if fresh_context
-                else "Continue the current semantic stage using Image 1 as the new authoritative "
+                else "Continue the current semantic stage/state using Image 1 as the new authoritative "
                 "target screenshot.\n"
             )
             return (
@@ -440,16 +438,12 @@ class CodexWindowsAgent:
                 "For an external submission, verify both destination and content before returning "
                 "the send/submit action. If the completion policy permits completion and Image 1 "
                 "now satisfies the analogous success condition, "
-                "return task_complete=true and no actions. Otherwise return one complete stage "
-                f"program of 1 to {self.plan_horizon} actions. When the reviewed Trace makes the "
-                "continuation predictable, target 5 to 8 adjacent actions rather than stopping "
-                "after every click. A wait action is an adaptive local visual checkpoint: after its "
-                "requested duration the runner keeps sampling until pixels settle, "
-                "and interrupts the remaining batch if the preceding pointer action produced no "
-                "visible response. Never return a one-action wait-only program for a routine "
-                "animation. Keep the next predictable reviewed interactions after the wait in the "
-                "same program. If the current stage's state_after is already visible, select the "
-                "next stage whose state_before matches Image 1, set stage_id to that stage, and "
+                "return task_complete=true and no actions. Otherwise follow the system planning "
+                "policy below.\n"
+                f"{self._system_planning_policy()}"
+                "If the current stage's state_after is already visible, select a legal outgoing "
+                "state whose preconditions match Image 1, set stage_id to that "
+                "state, and "
                 "return its first safe actions in this response. A stage boundary is not a reason "
                 "to return an empty incomplete decision. Stop only before a choice whose correct "
                 "target cannot be known from the current screenshot and reviewed Trace. State the "
@@ -489,7 +483,7 @@ class CodexWindowsAgent:
             "human-reviewed successful reference frame. Compare them visually. The local motor "
             "controller alone will execute your structured actions.\n\n"
             "Evidence priority is: current pixels and local safety, confirmed human guidance, "
-            "reviewed semantic stages, then raw Trace motor evidence. The Trace proves observed "
+            "reviewed semantic state graph, then raw Trace motor evidence. The Trace proves observed "
             "state transitions; it is not a coordinate script. Preserve reviewed phase intent when "
             "it matches the current pixels and explain deviations in the response reason.\n"
             f"{task_context}"
@@ -508,9 +502,7 @@ class CodexWindowsAgent:
             "A wait action is an adaptive local visual checkpoint: its duration is the minimum "
             "wait, then the runner samples locally until the window stabilizes. "
             "If the preceding pointer action causes no visible change near its target, the runner "
-            "discards the rest of this batch and replans. Use interaction, wait, then the next "
-            "predictable interaction in one batch; do not spend a model turn only checking whether "
-            "a routine animation ended.\n"
+            "discards the rest of this batch and replans.\n"
             "Raw demonstration coordinates, drag paths, hold durations, and fixed waits are "
             "intentionally withheld. Locate every target from Image 1 and use the simplest motor "
             "primitive justified by the visible control.\n"
@@ -518,13 +510,10 @@ class CodexWindowsAgent:
             f"Recent execution history:\n{history}\n\n"
             "If the completion policy permits completion and Image 1 already satisfies the success "
             "condition, return task_complete=true and "
-            "no actions. Otherwise return task_complete=false and one complete stage program "
-            f"between 1 and {self.plan_horizon} actions. Target 5 to 8 adjacent reviewed actions "
-            "whenever their continuation is predictable, and include waits between visual "
-            "transitions. Never return a one-action wait-only program for a routine animation. "
-            "Routine animations are local checkpoints, not reasons to end the batch. Stop before "
-            "a loading screen, a "
-            "choice whose correct target cannot be known yet. If a semantic stage has already "
+            "no actions. Otherwise set task_complete=false and follow the system planning policy "
+            "below.\n"
+            f"{self._system_planning_policy()}"
+            "If a semantic state has already "
             "reached its state_after, transition to the next matching stage and include that "
             "stage's first safe actions in the same response; never use an empty incomplete "
             "decision merely to signal a stage boundary. Describe the "
@@ -563,14 +552,17 @@ class CodexWindowsAgent:
         guidance = self.contract.human_guidance
         guidance_payload = guidance.prompt_payload() if guidance is not None else None
         return (
-            "Compiler Agent semantic stage index (derived and reviewable from the immutable human "
+            "Compiler Agent semantic stage index and directed state graph (derived and reviewable "
+            "from the immutable human "
             "Trace). Identify the current stage and return its id: "
             f"{json.dumps(experience.stage_index_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
             "Confirmed human guidance has higher priority than the derived interpretation: "
             f"{json.dumps(guidance_payload, ensure_ascii=False, separators=(',', ':'))}\n"
             "Semantic evidence images after the final success reference: "
             f"{json.dumps(image_map, ensure_ascii=False, separators=(',', ':'))}\n"
-            "Use stage preconditions and expected effects to interpret the current state. Choices "
+            "Use state preconditions and legal transition effects to interpret the current state. "
+            "State IDs are graph nodes, not ordered indexes; loops and backward transitions are "
+            "valid only when their declared conditions match current pixels. Choices "
             "marked runtime_agent_decides or unknown must be decided from the current screenshot, "
             "not copied from the single demonstration.\n"
         )
@@ -578,14 +570,9 @@ class CodexWindowsAgent:
     def _active_stage_context(self, references: tuple[Path, ...]) -> str:
         experience = self.contract.semantic_experience
         if experience is None:
-            return "Active semantic stage: unavailable.\n"
+            return "Active semantic state: unavailable.\n"
         payload = experience.active_stage_payload(self._active_stage_id)
-        guidance = self.contract.human_guidance
-        guidance_payload = (
-            guidance.prompt_payload(self._active_stage_id)
-            if guidance is not None
-            else None
-        )
+        guidance_payload = self._guidance_for_state(self._active_stage_id)
         trace_summary = self._stage_trace_summary(self._active_stage_id)
         image_map = [
             {
@@ -597,9 +584,10 @@ class CodexWindowsAgent:
             for index, path in enumerate(references[1:], start=3)
         ]
         return (
-            "Compact semantic stage index for boundary recognition and forward transition: "
+            "Compact semantic stage index as a directed state graph for boundary recognition and "
+            "legal transitions: "
             f"{json.dumps(experience.stage_index_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
-            "Locally retrieved active-stage experience: "
+            "Locally retrieved active-stage experience (the active graph state): "
             f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n"
             "Sanitized Trace evidence for this stage contains action categories only, with all "
             "recorded coordinates, drag paths, hold durations, and fixed wait values removed. It "
@@ -611,22 +599,42 @@ class CodexWindowsAgent:
             f"{json.dumps(guidance_payload, ensure_ascii=False, separators=(',', ':'))}\n"
         )
 
+    def _guidance_for_state(self, state_id: str | None) -> dict[str, Any] | None:
+        guidance = self.contract.human_guidance
+        experience = self.contract.semantic_experience
+        if guidance is None or experience is None:
+            return None
+        outgoing = experience.outgoing_transitions(state_id)
+        return guidance.prompt_payload(
+            state_id,
+            transition_ids=[transition.transition_id for transition in outgoing],
+            terminal_ids=[
+                transition.target_id
+                for transition in outgoing
+                if transition.target_type == "terminal"
+            ],
+        )
+
     def _repair_stage_id(self, rejected: dict[str, Any]) -> str | None:
         experience = self.contract.semantic_experience
         if experience is None:
             return None
-        stage_ids = [stage.stage_id for stage in experience.stages]
+        stage_ids = list(experience.state_ids)
         rejected_stage = rejected.get("stage_id")
         if rejected_stage in stage_ids and rejected_stage != self._active_stage_id:
             return str(rejected_stage)
         if self._active_stage_id in stage_ids:
-            current_index = stage_ids.index(self._active_stage_id)
-            if current_index + 1 < len(stage_ids):
-                return stage_ids[current_index + 1]
+            outgoing_states = [
+                transition.target_id
+                for transition in experience.outgoing_transitions(self._active_stage_id)
+                if transition.target_type == "state"
+            ]
+            if rejected_stage == self._active_stage_id and len(outgoing_states) == 1:
+                return outgoing_states[0]
             return self._active_stage_id
         if rejected_stage in stage_ids:
             return str(rejected_stage)
-        return stage_ids[0] if stage_ids else None
+        return experience.entry_state_id if experience.entry_state_id in stage_ids else None
 
     def _decision_repair_prompt(
         self,
@@ -640,12 +648,7 @@ class CodexWindowsAgent:
             if experience is not None
             else None
         )
-        guidance = self.contract.human_guidance
-        guidance_payload = (
-            guidance.prompt_payload(repair_stage_id)
-            if guidance is not None
-            else None
-        )
+        guidance_payload = self._guidance_for_state(repair_stage_id)
         trace_summary = self._stage_trace_summary(repair_stage_id)
         history = self._history[-8:]
         return (
@@ -676,9 +679,11 @@ class CodexWindowsAgent:
             "show that its precondition has changed.\n"
             "- Do not skip an unresolved choice, invent a target, or mark the task complete unless "
             "the declared success condition is visibly satisfied.\n\n"
-            "First verify the candidate stage preconditions against Image 1. If they match, set "
-            "stage_id to that stage and return its first safe action sequence. If they do not match, "
-            "continue the stage whose preconditions do match and return a different safe sequence. "
+            f"{self._system_planning_policy()}"
+            "First verify the candidate state preconditions against Image 1. If they match, set "
+            "stage_id to that state and return its first safe action sequence. If they do not match, "
+            "select a graph state whose preconditions do match, preferring a declared outgoing or "
+            "recovery transition over an invented jump, and return a different safe sequence. "
             "When no input target is visually justified and wait is an allowed skill, return a "
             "bounded wait rather than guessing a click. Return the complete corrected object matching "
             "the stricter supplied JSON schema."
@@ -688,30 +693,27 @@ class CodexWindowsAgent:
         experience = self.contract.semantic_experience
         if experience is None or stage_id is None:
             return {}
-        active = next(
-            (
-                stage
-                for stage in experience.stages
-                if stage.stage_id == stage_id
-            ),
-            None,
-        )
-        if active is None:
+        episodes = experience.evidence_stages_for_state(stage_id)
+        if not episodes:
             return {}
         categories: dict[str, int] = {}
-        for action in self.contract.demonstration[
-            active.start_action_index : active.end_action_index + 1
-        ]:
-            category = {
-                "drag": "unverified_pointer_gesture",
-                "hold_mouse": "unverified_pointer_gesture",
-                "wait": "observed_transition_wait",
-                "click": "pointer_activation",
-            }.get(action.skill, action.skill)
-            categories[category] = categories.get(category, 0) + 1
+        ranges: list[list[int]] = []
+        for episode in episodes:
+            ranges.append([episode.start_action_index, episode.end_action_index])
+            for action in self.contract.demonstration[
+                episode.start_action_index : episode.end_action_index + 1
+            ]:
+                category = {
+                    "drag": "unverified_pointer_gesture",
+                    "hold_mouse": "unverified_pointer_gesture",
+                    "wait": "observed_transition_wait",
+                    "click": "pointer_activation",
+                }.get(action.skill, action.skill)
+                categories[category] = categories.get(category, 0) + 1
         return {
-            "stage_id": active.stage_id,
-            "action_range": [active.start_action_index, active.end_action_index],
+            "state_id": stage_id,
+            "evidence_episode_ids": [episode.stage_id for episode in episodes],
+            "action_ranges": ranges,
             "observed_categories": categories,
             "motor_policy": "semantic_intent_only_no_recorded_coordinates",
         }
@@ -777,7 +779,7 @@ class CodexWindowsAgent:
         experience = self.contract.semantic_experience
         if experience is None:
             return ["unknown"]
-        return [stage.stage_id for stage in experience.stages] + ["unknown"]
+        return [*experience.state_ids, "unknown"]
 
     def _parse_payload(
         self,

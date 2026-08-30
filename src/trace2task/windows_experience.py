@@ -26,6 +26,9 @@ CONTACT_SHEET_ROWS = 2
 CONTACT_SHEET_THUMBNAIL = (320, 190)
 CONTACT_SHEET_LABEL_HEIGHT = 24
 MAX_SEMANTIC_STAGES = 12
+MAX_TASK_STATES = 24
+MAX_TASK_TRANSITIONS = 64
+MAX_TERMINAL_STATES = 8
 SCREEN_CHANGE_THRESHOLD = 0.12
 TEMPORAL_BOUNDARY_MS = 1_500
 PROVENANCE_VALUES = {"observed", "inferred", "unknown"}
@@ -91,6 +94,41 @@ class ExperienceStage:
 
 
 @dataclass(frozen=True)
+class TaskState:
+    state_id: str
+    name: str
+    description: str
+    preconditions: tuple[str, ...]
+    visual_anchors: tuple[str, ...]
+    evidence_stage_ids: tuple[str, ...]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class TaskTransition:
+    transition_id: str
+    source_state_id: str
+    target_type: str
+    target_id: str
+    condition: str
+    action_goal: str
+    expected_effects: tuple[str, ...]
+    evidence_stage_ids: tuple[str, ...]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class TerminalState:
+    terminal_id: str
+    kind: str
+    name: str
+    condition: str
+    visual_anchors: tuple[str, ...]
+    evidence_frame: str
+    confidence: float
+
+
+@dataclass(frozen=True)
 class SemanticExperience:
     canonical_instruction: str
     goal: str
@@ -99,6 +137,10 @@ class SemanticExperience:
     completion_success_condition: str
     completion_reason: str
     stages: tuple[ExperienceStage, ...]
+    entry_state_id: str
+    states: tuple[TaskState, ...]
+    transitions: tuple[TaskTransition, ...]
+    terminal_states: tuple[TerminalState, ...]
     narration_claims: tuple[NarrationClaim, ...]
     source_type: str
     model: str
@@ -106,6 +148,34 @@ class SemanticExperience:
     review_status: str
     requires_confirmation: bool
     source_path: Path
+
+    @property
+    def state_ids(self) -> tuple[str, ...]:
+        return tuple(state.state_id for state in self.states)
+
+    @property
+    def terminal_ids(self) -> tuple[str, ...]:
+        return tuple(terminal.terminal_id for terminal in self.terminal_states)
+
+    def state(self, state_id: str | None) -> TaskState | None:
+        return next(
+            (state for state in self.states if state.state_id == state_id),
+            None,
+        )
+
+    def outgoing_transitions(self, state_id: str | None) -> tuple[TaskTransition, ...]:
+        return tuple(
+            transition
+            for transition in self.transitions
+            if transition.source_state_id == state_id
+        )
+
+    def evidence_stages_for_state(self, state_id: str | None) -> tuple[ExperienceStage, ...]:
+        state = self.state(state_id)
+        if state is None:
+            return ()
+        evidence_ids = set(state.evidence_stage_ids)
+        return tuple(stage for stage in self.stages if stage.stage_id in evidence_ids)
 
     @staticmethod
     def _stage_payload(stage: ExperienceStage) -> dict[str, Any]:
@@ -159,7 +229,51 @@ class SemanticExperience:
                 "success_condition": self.completion_success_condition,
                 "reason": self.completion_reason,
             },
-            "stages": [self._stage_payload(stage) for stage in self.stages],
+            "trace_episodes": [self._stage_payload(stage) for stage in self.stages],
+            "state_graph": self.state_graph_payload(),
+        }
+
+    def state_graph_payload(self) -> dict[str, Any]:
+        return {
+            "entry_state_id": self.entry_state_id,
+            "states": [
+                {
+                    "id": state.state_id,
+                    "name": state.name,
+                    "description": state.description,
+                    "preconditions": list(state.preconditions),
+                    "visual_anchors": list(state.visual_anchors),
+                    "evidence_stage_ids": list(state.evidence_stage_ids),
+                    "confidence": state.confidence,
+                }
+                for state in self.states
+            ],
+            "transitions": [
+                {
+                    "id": transition.transition_id,
+                    "source_state_id": transition.source_state_id,
+                    "target_type": transition.target_type,
+                    "target_id": transition.target_id,
+                    "condition": transition.condition,
+                    "action_goal": transition.action_goal,
+                    "expected_effects": list(transition.expected_effects),
+                    "evidence_stage_ids": list(transition.evidence_stage_ids),
+                    "confidence": transition.confidence,
+                }
+                for transition in self.transitions
+            ],
+            "terminals": [
+                {
+                    "id": terminal.terminal_id,
+                    "kind": terminal.kind,
+                    "name": terminal.name,
+                    "condition": terminal.condition,
+                    "visual_anchors": list(terminal.visual_anchors),
+                    "evidence_frame": terminal.evidence_frame,
+                    "confidence": terminal.confidence,
+                }
+                for terminal in self.terminal_states
+            ],
         }
 
     def narration_audit_payload(self) -> list[dict[str, Any]]:
@@ -186,37 +300,52 @@ class SemanticExperience:
                 "success_condition": self.completion_success_condition,
                 "reason": self.completion_reason,
             },
-            "stage_index": [
-                {
-                    "id": stage.stage_id,
-                    "name": stage.name,
-                    "action_range": [stage.start_action_index, stage.end_action_index],
-                    "state_before": stage.state_before.description,
-                    "visual_anchors": list(stage.state_before.visual_anchors),
-                    "state_after": stage.state_after.description,
-                    "confidence": stage.confidence,
-                }
-                for stage in self.stages
-            ],
+            "state_graph": self.state_graph_payload(),
         }
 
     def active_stage_payload(self, stage_id: str | None) -> dict[str, Any] | None:
-        if stage_id is None:
+        state = self.state(stage_id)
+        if state is None:
             return None
-        for index, stage in enumerate(self.stages):
-            if stage.stage_id != stage_id:
-                continue
-            payload: dict[str, Any] = {"active_stage": self._stage_payload(stage)}
-            if index + 1 < len(self.stages):
-                next_stage = self.stages[index + 1]
-                payload["next_stage"] = {
-                    "id": next_stage.stage_id,
-                    "name": next_stage.name,
-                    "state_before": next_stage.state_before.description,
-                    "visual_anchors": list(next_stage.state_before.visual_anchors),
+        evidence = self.evidence_stages_for_state(stage_id)
+        return {
+            "active_state": {
+                "id": state.state_id,
+                "name": state.name,
+                "description": state.description,
+                "preconditions": list(state.preconditions),
+                "visual_anchors": list(state.visual_anchors),
+                "confidence": state.confidence,
+            },
+            "legal_outgoing_transitions": [
+                {
+                    "id": transition.transition_id,
+                    "target_type": transition.target_type,
+                    "target_id": transition.target_id,
+                    "condition": transition.condition,
+                    "action_goal": transition.action_goal,
+                    "expected_effects": list(transition.expected_effects),
+                    "confidence": transition.confidence,
                 }
-            return payload
-        return None
+                for transition in self.outgoing_transitions(stage_id)
+            ],
+            "trace_episodes": [self._stage_payload(stage) for stage in evidence],
+        }
+
+    def evidence_paths_for_state(
+        self,
+        state_id: str | None,
+        task_root: Path,
+    ) -> tuple[Path, ...]:
+        relative_paths = [
+            relative
+            for stage in self.evidence_stages_for_state(state_id)
+            for relative in (
+                stage.state_before.evidence_frame,
+                stage.state_after.evidence_frame,
+            )
+        ]
+        return self._resolve_evidence_paths(relative_paths, task_root)
 
     def evidence_paths(self, task_root: Path) -> tuple[Path, ...]:
         relative_paths = [
@@ -227,6 +356,13 @@ class SemanticExperience:
                 stage.state_after.evidence_frame,
             )
         ]
+        return self._resolve_evidence_paths(relative_paths, task_root)
+
+    @staticmethod
+    def _resolve_evidence_paths(
+        relative_paths: Sequence[str],
+        task_root: Path,
+    ) -> tuple[Path, ...]:
         paths: list[Path] = []
         resolved_root = task_root.resolve()
         for relative in dict.fromkeys(relative_paths):
@@ -290,6 +426,243 @@ def _experience_state(
     )
 
 
+def _legacy_state_graph(
+    stages: Sequence[ExperienceStage],
+    *,
+    completion_success_condition: str,
+) -> tuple[str, tuple[TaskState, ...], tuple[TaskTransition, ...], tuple[TerminalState, ...]]:
+    states = tuple(
+        TaskState(
+            state_id=stage.stage_id,
+            name=stage.name,
+            description=stage.state_before.description,
+            preconditions=stage.preconditions,
+            visual_anchors=stage.state_before.visual_anchors,
+            evidence_stage_ids=(stage.stage_id,),
+            confidence=stage.confidence,
+        )
+        for stage in stages
+    )
+    transitions: list[TaskTransition] = []
+    for index, stage in enumerate(stages):
+        is_last = index == len(stages) - 1
+        transitions.append(
+            TaskTransition(
+                transition_id=f"legacy_transition_{index + 1}",
+                source_state_id=stage.stage_id,
+                target_type="terminal" if is_last else "state",
+                target_id="success" if is_last else stages[index + 1].stage_id,
+                condition=(
+                    completion_success_condition
+                    if is_last
+                    else stage.state_after.description
+                ),
+                action_goal="；".join(
+                    intent.description for intent in stage.action_intents
+                ),
+                expected_effects=stage.expected_effects,
+                evidence_stage_ids=(stage.stage_id,),
+                confidence=stage.confidence,
+            )
+        )
+    last_stage = stages[-1]
+    terminals = (
+        TerminalState(
+            terminal_id="success",
+            kind="success",
+            name="任务成功",
+            condition=completion_success_condition,
+            visual_anchors=last_stage.state_after.visual_anchors,
+            evidence_frame=last_stage.state_after.evidence_frame,
+            confidence=last_stage.confidence,
+        ),
+    )
+    return stages[0].stage_id, states, tuple(transitions), terminals
+
+
+def validate_state_graph(
+    value: object,
+    *,
+    stages: Sequence[ExperienceStage],
+    completion_success_condition: str,
+    allowed_frames: set[str],
+) -> tuple[str, tuple[TaskState, ...], tuple[TaskTransition, ...], tuple[TerminalState, ...]]:
+    if value is None:
+        return _legacy_state_graph(
+            stages,
+            completion_success_condition=completion_success_condition,
+        )
+    graph = _mapping(value, "state_graph")
+    raw_states = graph.get("states")
+    if not isinstance(raw_states, list) or not 1 <= len(raw_states) <= MAX_TASK_STATES:
+        raise ValueError(f"state_graph.states must contain 1-{MAX_TASK_STATES} states")
+    stage_ids = {stage.stage_id for stage in stages}
+    states: list[TaskState] = []
+    state_ids: set[str] = set()
+    for index, raw_state in enumerate(raw_states):
+        label = f"state_graph.states[{index}]"
+        data = _mapping(raw_state, label)
+        state_id = _string(data.get("id"), f"{label}.id")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,47}", state_id):
+            raise ValueError(f"{label}.id must be a short lowercase identifier")
+        if state_id in state_ids:
+            raise ValueError(f"state_graph contains duplicate state id {state_id!r}")
+        state_ids.add(state_id)
+        evidence_stage_ids = _string_list(
+            data.get("evidence_stage_ids"),
+            f"{label}.evidence_stage_ids",
+        )
+        if not evidence_stage_ids or not set(evidence_stage_ids) <= stage_ids:
+            raise ValueError(f"{label}.evidence_stage_ids must reference Trace episodes")
+        states.append(
+            TaskState(
+                state_id=state_id,
+                name=_string(data.get("name"), f"{label}.name"),
+                description=_string(data.get("description"), f"{label}.description"),
+                preconditions=_string_list(
+                    data.get("preconditions"), f"{label}.preconditions"
+                ),
+                visual_anchors=_string_list(
+                    data.get("visual_anchors"), f"{label}.visual_anchors"
+                ),
+                evidence_stage_ids=evidence_stage_ids,
+                confidence=_confidence(data.get("confidence"), f"{label}.confidence"),
+            )
+        )
+    entry_state_id = _string(graph.get("entry_state_id"), "state_graph.entry_state_id")
+    if entry_state_id not in state_ids:
+        raise ValueError("state_graph.entry_state_id must reference a state")
+
+    raw_terminals = graph.get("terminals")
+    if not isinstance(raw_terminals, list) or not 1 <= len(raw_terminals) <= MAX_TERMINAL_STATES:
+        raise ValueError(
+            f"state_graph.terminals must contain 1-{MAX_TERMINAL_STATES} terminal states"
+        )
+    terminals: list[TerminalState] = []
+    terminal_ids: set[str] = set()
+    for index, raw_terminal in enumerate(raw_terminals):
+        label = f"state_graph.terminals[{index}]"
+        data = _mapping(raw_terminal, label)
+        terminal_id = _string(data.get("id"), f"{label}.id")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,47}", terminal_id):
+            raise ValueError(f"{label}.id must be a short lowercase identifier")
+        if terminal_id in terminal_ids or terminal_id in state_ids:
+            raise ValueError(f"state_graph contains duplicate terminal id {terminal_id!r}")
+        terminal_ids.add(terminal_id)
+        kind = _string(data.get("kind"), f"{label}.kind")
+        if kind not in {"success", "failure"}:
+            raise ValueError(f"{label}.kind must be success or failure")
+        evidence_frame = _string(data.get("evidence_frame"), f"{label}.evidence_frame")
+        if evidence_frame not in allowed_frames:
+            raise ValueError(f"{label}.evidence_frame must reference preserved evidence")
+        terminals.append(
+            TerminalState(
+                terminal_id=terminal_id,
+                kind=kind,
+                name=_string(data.get("name"), f"{label}.name"),
+                condition=_string(data.get("condition"), f"{label}.condition"),
+                visual_anchors=_string_list(
+                    data.get("visual_anchors"), f"{label}.visual_anchors"
+                ),
+                evidence_frame=evidence_frame,
+                confidence=_confidence(data.get("confidence"), f"{label}.confidence"),
+            )
+        )
+    if not any(terminal.kind == "success" for terminal in terminals):
+        raise ValueError("state_graph must define at least one success terminal")
+
+    raw_transitions = graph.get("transitions")
+    if not isinstance(raw_transitions, list) or len(raw_transitions) > MAX_TASK_TRANSITIONS:
+        raise ValueError(
+            f"state_graph.transitions must contain at most {MAX_TASK_TRANSITIONS} transitions"
+        )
+    transitions: list[TaskTransition] = []
+    transition_ids: set[str] = set()
+    for index, raw_transition in enumerate(raw_transitions):
+        label = f"state_graph.transitions[{index}]"
+        data = _mapping(raw_transition, label)
+        transition_id = _string(data.get("id"), f"{label}.id")
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", transition_id):
+            raise ValueError(f"{label}.id must be a short lowercase identifier")
+        if transition_id in transition_ids:
+            raise ValueError(f"state_graph contains duplicate transition id {transition_id!r}")
+        transition_ids.add(transition_id)
+        source_state_id = _string(
+            data.get("source_state_id"), f"{label}.source_state_id"
+        )
+        if source_state_id not in state_ids:
+            raise ValueError(f"{label}.source_state_id must reference a state")
+        target_type = _string(data.get("target_type"), f"{label}.target_type")
+        target_id = _string(data.get("target_id"), f"{label}.target_id")
+        if target_type == "state":
+            valid_target = target_id in state_ids
+        elif target_type == "terminal":
+            valid_target = target_id in terminal_ids
+        else:
+            raise ValueError(f"{label}.target_type must be state or terminal")
+        if not valid_target:
+            raise ValueError(f"{label}.target_id does not match its target_type")
+        evidence_stage_ids = _string_list(
+            data.get("evidence_stage_ids"), f"{label}.evidence_stage_ids"
+        )
+        if not evidence_stage_ids or not set(evidence_stage_ids) <= stage_ids:
+            raise ValueError(f"{label}.evidence_stage_ids must reference Trace episodes")
+        transitions.append(
+            TaskTransition(
+                transition_id=transition_id,
+                source_state_id=source_state_id,
+                target_type=target_type,
+                target_id=target_id,
+                condition=_string(data.get("condition"), f"{label}.condition"),
+                action_goal=_string(data.get("action_goal"), f"{label}.action_goal"),
+                expected_effects=_string_list(
+                    data.get("expected_effects"), f"{label}.expected_effects"
+                ),
+                evidence_stage_ids=evidence_stage_ids,
+                confidence=_confidence(
+                    data.get("confidence"), f"{label}.confidence"
+                ),
+            )
+        )
+    if not transitions:
+        raise ValueError("state_graph must define at least one legal transition")
+    reachable = {entry_state_id}
+    changed = True
+    while changed:
+        changed = False
+        for transition in transitions:
+            if (
+                transition.source_state_id in reachable
+                and transition.target_type == "state"
+                and transition.target_id not in reachable
+            ):
+                reachable.add(transition.target_id)
+                changed = True
+    if reachable != state_ids:
+        unreachable = sorted(state_ids - reachable)
+        raise ValueError(f"state_graph has unreachable states: {unreachable}")
+    sources_with_outgoing = {transition.source_state_id for transition in transitions}
+    dead_ends = sorted(state_ids - sources_with_outgoing)
+    if dead_ends:
+        raise ValueError(f"state_graph has non-terminal states with no outgoing edge: {dead_ends}")
+    reachable_terminals = {
+        transition.target_id
+        for transition in transitions
+        if transition.source_state_id in reachable and transition.target_type == "terminal"
+    }
+    unreachable_terminals = sorted(terminal_ids - reachable_terminals)
+    if unreachable_terminals:
+        raise ValueError(
+            f"state_graph has unreachable terminal states: {unreachable_terminals}"
+        )
+    success_ids = {
+        terminal.terminal_id for terminal in terminals if terminal.kind == "success"
+    }
+    if not success_ids <= reachable_terminals:
+        raise ValueError("state_graph success terminals must be reachable from the entry state")
+    return entry_state_id, tuple(states), tuple(transitions), tuple(terminals)
+
+
 def _validate_semantic_payload(
     payload: object,
     *,
@@ -304,6 +677,10 @@ def _validate_semantic_payload(
     str,
     str,
     tuple[ExperienceStage, ...],
+    str,
+    tuple[TaskState, ...],
+    tuple[TaskTransition, ...],
+    tuple[TerminalState, ...],
     tuple[NarrationClaim, ...],
 ]:
     root = _mapping(payload, "Compiler Agent output")
@@ -455,6 +832,13 @@ def _validate_semantic_payload(
             f"Semantic stages cover {expected_stage_start} of {action_count} actions for {task_id}"
         )
 
+    entry_state_id, states, transitions, terminal_states = validate_state_graph(
+        root.get("state_graph"),
+        stages=stages,
+        completion_success_condition=completion_success_condition,
+        allowed_frames=allowed_frames,
+    )
+
     raw_claims = root.get("narration_claims", [])
     if not isinstance(raw_claims, list) or len(raw_claims) > 24:
         raise ValueError("narration_claims must contain at most 24 items")
@@ -497,6 +881,10 @@ def _validate_semantic_payload(
         completion_success_condition,
         completion_reason,
         tuple(stages),
+        entry_state_id,
+        states,
+        transitions,
+        terminal_states,
         tuple(narration_claims),
     )
 
@@ -519,13 +907,17 @@ def _experience_document(
     completion_success_condition: str,
     completion_reason: str,
     stages: Sequence[ExperienceStage],
+    entry_state_id: str,
+    states: Sequence[TaskState],
+    transitions: Sequence[TaskTransition],
+    terminal_states: Sequence[TerminalState],
     narration_claims: Sequence[NarrationClaim],
     model: str,
     reasoning_effort: str,
     narration_available: bool,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "0.3",
+        "schema_version": "0.4",
         "task_id": task_id,
         "source": {
             "type": "human_trace",
@@ -597,6 +989,47 @@ def _experience_document(
             }
             for stage in stages
         ],
+        "state_graph": {
+            "entry_state_id": entry_state_id,
+            "states": [
+                {
+                    "id": state.state_id,
+                    "name": state.name,
+                    "description": state.description,
+                    "preconditions": list(state.preconditions),
+                    "visual_anchors": list(state.visual_anchors),
+                    "evidence_stage_ids": list(state.evidence_stage_ids),
+                    "confidence": state.confidence,
+                }
+                for state in states
+            ],
+            "transitions": [
+                {
+                    "id": transition.transition_id,
+                    "source_state_id": transition.source_state_id,
+                    "target_type": transition.target_type,
+                    "target_id": transition.target_id,
+                    "condition": transition.condition,
+                    "action_goal": transition.action_goal,
+                    "expected_effects": list(transition.expected_effects),
+                    "evidence_stage_ids": list(transition.evidence_stage_ids),
+                    "confidence": transition.confidence,
+                }
+                for transition in transitions
+            ],
+            "terminals": [
+                {
+                    "id": terminal.terminal_id,
+                    "kind": terminal.kind,
+                    "name": terminal.name,
+                    "condition": terminal.condition,
+                    "visual_anchors": list(terminal.visual_anchors),
+                    "evidence_frame": terminal.evidence_frame,
+                    "confidence": terminal.confidence,
+                }
+                for terminal in terminal_states
+            ],
+        },
         "review": {
             "status": "draft",
             "requires_confirmation": True,
@@ -633,6 +1066,10 @@ def load_semantic_experience(
         completion_success_condition,
         completion_reason,
         stages,
+        entry_state_id,
+        states,
+        transitions,
+        terminal_states,
         narration_claims,
     ) = _validate_semantic_payload(
         root,
@@ -658,6 +1095,10 @@ def load_semantic_experience(
         completion_success_condition=completion_success_condition,
         completion_reason=completion_reason,
         stages=stages,
+        entry_state_id=entry_state_id,
+        states=states,
+        transitions=transitions,
+        terminal_states=terminal_states,
         narration_claims=narration_claims,
         source_type=source_type,
         model=_string(compiler.get("model"), "experience.compiler.model"),
@@ -839,6 +1280,106 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
         "required": ["description", "evidence_frame", "visual_anchors"],
         "additionalProperties": False,
     }
+    graph_state = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 2, "maxLength": 48},
+            "name": {"type": "string", "minLength": 1},
+            "description": {"type": "string", "minLength": 1},
+            "preconditions": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "visual_anchors": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "evidence_stage_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 2, "maxLength": 48},
+                "minItems": 1,
+                "maxItems": 6,
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": [
+            "id",
+            "name",
+            "description",
+            "preconditions",
+            "visual_anchors",
+            "evidence_stage_ids",
+            "confidence",
+        ],
+        "additionalProperties": False,
+    }
+    graph_transition = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 2, "maxLength": 64},
+            "source_state_id": {"type": "string", "minLength": 2, "maxLength": 48},
+            "target_type": {"type": "string", "enum": ["state", "terminal"]},
+            "target_id": {"type": "string", "minLength": 2, "maxLength": 48},
+            "condition": {"type": "string", "minLength": 1},
+            "action_goal": {"type": "string", "minLength": 1},
+            "expected_effects": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "evidence_stage_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 2, "maxLength": 48},
+                "minItems": 1,
+                "maxItems": 6,
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": [
+            "id",
+            "source_state_id",
+            "target_type",
+            "target_id",
+            "condition",
+            "action_goal",
+            "expected_effects",
+            "evidence_stage_ids",
+            "confidence",
+        ],
+        "additionalProperties": False,
+    }
+    terminal_state = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "minLength": 2, "maxLength": 48},
+            "kind": {"type": "string", "enum": ["success", "failure"]},
+            "name": {"type": "string", "minLength": 1},
+            "condition": {"type": "string", "minLength": 1},
+            "visual_anchors": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "evidence_frame": {"type": "string", "enum": list(evidence_frames)},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": [
+            "id",
+            "kind",
+            "name",
+            "condition",
+            "visual_anchors",
+            "evidence_frame",
+            "confidence",
+        ],
+        "additionalProperties": False,
+    }
     return {
         "type": "object",
         "properties": {
@@ -1007,6 +1548,36 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
                     "additionalProperties": False,
                 },
             },
+            "state_graph": {
+                "type": "object",
+                "properties": {
+                    "entry_state_id": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 48,
+                    },
+                    "states": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TASK_STATES,
+                        "items": graph_state,
+                    },
+                    "transitions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TASK_TRANSITIONS,
+                        "items": graph_transition,
+                    },
+                    "terminals": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_TERMINAL_STATES,
+                        "items": terminal_state,
+                    },
+                },
+                "required": ["entry_state_id", "states", "transitions", "terminals"],
+                "additionalProperties": False,
+            },
         },
         "required": [
             "canonical_instruction",
@@ -1015,6 +1586,7 @@ def _output_schema(evidence_frames: Sequence[str], action_count: int) -> dict[st
             "completion",
             "narration_claims",
             "stages",
+            "state_graph",
         ],
         "additionalProperties": False,
     }
@@ -1149,14 +1721,26 @@ def _prompt(
         f"{narration_context}\n\n"
         "Return a concise canonical_instruction suitable for the runtime Agent. It must state the "
         "goal and major phase order, not turn low-confidence narration or one demonstrated choice "
-        "into a universal tactic. Also classify "
+        "into a universal tactic. Multi-action batching, plan horizon, reducing model calls, and "
+        "adaptive wait behavior are task-independent executor policies; do not encode them in the "
+        "canonical instruction, summary, state graph, stages, or dynamic decisions. Preserve only "
+        "task-specific sequence facts, such as a UI that requires exactly three selections or a "
+        "predictable target-selection branch after a particular control. Also classify "
         "completion as state or cycle. A cycle starts and ends at the same visual anchor; if the "
         "initial screen already matches that anchor, it is not complete until the run visibly "
         "leaves it and later returns.\n\n"
-        "Partition every action index exactly once into contiguous stages. Within every stage, "
+        "First partition every action index exactly once into contiguous Trace episodes. These "
+        "episodes describe the one recorded trajectory and remain evidence, not the runtime control "
+        "flow. Within every episode, "
         "partition every action index exactly once into contiguous action_intents. Describe only "
         "visually grounded states, observable preconditions, action intent, and expected visible "
-        "effects. Coordinates, drag paths, hold durations, and input skills are physical evidence, "
+        "effects. Then derive a separate state_graph for runtime reasoning. A state is a reusable "
+        "visually recognizable situation, not an action interval. Transitions are directed legal "
+        "moves and may branch, loop, or return from a later state to an earlier state when the "
+        "visible task permits it; never infer next_state from episode order alone. Success and "
+        "failure are terminal nodes outside the numbered/reusable states. Every state and transition "
+        "must cite one or more Trace episode IDs as grounding evidence. Coordinates, drag paths, "
+        "hold durations, and input skills are physical evidence, "
         "not semantic intent. A recorded drag or hold does not prove that the control requires that "
         "gesture; describe the visible target and intended state transition instead.\n\n"
         "A single trajectory does not prove a general strategy. If a choice could depend on "
@@ -1201,6 +1785,10 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     task_data["semantic_experience"] = {
         "path": "experience.yaml",
         "stage_count": len(document["stages"]),
+        "state_count": len(document["state_graph"]["states"]),
+        "transition_count": len(document["state_graph"]["transitions"]),
+        "terminal_count": len(document["state_graph"]["terminals"]),
+        "revision": 0,
         "source": "human_trace",
     }
     previous_guidance = task_data.get("human_guidance")
@@ -1219,13 +1807,32 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
         ):
             guidance_data = yaml.safe_load(guidance_path.read_text(encoding="utf-8"))
             raw_rules = guidance_data.get("rules", []) if isinstance(guidance_data, dict) else []
-            referenced_stages = {
-                str(rule.get("stage_id"))
-                for rule in raw_rules
-                if isinstance(rule, dict) and rule.get("stage_id") != "global"
+            graph = document["state_graph"]
+            scope_ids = {
+                "state": {str(state["id"]) for state in graph["states"]},
+                "transition": {
+                    str(transition["id"]) for transition in graph["transitions"]
+                },
+                "terminal": {str(terminal["id"]) for terminal in graph["terminals"]},
             }
-            stage_ids = {str(stage["id"]) for stage in document["stages"]}
-            guidance_compatible = referenced_stages <= stage_ids
+            guidance_compatible = True
+            for rule in raw_rules:
+                if not isinstance(rule, dict):
+                    guidance_compatible = False
+                    break
+                raw_scope = rule.get("scope")
+                if isinstance(raw_scope, dict):
+                    scope_type = str(raw_scope.get("type") or "")
+                    scope_id = str(raw_scope.get("id") or "")
+                else:
+                    legacy_stage = str(rule.get("stage_id") or "")
+                    scope_type = "global" if legacy_stage == "global" else "state"
+                    scope_id = "global" if legacy_stage == "global" else legacy_stage
+                if scope_type == "global" and scope_id == "global":
+                    continue
+                if scope_id not in scope_ids.get(scope_type, set()):
+                    guidance_compatible = False
+                    break
     if previous_guidance is not None and not guidance_compatible:
         task_data.pop("human_guidance", None)
     review = _mapping(task_data.get("review"), "task.review")
@@ -1234,13 +1841,13 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     review.pop("confirmed_at", None)
     checklist = review.setdefault("checklist", [])
     semantic_check = (
-        "Review the Compiler Agent stages, grounded states, intents, preconditions, expected "
-        "effects, and unknown dynamic decisions."
+        "Review the Compiler Agent Trace episodes, directed runtime states, legal transitions, "
+        "terminal outcomes, intents, preconditions, effects, and unknown dynamic decisions."
     )
     if isinstance(checklist, list) and semantic_check not in checklist:
         checklist.append(semantic_check)
     guidance_check = (
-        "The semantic stage structure changed, so previously confirmed human guidance was "
+        "The semantic task-state structure changed, so previously confirmed human guidance was "
         "deactivated. Generate and review a new guidance revision before relying on it."
     )
     if (
@@ -1316,7 +1923,8 @@ def compile_windows_semantic_experience(
                         "Your previous semantic compilation failed deterministic validation: "
                         f"{last_error}. Return a complete corrected result. Preserve exact "
                         "contiguous coverage of every action index and use only supplied evidence "
-                        "frame paths."
+                        "frame paths. Keep Trace episodes separate from the validated directed "
+                        "state graph and keep terminal outcomes outside reusable states."
                     )
                 output = session.run_turn(
                     prompt=active_prompt,
@@ -1334,6 +1942,10 @@ def compile_windows_semantic_experience(
                         completion_success_condition,
                         completion_reason,
                         stages,
+                        entry_state_id,
+                        states,
+                        transitions,
+                        terminal_states,
                         narration_claims,
                     ) = _validate_semantic_payload(
                         payload,
@@ -1353,6 +1965,10 @@ def compile_windows_semantic_experience(
                     completion_success_condition=completion_success_condition,
                     completion_reason=completion_reason,
                     stages=stages,
+                    entry_state_id=entry_state_id,
+                    states=states,
+                    transitions=transitions,
+                    terminal_states=terminal_states,
                     narration_claims=narration_claims,
                     model=model,
                     reasoning_effort=reasoning_effort,
