@@ -29,6 +29,12 @@ const elements = {
   stopButton: document.querySelector("#stop-button"),
   viewTabs: [...document.querySelectorAll(".view-tab")],
   viewPanels: [...document.querySelectorAll(".view-panel")],
+  recordSource: document.querySelector("#record-source"),
+  localRecordingFields: document.querySelector("#local-recording-fields"),
+  waaRecordingFields: document.querySelector("#waa-recording-fields"),
+  waaRoot: document.querySelector("#waa-root"),
+  waaExample: document.querySelector("#waa-example"),
+  waaTaskMeta: document.querySelector("#waa-task-meta"),
   recordWindow: document.querySelector("#record-window"),
   recordName: document.querySelector("#record-name"),
   recordModel: document.querySelector("#record-model"),
@@ -38,12 +44,14 @@ const elements = {
   narrationTranscript: document.querySelector("#narration-transcript"),
   narrationStatus: document.querySelector("#narration-status"),
   narrationSubmit: document.querySelector("#narration-submit"),
+  narrationDiscard: document.querySelector("#narration-discard"),
   compilerModel: document.querySelector("#compiler-model"),
   compilerReasoningEffort: document.querySelector("#compiler-reasoning-effort"),
   experienceModelSummary: document.querySelector("#experience-model-summary"),
   windowMeta: document.querySelector("#window-meta"),
   refreshWindows: document.querySelector("#refresh-windows"),
   recordButton: document.querySelector("#record-button"),
+  recordStopButton: document.querySelector("#record-stop-button"),
   recordError: document.querySelector("#record-error"),
   refreshLibrary: document.querySelector("#refresh-library"),
   taskpackList: document.querySelector("#taskpack-list"),
@@ -65,6 +73,7 @@ const statusLabels = {
   queued: "排队中",
   running: "运行中",
   stopping: "停止中",
+  awaiting_recording_start: "等待同步开始",
   awaiting_narration: "等待讲解确认",
   stopped: "已停止",
   completed: "已完成",
@@ -166,6 +175,11 @@ let backendSupportsIncrementalGuidance = false;
 let narrationCapture = null;
 let narrationReviewJobId = null;
 let narrationReviewPreparing = false;
+let waaGoStartingJobId = null;
+let waaGoSentJobId = null;
+let waaTasks = [];
+let waaTaskCatalogRoot = null;
+let defaultWaaExamplePath = "";
 let dictationSession = null;
 const taskDetailFragments = new Map();
 
@@ -188,6 +202,73 @@ function selectedWindow() {
   return localWindows.find((windowInfo) => windowInfo.handle === handle) || null;
 }
 
+function usesWaaRecording() {
+  return elements.recordSource.value === "waa";
+}
+
+function selectedWaaTask() {
+  return waaTasks.find((task) => task.example_path === elements.waaExample.value) || null;
+}
+
+function renderWaaTaskMeta() {
+  const task = selectedWaaTask();
+  if (!task) {
+    elements.waaTaskMeta.textContent = waaTasks.length
+      ? "请选择一个已配置 Reset 的 WAA 标准任务。"
+      : "当前 WAA 目录没有可安全录制的任务。";
+    return;
+  }
+  const apps = task.related_apps?.length ? task.related_apps.join("、") : task.domain;
+  const evaluator = task.evaluator?.length ? task.evaluator.join(" + ") : "WAA evaluator";
+  elements.waaTaskMeta.textContent = `${task.instruction} · 应用：${apps} · Evaluator：${evaluator} · Reset：${task.reset_paths.length} 条规则已配置`;
+}
+
+async function refreshWaaTasks({ force = false } = {}) {
+  const root = elements.waaRoot.value.trim();
+  if (!root) {
+    waaTasks = [];
+    elements.waaExample.replaceChildren();
+    renderWaaTaskMeta();
+    return;
+  }
+  if (!force && waaTaskCatalogRoot === root && waaTasks.length) return;
+  elements.waaExample.disabled = true;
+  elements.waaTaskMeta.textContent = "正在读取 WAA 任务与 Reset 规则…";
+  try {
+    const payload = await request(`/api/waa/tasks?root=${encodeURIComponent(root)}`);
+    const previous = elements.waaExample.value || defaultWaaExamplePath;
+    waaTasks = payload.tasks || [];
+    waaTaskCatalogRoot = root;
+    elements.waaExample.replaceChildren();
+    waaTasks.forEach((task) => {
+      const option = document.createElement("option");
+      option.value = task.example_path;
+      option.textContent = `${task.domain} · ${task.instruction}`;
+      elements.waaExample.append(option);
+    });
+    const selected = waaTasks.find((task) => task.example_path === previous);
+    elements.waaExample.value = selected?.example_path || waaTasks[0]?.example_path || "";
+    renderWaaTaskMeta();
+  } catch (error) {
+    waaTasks = [];
+    waaTaskCatalogRoot = null;
+    elements.waaExample.replaceChildren();
+    elements.waaTaskMeta.textContent = `任务目录加载失败：${error.message}`;
+  } finally {
+    elements.waaExample.disabled = isBusy();
+    renderRecordingSource();
+  }
+}
+
+function renderRecordingSource() {
+  const waa = usesWaaRecording();
+  elements.localRecordingFields.classList.toggle("hidden", waa);
+  elements.waaRecordingFields.classList.toggle("hidden", !waa);
+  elements.recordButton.disabled = isBusy()
+    || (!waa && !selectedWindow())
+    || (waa && !selectedWaaTask());
+}
+
 function switchView(view) {
   closeTaskDetail();
   document.body.classList.toggle("library-mode", view === "library");
@@ -197,7 +278,7 @@ function switchView(view) {
   elements.viewPanels.forEach((panel) => {
     panel.classList.toggle("hidden", panel.id !== `${view}-panel`);
   });
-  if (view === "record" && !localWindows.length) refreshWindows();
+  if (view === "record" && !usesWaaRecording() && !localWindows.length) refreshWindows();
   if (view === "library") refreshState();
 }
 
@@ -260,6 +341,10 @@ function populateTaskpacks(records) {
 
 function populateAgentOptions(options) {
   if (!options) return;
+  if (!elements.waaRoot.value.trim() && options.waa_defaults?.root) {
+    elements.waaRoot.value = options.waa_defaults.root;
+  }
+  defaultWaaExamplePath = options.waa_defaults?.example_path || defaultWaaExamplePath;
   const previousRuntimeModel = elements.model.value || options.defaults?.model;
   const previousRuntimeEffort = elements.reasoningEffort.value
     || options.defaults?.reasoning_effort;
@@ -458,6 +543,13 @@ function renderLibrary() {
         || task.semantic_experience.reasoning_effort;
       compiler.textContent = `由 ${compilerModel} / ${compilerEffort} 编译`;
       tags.append(compiler);
+      const compilerVariant = document.createElement("span");
+      const narrationKind = task.semantic_experience.narration_kind || "none";
+      compilerVariant.className = `mini-tag ${narrationKind === "human" ? "info" : ""}`;
+      compilerVariant.textContent = narrationKind === "human"
+        ? "人类讲解编译"
+        : (narrationKind === "task_instruction" ? "任务说明辅助编译" : "纯 Trace 编译");
+      tags.append(compilerVariant);
       const completion = document.createElement("span");
       completion.className = `mini-tag ${task.semantic_experience.completion.mode === "cycle" ? "info" : ""}`;
       completion.textContent = task.semantic_experience.completion.mode === "cycle"
@@ -830,9 +922,15 @@ function renderLibrary() {
     const taskComplete = candidate.outcome?.task_complete;
     outcome.className = `mini-tag ${taskComplete === true ? "ok" : "warn"}`;
     outcome.textContent = taskComplete === true
-      ? "任务完成"
+      ? candidate.outcome?.verified === true
+        ? "效果已独立验证"
+        : candidate.outcome?.verification_outcome === "completed_unverified"
+          ? "已完成 · 尚未独立验证"
+          : "任务完成"
       : taskComplete === false
-        ? `任务未完成${candidate.outcome?.stop_reason ? ` · ${candidate.outcome.stop_reason}` : ""}`
+        ? candidate.outcome?.verification_outcome === "reconciliation_required"
+          ? "结果冲突 · 需要协调"
+          : `任务未完成${candidate.outcome?.stop_reason ? ` · ${candidate.outcome.stop_reason}` : ""}`
         : "历史运行 · 结果未记录";
     if (candidate.outcome?.failure_message) {
       outcome.title = candidate.outcome.failure_message;
@@ -1070,7 +1168,7 @@ function renderLibrary() {
     if (recording.success) {
       actions.append(
         makeMiniButton(
-          "编译为经验",
+          "编译 / 重试",
           (button) => compileRecording(recording, button),
           true,
         ),
@@ -1246,6 +1344,7 @@ async function startNarrationCapture() {
     finalParts: [],
     segments: [],
     startedAt: performance.now(),
+    startedAtEpochMs: Date.now(),
     lastSegmentEnd: 0,
     audioArchived: false,
     transcriptionEngine: null,
@@ -1507,7 +1606,7 @@ async function submitNarration() {
 }
 
 function isBusy() {
-  return ["queued", "running", "stopping", "awaiting_narration"]
+  return ["queued", "running", "stopping", "awaiting_recording_start", "awaiting_narration"]
     .includes(elements.status.dataset.status);
 }
 
@@ -1522,6 +1621,9 @@ function setBusy(busy) {
   elements.adaptiveReasoning.disabled = busy;
   elements.instruction.disabled = busy;
   elements.viewTabs.forEach((button) => { button.disabled = busy; });
+  elements.recordSource.disabled = busy;
+  elements.waaRoot.disabled = busy;
+  elements.waaExample.disabled = busy;
   elements.recordWindow.disabled = busy;
   elements.recordName.disabled = busy;
   elements.recordModel.disabled = busy;
@@ -1530,7 +1632,9 @@ function setBusy(busy) {
   elements.compilerModel.disabled = busy;
   elements.compilerReasoningEffort.disabled = busy;
   elements.refreshWindows.disabled = busy;
-  elements.recordButton.disabled = busy || !selectedWindow();
+  elements.recordButton.disabled = busy
+    || (!usesWaaRecording() && !selectedWindow())
+    || (usesWaaRecording() && !selectedWaaTask());
   elements.refreshLibrary.disabled = busy;
   document.querySelectorAll(".mini-button").forEach((button) => {
     button.disabled = busy;
@@ -1549,8 +1653,8 @@ function renderJob(job) {
   elements.status.textContent = job.kind === "compilation" && job.status === "partial"
     ? "部分完成"
     : statusLabels[job.status] || job.status;
-  elements.jobMode.textContent = job.kind === "recording"
-    ? "录制"
+  elements.jobMode.textContent = ["recording", "waa_recording"].includes(job.kind)
+    ? (job.kind === "waa_recording" ? "WAA 录制" : "录制")
     : job.kind === "compilation"
       ? "编译"
       : job.kind === "revision"
@@ -1568,14 +1672,19 @@ function renderJob(job) {
     elements.jobLog.append(item);
   });
   elements.jobLog.scrollTop = elements.jobLog.scrollHeight;
-  const busy = ["queued", "running", "stopping", "awaiting_narration"].includes(job.status);
+  const busy = ["queued", "running", "stopping", "awaiting_recording_start", "awaiting_narration"].includes(job.status);
   elements.liveDot.classList.toggle(
     "active",
-    ["queued", "running", "stopping"].includes(job.status),
+    ["queued", "running", "stopping", "awaiting_recording_start"].includes(job.status),
   );
   elements.stopButton.classList.toggle(
     "hidden",
     !busy || !["execute", "record"].includes(job.mode),
+  );
+  elements.recordStopButton.classList.toggle(
+    "hidden",
+    job.mode !== "record"
+      || !["queued", "running", "stopping", "awaiting_recording_start"].includes(job.status),
   );
   setBusy(busy);
   if (job.result || job.error) {
@@ -1599,19 +1708,57 @@ function renderJob(job) {
   }
 }
 
+async function prepareWaaRecordingStart(job) {
+  if (waaGoSentJobId === job.job_id || waaGoStartingJobId === job.job_id) return;
+  waaGoStartingJobId = job.job_id;
+  try {
+    let audioStartedAtEpochMs = null;
+    if (job.narrated) {
+      await startNarrationCapture();
+      audioStartedAtEpochMs = narrationCapture.startedAtEpochMs;
+    }
+    const started = await request("/api/waa/recordings/go", {
+      method: "POST",
+      body: JSON.stringify({
+        job_id: job.job_id,
+        audio_started_at_epoch_ms: audioStartedAtEpochMs,
+      }),
+    });
+    waaGoSentJobId = job.job_id;
+    renderJob(started);
+  } catch (error) {
+    if (narrationCapture) await discardNarrationCapture();
+    showRecordError(`WAA 同步启动失败：${error.message}`);
+    try {
+      await request(`/api/jobs/${job.job_id}/stop`, { method: "POST", body: "{}" });
+    } catch (_) { /* original error is more useful */ }
+  } finally {
+    waaGoStartingJobId = null;
+  }
+}
+
 async function pollJob() {
   if (!activeJobId) return;
   try {
     const job = await request(`/api/jobs/${activeJobId}`);
     renderJob(job);
-    if (job.status === "awaiting_narration") {
+    if (job.status === "awaiting_recording_start" && job.kind === "waa_recording") {
+      await prepareWaaRecordingStart(job);
+      pollTimer = setTimeout(pollJob, 250);
+    } else if (job.status === "awaiting_narration") {
       await prepareNarrationReview(job);
     } else if (["queued", "running", "stopping"].includes(job.status)) {
       pollTimer = setTimeout(pollJob, 850);
-    } else if ((["recording", "compilation", "revision", "task_model_revision"].includes(job.kind)
+    } else if ((["recording", "waa_recording", "compilation", "revision", "task_model_revision"].includes(job.kind)
       || job.result?.candidate_experience)
       && refreshedRecordingJobId !== job.job_id) {
-      if (job.kind === "recording" && narrationCapture) await discardNarrationCapture();
+      if (["recording", "waa_recording"].includes(job.kind) && narrationCapture) {
+        await discardNarrationCapture();
+      }
+      if (job.kind === "waa_recording") {
+        waaGoSentJobId = null;
+        waaGoStartingJobId = null;
+      }
       refreshedRecordingJobId = job.job_id;
       await refreshState();
     }
@@ -1649,18 +1796,21 @@ async function refreshState() {
     && state.capabilities?.directed_task_graph === true
     && state.capabilities?.task_model_revision === true
     && state.capabilities?.graph_native_guidance === true
-    && state.capabilities?.independent_guidance_delete === true;
+    && state.capabilities?.independent_guidance_delete === true
+    && state.capabilities?.waa_narrated_recording === true
+    && state.capabilities?.waa_task_catalog === true;
   elements.version.textContent = backendSupportsV14
     ? `v${state.version}`
     : `v${state.version} · 需要重启`;
   if (!backendSupportsIncrementalGuidance) {
     showError("网页后台仍是旧版本。请停止并重新启动 trace2task web；在此之前已确认经验可能被整包覆写。");
   } else if (!backendSupportsV14) {
-    showError("网页后台还没有加载 V0.14.1。请停止并重新启动 trace2task web；重启前 Guidance 仍可能只按旧状态字段检索。");
+    showError("网页后台还没有加载当前版本。请停止并重新启动 trace2task web；重启前 WAA 同步讲解录制不可用。");
   }
   candidates = state.candidates || [];
   recordings = state.recordings || [];
   populateAgentOptions(state.agent_options);
+  await refreshWaaTasks();
   populateTaskpacks(state.taskpacks || []);
   return state;
 }
@@ -1690,7 +1840,7 @@ function renderWindowMeta() {
   const windowInfo = selectedWindow();
   if (!windowInfo) {
     elements.windowMeta.textContent = "没有找到可录制的可见窗口。";
-    elements.recordButton.disabled = true;
+    elements.recordButton.disabled = !usesWaaRecording() || !selectedWaaTask();
     return;
   }
   elements.windowMeta.textContent = `${windowInfo.client_width} × ${windowInfo.client_height} · ${windowInfo.is_foreground ? "当前前台" : "录制时自动切换到前台"}`;
@@ -1702,17 +1852,27 @@ async function startRecording() {
   if (dictationSession) {
     return showRecordError("请先结束语音输入并等待转写完成");
   }
+  const waa = usesWaaRecording();
   const windowInfo = selectedWindow();
   const taskId = elements.recordName.value.trim();
-  if (!windowInfo) return showRecordError("请选择一个本地目标窗口");
+  if (!waa && !windowInfo) return showRecordError("请选择一个本地目标窗口");
   if (!taskId) return showRecordError("请输入经验名称");
+  if (waa && !elements.waaRoot.value.trim()) return showRecordError("请输入 WAA 根目录");
+  if (waa && !selectedWaaTask()) return showRecordError("请选择一个 WAA 标准任务");
   const narrated = elements.recordNarration.checked;
   setBusy(true);
   try {
-    if (narrated) await startNarrationCapture();
-    const job = await request("/api/recordings", {
+    if (!waa && narrated) await startNarrationCapture();
+    const job = await request(waa ? "/api/waa/recordings" : "/api/recordings", {
       method: "POST",
-      body: JSON.stringify({
+      body: JSON.stringify(waa ? {
+        waa_root: elements.waaRoot.value.trim(),
+        example_path: elements.waaExample.value.trim(),
+        task_id: taskId,
+        narrated,
+        model: elements.recordModel.value,
+        reasoning_effort: elements.recordReasoningEffort.value,
+      } : {
         handle: windowInfo.handle,
         task_id: taskId,
         narrated,
@@ -1777,7 +1937,7 @@ async function openLocal(path) {
 
 async function compileRecording(recording, button) {
   if (isBusy()) return;
-  const originalLabel = button?.textContent || "编译为经验";
+  const originalLabel = button?.textContent || "编译 / 重试";
   if (button) {
     button.disabled = true;
     button.textContent = "正在提交…";
@@ -2035,7 +2195,10 @@ async function startJob(mode) {
 async function stopJob() {
   if (!activeJobId) return;
   elements.stopButton.disabled = true;
+  elements.recordStopButton.disabled = true;
+  elements.narrationDiscard.disabled = true;
   try {
+    await discardNarrationCapture();
     const job = await request(`/api/jobs/${activeJobId}/stop`, {
       method: "POST",
       body: "{}",
@@ -2045,6 +2208,8 @@ async function stopJob() {
     showError(error.message);
   } finally {
     elements.stopButton.disabled = false;
+    elements.recordStopButton.disabled = false;
+    elements.narrationDiscard.disabled = false;
   }
 }
 
@@ -2059,6 +2224,10 @@ async function initialize() {
       renderJob(state.active_job);
       if (state.active_job.status === "awaiting_narration") {
         await prepareNarrationReview(state.active_job);
+      } else if (state.active_job.status === "awaiting_recording_start"
+        && state.active_job.kind === "waa_recording") {
+        await prepareWaaRecordingStart(state.active_job);
+        pollTimer = setTimeout(pollJob, 250);
       } else if (["queued", "running", "stopping"].includes(state.active_job.status)) {
         pollTimer = setTimeout(pollJob, 500);
       }
@@ -2087,6 +2256,15 @@ elements.viewTabs.forEach((button) => {
   button.addEventListener("click", () => switchView(button.dataset.view));
 });
 elements.recordWindow.addEventListener("change", renderWindowMeta);
+elements.recordSource.addEventListener("change", () => {
+  renderRecordingSource();
+  if (usesWaaRecording()) refreshWaaTasks();
+});
+elements.waaRoot.addEventListener("change", () => refreshWaaTasks({ force: true }));
+elements.waaExample.addEventListener("change", () => {
+  renderWaaTaskMeta();
+  renderRecordingSource();
+});
 elements.recordModel.addEventListener("change", () => {
   syncCompilerSettings(elements.recordModel.value, elements.recordReasoningEffort.value);
 });
@@ -2101,7 +2279,9 @@ elements.compilerReasoningEffort.addEventListener("change", () => {
 });
 elements.refreshWindows.addEventListener("click", refreshWindows);
 elements.recordButton.addEventListener("click", startRecording);
+elements.recordStopButton.addEventListener("click", stopJob);
 elements.narrationSubmit.addEventListener("click", submitNarration);
+elements.narrationDiscard.addEventListener("click", stopJob);
 elements.refreshLibrary.addEventListener("click", async () => {
   elements.refreshLibrary.disabled = true;
   try {
@@ -2113,4 +2293,5 @@ elements.refreshLibrary.addEventListener("click", async () => {
   }
 });
 
+renderRecordingSource();
 initialize();

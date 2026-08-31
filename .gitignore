@@ -9,3 +9,6 @@ build/
 runs/
 taskpacks/generated/
 taskpacks/.trash/
+taskpacks/*-windows-taskpack/
+evaluations/
+tmp/

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -38,9 +39,59 @@ NARRATION_CLAIM_TYPES = {"goal", "strategy", "observation", "recovery", "example
 NARRATION_CLAIM_VERDICTS = {"supported", "advisory", "rejected"}
 DEFAULT_COMPILER_MODEL = "gpt-5.6-sol"
 DEFAULT_COMPILER_REASONING_EFFORT = "high"
+COMPILER_PREFLIGHT_MODEL = "gpt-5.6-luna"
+COMPILER_PREFLIGHT_TIMEOUT_SECONDS = 45
+COMPILER_RESPONSE_IDLE_TIMEOUT_SECONDS = 90
+COMPILER_HARD_TIMEOUT_SECONDS = 600
 
 BinaryResolver = Callable[[str], str]
 SessionFactory = Callable[..., CodexAppServerSession]
+
+
+def probe_codex_compiler_connection(
+    *,
+    model: str = COMPILER_PREFLIGHT_MODEL,
+    codex_bin: str = "codex",
+    timeout_seconds: float = COMPILER_PREFLIGHT_TIMEOUT_SECONDS,
+    binary_resolver: BinaryResolver = resolve_codex_binary,
+    session_factory: SessionFactory = CodexAppServerSession,
+) -> dict[str, Any]:
+    """Run a small text-only turn before spending time building compiler prompts."""
+
+    executable = binary_resolver(codex_bin)
+    session = session_factory(
+        executable,
+        model=model,
+        reasoning_effort="low",
+        cwd=Path.cwd(),
+        timeout_seconds=timeout_seconds,
+    )
+    started = time.perf_counter()
+    try:
+        output = session.run_turn(
+            prompt=(
+                "This is a Trace2Task compiler connectivity preflight. "
+                'Return exactly {"status":"ok"}.'
+            ),
+            image_path=None,
+            output_schema={
+                "type": "object",
+                "properties": {"status": {"type": "string", "enum": ["ok"]}},
+                "required": ["status"],
+                "additionalProperties": False,
+            },
+        )
+        payload = json.loads(output.strip())
+        if payload != {"status": "ok"}:
+            raise RuntimeError("Codex compiler connectivity preflight returned an invalid result")
+    finally:
+        session.close()
+    return {
+        "status": "completed",
+        "model": model,
+        "reasoning_effort": "low",
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+    }
 
 
 @dataclass(frozen=True)
@@ -143,6 +194,8 @@ class SemanticExperience:
     terminal_states: tuple[TerminalState, ...]
     narration_claims: tuple[NarrationClaim, ...]
     source_type: str
+    narration_available: bool
+    narration_kind: str
     model: str
     reasoning_effort: str
     review_status: str
@@ -379,6 +432,8 @@ class SemanticCompilation:
     model: str
     reasoning_effort: str
     review_status: str
+    narration_available: bool = False
+    narration_kind: str = "none"
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -914,8 +969,9 @@ def _experience_document(
     narration_claims: Sequence[NarrationClaim],
     model: str,
     reasoning_effort: str,
-    narration_available: bool,
+    narration_kind: str,
 ) -> dict[str, Any]:
+    narration_available = narration_kind != "none"
     return {
         "schema_version": "0.4",
         "task_id": task_id,
@@ -924,6 +980,7 @@ def _experience_document(
             "trace": "reference/trace.jsonl",
             "demonstration": "demonstration.json",
             "narration": "reference/narration.json" if narration_available else None,
+            "narration_kind": narration_kind,
             "policy": "immutable_observation_evidence",
             "runtime_motor_policy": "semantic_intent_only_no_recorded_coordinates",
         },
@@ -1052,6 +1109,27 @@ def load_semantic_experience(
     source_type = _string(source.get("type"), "experience.source.type")
     if source_type != "human_trace":
         raise ValueError("V0.7 semantic experience must derive from a human Trace")
+    narration_source = source.get("narration")
+    if narration_source is not None and (
+        not isinstance(narration_source, str) or not narration_source.strip()
+    ):
+        raise ValueError("experience.source.narration must be null or a non-empty path")
+    narration_kind = source.get("narration_kind")
+    if narration_kind is None:
+        narration_kind = "none"
+        if isinstance(narration_source, str):
+            narration_path = (source_path.parent / narration_source).resolve()
+            if narration_path.is_relative_to(source_path.parent.resolve()) and narration_path.is_file():
+                narration_payload = _load_json(narration_path, "experience narration")
+                narration_kind = (
+                    "task_instruction"
+                    if narration_payload.get("transcription_engine") == "waa_task_instruction"
+                    else "human"
+                )
+    if narration_kind not in {"none", "task_instruction", "human"}:
+        raise ValueError("experience.source.narration_kind is invalid")
+    if (narration_source is None) != (narration_kind == "none"):
+        raise ValueError("experience narration path and narration_kind disagree")
     task_root = source_path.parent.resolve()
     allowed_frames = {
         path.resolve().relative_to(task_root).as_posix()
@@ -1101,6 +1179,8 @@ def load_semantic_experience(
         terminal_states=terminal_states,
         narration_claims=narration_claims,
         source_type=source_type,
+        narration_available=narration_source is not None,
+        narration_kind=narration_kind,
         model=_string(compiler.get("model"), "experience.compiler.model"),
         reasoning_effort=_string(
             compiler.get("reasoning_effort"), "experience.compiler.reasoning_effort"
@@ -1615,6 +1695,13 @@ def _aligned_narration_context(
         return []
     raw_segments = narration.get("segments")
     segments = raw_segments if isinstance(raw_segments, list) else []
+    raw_audio_offset = narration.get("audio_start_trace_elapsed_ms")
+    audio_offset = (
+        float(raw_audio_offset)
+        if isinstance(raw_audio_offset, (int, float))
+        and not isinstance(raw_audio_offset, bool)
+        else 0.0
+    )
     if not segments:
         transcript = _deduplicate_narration_text(narration.get("transcript"))
         return (
@@ -1646,33 +1733,50 @@ def _aligned_narration_context(
             or end_ms < start_ms
         ):
             continue
+        trace_start_ms = float(start_ms) + audio_offset
+        trace_end_ms = float(end_ms) + audio_offset
         overlapping = [
             index
             for index, action in enumerate(timeline)
-            if float(action.get("end_elapsed_ms", 0.0)) >= float(start_ms)
-            and float(action.get("start_elapsed_ms", 0.0)) <= float(end_ms)
+            if float(action.get("end_elapsed_ms", 0.0)) >= trace_start_ms
+            and float(action.get("start_elapsed_ms", 0.0)) <= trace_end_ms
         ]
         alignment = "timestamp_overlap"
         if not overlapping:
-            midpoint = (float(start_ms) + float(end_ms)) / 2
-            nearest = min(
-                range(len(timeline)),
-                key=lambda index: abs(
-                    (
-                        float(timeline[index].get("start_elapsed_ms", 0.0))
-                        + float(timeline[index].get("end_elapsed_ms", 0.0))
-                    )
-                    / 2
-                    - midpoint
-                ),
-            )
-            overlapping = [nearest]
-            alignment = "nearest_action"
+            spoken_before = [
+                index
+                for index, action in enumerate(timeline)
+                if trace_end_ms
+                <= float(action.get("start_elapsed_ms", 0.0))
+                <= trace_end_ms + 4_000
+            ]
+            if spoken_before:
+                overlapping = [spoken_before[0]]
+                alignment = "spoken_before_action"
+            else:
+                midpoint = (trace_start_ms + trace_end_ms) / 2
+                nearest = min(
+                    range(len(timeline)),
+                    key=lambda index: abs(
+                        (
+                            float(timeline[index].get("start_elapsed_ms", 0.0))
+                            + float(timeline[index].get("end_elapsed_ms", 0.0))
+                        )
+                        / 2
+                        - midpoint
+                    ),
+                )
+                overlapping = [nearest]
+                alignment = "nearest_action"
         aligned.append(
             {
                 "segment": segment_index,
-                "start_ms": round(float(start_ms), 1),
-                "end_ms": round(float(end_ms), 1),
+                "audio_start_ms": round(float(start_ms), 1),
+                "audio_end_ms": round(float(end_ms), 1),
+                "start_ms": round(trace_start_ms, 1),
+                "end_ms": round(trace_end_ms, 1),
+                "trace_start_ms": round(trace_start_ms, 1),
+                "trace_end_ms": round(trace_end_ms, 1),
                 "text": text,
                 "aligned_action_range": [min(overlapping), max(overlapping)],
                 "alignment": alignment,
@@ -1871,6 +1975,7 @@ def compile_windows_semantic_experience(
     reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
     codex_bin: str = "codex",
     timeout_seconds: float = 300,
+    use_narration: bool = True,
     binary_resolver: BinaryResolver = resolve_codex_binary,
     session_factory: SessionFactory = CodexAppServerSession,
 ) -> SemanticCompilation:
@@ -1885,7 +1990,20 @@ def compile_windows_semantic_experience(
     task_instruction = _string(task_data.get("instruction"), "task.instruction")
     timeline, all_frames, boundary_hints = _prepare_timeline(source_path.parent)
     evidence_frames = _sample_frames(all_frames)
-    narration = load_narration(source_path.parent / "reference" / "narration.json")
+    narration = (
+        load_narration(source_path.parent / "reference" / "narration.json")
+        if use_narration
+        else None
+    )
+    narration_kind = (
+        "none"
+        if narration is None
+        else (
+            "task_instruction"
+            if narration.get("transcription_engine") == "waa_task_instruction"
+            else "human"
+        )
+    )
     original_evidence_paths = tuple(
         (source_path.parent / frame).resolve() for frame in evidence_frames
     )
@@ -1914,6 +2032,8 @@ def compile_windows_semantic_experience(
             reasoning_effort=reasoning_effort,
             cwd=Path.cwd(),
             timeout_seconds=timeout_seconds,
+            progress_timeout_seconds=COMPILER_RESPONSE_IDLE_TIMEOUT_SECONDS,
+            hard_timeout_seconds=max(COMPILER_HARD_TIMEOUT_SECONDS, timeout_seconds),
         )
         try:
             for attempt in range(2):
@@ -1972,7 +2092,7 @@ def compile_windows_semantic_experience(
                     narration_claims=narration_claims,
                     model=model,
                     reasoning_effort=reasoning_effort,
-                    narration_available=narration is not None,
+                    narration_kind=narration_kind,
                 )
                 experience_path = _attach_experience(source_path, document)
                 loaded = load_semantic_experience(
@@ -1986,6 +2106,8 @@ def compile_windows_semantic_experience(
                     model=model,
                     reasoning_effort=reasoning_effort,
                     review_status=loaded.review_status,
+                    narration_available=loaded.narration_available,
+                    narration_kind=loaded.narration_kind,
                 )
         finally:
             session.close()

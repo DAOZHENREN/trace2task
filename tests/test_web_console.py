@@ -2,21 +2,39 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import pygame
 import pytest
 import yaml
 
 from trace2task import web_console
+from trace2task.codex_app_server import CodexTurnTimeoutError
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
 from trace2task.windows_runner import WindowsAgentRunFailed
+
+
+@pytest.fixture(autouse=True)
+def _stub_compiler_connectivity_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        web_console,
+        "probe_codex_compiler_connection",
+        lambda **kwargs: {
+            "status": "completed",
+            "model": kwargs.get("model", "gpt-5.6-luna"),
+            "reasoning_effort": "low",
+            "elapsed_ms": 12.0,
+        },
+    )
 
 
 def _write_windows_task(
@@ -335,6 +353,9 @@ class SuccessfulResult:
         ]
     )
     failure_message: str | None = None
+    verification_outcome: str | None = None
+    verified: bool = False
+    verification_receipt_path: str | None = None
 
 
 def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path: Path) -> None:
@@ -541,6 +562,41 @@ def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Pat
         "task_complete": False,
         "stop_reason": "action_limit",
     }
+
+
+def test_feedback_candidate_preserves_effect_verification_outcome(tmp_path: Path) -> None:
+    task_path = _write_windows_task(tmp_path)
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["actions"].extend(["type_text", "press_key"])
+    task_path.write_text(yaml.safe_dump(task, allow_unicode=True), encoding="utf-8")
+    trace_path = tmp_path / "runs" / "verified-agent" / "trace.jsonl"
+    trace_path.parent.mkdir(parents=True)
+    trace_path.write_text('{"seq": 0}\n', encoding="utf-8")
+    receipt_path = trace_path.with_name("verification.json")
+    receipt_path.write_text('{"outcome": "verified"}\n', encoding="utf-8")
+    controller = WebConsoleController(
+        tmp_path,
+        runner=lambda *args, **kwargs: SuccessfulResult(
+            task_complete=True,
+            stop_reason="model_complete",
+            trace_path=str(trace_path),
+            verification_outcome="verified",
+            verified=True,
+            verification_receipt_path=str(receipt_path),
+        ),
+    )
+
+    job = controller.start_job(
+        task_path=task_path.relative_to(tmp_path).as_posix(),
+        instruction="执行并保存独立验证结果",
+        execute=True,
+    )
+    controller.wait(job["job_id"])
+    candidate = controller.list_candidates()[0]
+
+    assert candidate["outcome"]["verification_outcome"] == "verified"
+    assert candidate["outcome"]["verified"] is True
+    assert candidate["outcome"]["verification_receipt_path"] == str(receipt_path)
 
 
 def test_failed_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
@@ -758,6 +814,48 @@ def test_narrated_recording_waits_for_review_then_archives_and_compiles(
         controller.submit_recording_narration(job.job_id, transcript="重复提交")
 
 
+def test_narrated_recording_can_be_discarded_while_waiting_for_review(
+    tmp_path: Path,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path)
+    audio_path = trace_path.parent / "narration.webm"
+    audio_path.write_bytes(b"poor audio")
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+    job = ConsoleJob(
+        job_id="discard-narration-job",
+        task_path="",
+        task_id="讲解示范",
+        instruction="录制带讲解的示范",
+        mode="record",
+        kind="recording",
+        narrated=True,
+        status="awaiting_narration",
+        result={
+            "trace_path": str(trace_path),
+            "success": True,
+            "narration": {
+                "status": "awaiting_review",
+                "audio_path": str(audio_path),
+                "transcript": "错误的转写",
+            },
+        },
+    )
+    controller._jobs[job.job_id] = job
+    controller._active_job_id = job.job_id
+
+    stopped = controller.stop_job(job.job_id)
+
+    assert stopped["status"] == "stopped"
+    assert stopped["stop_requested"] is True
+    assert stopped["result"]["narration"] == {
+        "status": "discarded",
+        "audio_discarded": True,
+    }
+    assert trace_path.is_file()
+    assert not audio_path.exists()
+    assert "保留原始 Trace" in stopped["logs"][-1]
+
+
 def test_narrated_recording_uses_local_turbo_before_human_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -888,6 +986,409 @@ def test_voice_dictation_reuses_local_turbo_without_archiving_audio(
     )
     assert not Path(seen["audio_path"]).exists()
     assert not list(tmp_path.rglob("dictation.webm"))
+
+
+def test_web_controller_starts_and_releases_a_narrated_waa_recording(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waa_root = tmp_path / "WindowsAgentArena"
+    client_root = waa_root / "src" / "win-arena-container" / "client"
+    example_path = client_root / "evaluation_examples_windows" / "example.json"
+    example_path.parent.mkdir(parents=True)
+    example_path.write_text(
+        json.dumps({"id": "waa-example", "instruction": "Type hello in Notepad."}),
+        encoding="utf-8",
+    )
+    reset_spec = (
+        tmp_path
+        / "integrations"
+        / "windows_agent_arena"
+        / "reset_specs"
+        / "notepad.json"
+    )
+    reset_spec.parent.mkdir(parents=True)
+    reset_spec.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "tasks": {
+                    "waa-example": {
+                        "must_not_exist": [
+                            r"C:\Users\Docker\Documents\draft.txt"
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundled_client = reset_spec.parents[1] / "client"
+    bundled_client.mkdir()
+    (bundled_client / "trace2task_reset.py").write_text(
+        "# reset helper\n",
+        encoding="utf-8",
+    )
+    (client_root / "trace2task_human_trace.py").write_text("# recorder\n", encoding="utf-8")
+    process_created = threading.Event()
+
+    class BlockingStdout:
+        def __init__(self) -> None:
+            self.lines: queue.Queue[str | None] = queue.Queue()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> str:
+            line = self.lines.get(timeout=2)
+            if line is None:
+                raise StopIteration
+            return line
+
+        def readline(self) -> str:
+            try:
+                return next(self)
+            except StopIteration:
+                return ""
+
+    class FakeStdin:
+        def __init__(self, process) -> None:
+            self.process = process
+            self.values: list[str] = []
+
+        def write(self, value: str) -> int:
+            self.values.append(value)
+            if value.strip() == "GO":
+                self.process.stdout.lines.put(
+                    web_console.WAA_CONTROL_EVENT_PREFIX
+                    + json.dumps(
+                        {
+                            "type": "started",
+                            "trace_started_at": "1970-01-01T00:16:40.500+00:00",
+                        }
+                    )
+                    + "\n"
+                )
+            return len(value)
+
+        def flush(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            self.args = command
+            self.kwargs = kwargs
+            self.stdout = BlockingStdout()
+            self.stdin = FakeStdin(self)
+            self.returncode: int | None = None
+            self.finished = threading.Event()
+            session_index = command.index("--session-id")
+            self.session_id = command[session_index + 1]
+            self.host_run_dir = client_root / "trace2task_recordings" / self.session_id
+            self.host_trace_path = self.host_run_dir / "trace.jsonl"
+            self.stdout.lines.put(
+                web_console.WAA_CONTROL_EVENT_PREFIX
+                + json.dumps(
+                    {
+                        "type": "ready",
+                        "waa_task_id": "waa-example",
+                        "run_dir": f"/client/trace2task_recordings/{self.session_id}",
+                        "reset_receipt": {
+                            "status": "verified",
+                            "task_id": "waa-example",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            process_created.set()
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            if not self.finished.wait(timeout):
+                raise TimeoutError("fake WAA recorder did not finish")
+            return int(self.returncode or 0)
+
+        def finish(self) -> None:
+            self.host_run_dir.mkdir(parents=True)
+            self.host_trace_path.write_text('{"seq":0}\n', encoding="utf-8")
+            (self.host_run_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "task_id": "waa-narrated",
+                        "success": True,
+                        "source": "windows_human",
+                        "started_at": "2026-08-31T00:00:00+00:00",
+                        "stop_reason": "success_marked",
+                        "input_event_count": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (self.host_run_dir / "reset-receipt.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "0.1",
+                        "status": "verified",
+                        "task_id": "waa-example",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.stdout.lines.put(
+                web_console.WAA_CONTROL_EVENT_PREFIX
+                + json.dumps(
+                    {
+                        "type": "completed",
+                        "result": {
+                            "trace_path": (
+                                f"/client/trace2task_recordings/{self.session_id}/trace.jsonl"
+                            ),
+                            "task_id": "waa-narrated",
+                            "success": True,
+                            "stop_reason": "success_marked",
+                            "input_event_count": 1,
+                        },
+                    }
+                )
+                + "\n"
+            )
+            self.returncode = 0
+            self.stdout.lines.put(None)
+            self.finished.set()
+
+        def terminate(self) -> None:
+            self.returncode = 1
+            self.stdout.lines.put(None)
+            self.finished.set()
+
+        kill = terminate
+
+    spawned: list[FakeProcess] = []
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        process = FakeProcess(command, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(web_console.subprocess, "Popen", fake_popen)
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    started = controller.start_waa_recording(
+        waa_root=waa_root,
+        example_path=example_path,
+        task_id="waa-narrated",
+        narrated=True,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert started["kind"] == "waa_recording"
+    assert process_created.wait(2)
+    deadline = time.monotonic() + 2
+    while controller.get_job(started["job_id"])["status"] != "awaiting_recording_start":
+        if time.monotonic() >= deadline:
+            raise AssertionError("WAA recording never became ready")
+        time.sleep(0.01)
+
+    released = controller.go_waa_recording(
+        started["job_id"],
+        audio_started_at_epoch_ms=1_000_000.0,
+    )
+    assert released["status"] == "running"
+    assert spawned[0].stdin.values == ["GO\n"]
+    assert "--wait-for-go" in spawned[0].args
+    assert "--no-task-narration" in spawned[0].args
+    assert "-e" in spawned[0].args
+    reset_env = next(
+        value
+        for value in spawned[0].args
+        if value.startswith("TRACE2TASK_WAA_RESET_SPEC=")
+    )
+    assert reset_env.endswith(".json")
+
+    spawned[0].finish()
+    finished = controller.wait(started["job_id"], timeout=2)
+    assert finished["status"] == "awaiting_narration"
+    imported_trace = Path(finished["result"]["trace_path"])
+    assert imported_trace.is_relative_to((tmp_path / "runs").resolve())
+    assert imported_trace.read_bytes() == spawned[0].host_trace_path.read_bytes()
+    assert finished["result"]["audio_start_trace_elapsed_ms"] == -500.0
+    imported_receipt = Path(finished["result"]["reset_receipt_path"])
+    assert imported_receipt.parent == imported_trace.parent
+    assert json.loads(imported_receipt.read_text(encoding="utf-8"))["status"] == (
+        "verified"
+    )
+
+
+def test_waa_recording_refuses_a_task_without_a_reset_spec(tmp_path: Path) -> None:
+    waa_root = tmp_path / "WindowsAgentArena"
+    client_root = waa_root / "src" / "win-arena-container" / "client"
+    example_path = client_root / "evaluation_examples_windows" / "example.json"
+    example_path.parent.mkdir(parents=True)
+    example_path.write_text(
+        json.dumps({"id": "uncovered-task", "instruction": "Type hello."}),
+        encoding="utf-8",
+    )
+    (client_root / "trace2task_human_trace.py").write_text(
+        "# recorder\n",
+        encoding="utf-8",
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    with pytest.raises(FileNotFoundError, match="没有匹配的 reset spec"):
+        controller.start_waa_recording(
+            waa_root=waa_root,
+            example_path=example_path,
+            task_id="uncovered",
+        )
+
+
+def test_web_controller_lists_only_reset_ready_waa_tasks(tmp_path: Path) -> None:
+    waa_root = tmp_path / "WindowsAgentArena"
+    example_root = (
+        waa_root
+        / "src"
+        / "win-arena-container"
+        / "client"
+        / "evaluation_examples_windows"
+        / "examples"
+        / "notepad"
+    )
+    example_root.mkdir(parents=True)
+    covered = example_root / "covered.json"
+    covered.write_text(
+        json.dumps(
+            {
+                "id": "covered-task",
+                "instruction": "Create draft.txt in Documents.",
+                "related_apps": ["notepad"],
+                "evaluator": {"func": ["exact_match", "compare_text_file"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (example_root / "uncovered.json").write_text(
+        json.dumps({"id": "uncovered-task", "instruction": "Ignore me."}),
+        encoding="utf-8",
+    )
+    reset_spec = (
+        tmp_path
+        / "integrations"
+        / "windows_agent_arena"
+        / "reset_specs"
+        / "notepad.json"
+    )
+    reset_spec.parent.mkdir(parents=True)
+    reset_spec.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "tasks": {
+                    "covered-task": {
+                        "must_not_exist": [
+                            r"C:\Users\Docker\Documents\draft.txt"
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    tasks = controller.list_waa_tasks(waa_root)
+
+    assert tasks == [
+        {
+            "id": "covered-task",
+            "domain": "notepad",
+            "instruction": "Create draft.txt in Documents.",
+            "related_apps": ["notepad"],
+            "evaluator": ["exact_match", "compare_text_file"],
+            "example_path": (
+                "evaluation_examples_windows/examples/notepad/covered.json"
+            ),
+            "reset_spec": str(reset_spec.resolve()),
+            "reset_paths": [r"C:\Users\Docker\Documents\draft.txt"],
+        }
+    ]
+
+
+def test_waa_recording_reuses_turbo_review_and_narration_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, run_name="waa-recording")
+
+    class FakeTranscriber:
+        def transcribe(
+            self,
+            audio_path: Path,
+            *,
+            cache_dir: Path,
+            initial_prompt: str,
+        ) -> LocalTranscription:
+            return LocalTranscription(
+                transcript="先打开菜单，再选择目标。",
+                segments=[{"start_ms": 800.0, "end_ms": 1400.0, "text": "选择目标"}],
+                language="zh",
+                language_probability=0.99,
+                model="turbo",
+                device="cuda",
+                compute_type="float16",
+            )
+
+    controller = WebConsoleController(
+        tmp_path,
+        runner=lambda *args, **kwargs: FakeResult(),
+        narration_transcriber=FakeTranscriber(),
+    )
+    job = ConsoleJob(
+        job_id="waa-narration-job",
+        task_path="",
+        task_id="WAA 人工讲解",
+        instruction="录制 WAA 示范",
+        mode="record",
+        kind="waa_recording",
+        narrated=True,
+        status="awaiting_narration",
+        result={
+            "trace_path": str(trace_path),
+            "success": True,
+            "audio_start_trace_elapsed_ms": -500.0,
+        },
+    )
+    controller._jobs[job.job_id] = job
+    controller._active_job_id = job.job_id
+    compiled = threading.Event()
+    monkeypatch.setattr(
+        controller,
+        "_run_recording_compilation",
+        lambda *args: compiled.set(),
+    )
+
+    transcribed = controller.transcribe_recording_narration(
+        job.job_id,
+        audio_base64=base64.b64encode(b"webm").decode("ascii"),
+        mime_type="audio/webm",
+    )
+    submitted = controller.submit_recording_narration(
+        job.job_id,
+        transcript=transcribed["transcription"]["transcript"],
+        segments=transcribed["transcription"]["segments"],
+        transcription_engine="faster_whisper:turbo",
+    )
+
+    assert submitted["status"] == "queued"
+    assert compiled.wait(2)
+    narration = json.loads(
+        (trace_path.parent / "narration.json").read_text(encoding="utf-8")
+    )
+    assert narration["audio_start_trace_elapsed_ms"] == -500.0
+    assert narration["transcription_engine"] == "faster_whisper:turbo"
 
 
 def test_taskpack_listing_exposes_active_human_guidance(tmp_path: Path) -> None:
@@ -1096,6 +1597,230 @@ def test_web_controller_can_retry_compiling_a_saved_recording(
         controller.compile_recording("README.md")
 
 
+def test_waa_narration_pair_preserves_trace_and_compiler_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, task_id="waa-pair-example")
+    compile_calls: list[tuple[Path, str]] = []
+    semantic_calls: list[tuple[Path, bool]] = []
+
+    def compiler(
+        source: Path,
+        output: Path,
+        *,
+        task_id_override: str,
+    ) -> FakeCompilation:
+        compile_calls.append((source, task_id_override))
+        task_dir = output / f"pair-{len(compile_calls)}"
+        reference_dir = task_dir / "reference"
+        reference_dir.mkdir(parents=True)
+        (reference_dir / "trace.jsonl").write_bytes(source.read_bytes())
+        task_path = task_dir / "task.yaml"
+        task_path.write_text(
+            yaml.safe_dump(
+                {"id": task_id_override, "experience": {}},
+                sort_keys=False,
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
+        return FakeCompilation(task_path=str(task_path))
+
+    def semantic_compiler(
+        task_path: Path,
+        *,
+        model: str,
+        reasoning_effort: str,
+        use_narration: bool,
+    ) -> FakeSemanticCompilation:
+        assert model == "gpt-5.6-sol"
+        assert reasoning_effort == "high"
+        semantic_calls.append((task_path, use_narration))
+        return FakeSemanticCompilation(
+            experience_path=str(task_path.with_name("experience.yaml"))
+        )
+
+    monkeypatch.setattr(web_console, "compile_trace", compiler)
+    monkeypatch.setattr(
+        web_console,
+        "compile_windows_semantic_experience",
+        semantic_compiler,
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    result = controller._compile_waa_narration_pair(
+        trace_path,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    compiled_path = Path(result["variants"]["compiled"]["task_path"])
+    narrated_path = Path(result["variants"]["narrated_compiled"]["task_path"])
+    compiled_task = yaml.safe_load(compiled_path.read_text(encoding="utf-8"))
+    narrated_task = yaml.safe_load(narrated_path.read_text(encoding="utf-8"))
+    compiled_trace = compiled_path.parent / "reference" / "trace.jsonl"
+    narrated_trace = narrated_path.parent / "reference" / "trace.jsonl"
+
+    assert [source for source, _task_id in compile_calls] == [trace_path, trace_path]
+    assert semantic_calls == [(compiled_path, False), (narrated_path, True)]
+    assert compiled_trace.read_bytes() == narrated_trace.read_bytes() == trace_path.read_bytes()
+    assert compiled_task["id"] != narrated_task["id"]
+    assert compiled_task["experience"]["family_id"] == result["family_id"]
+    assert narrated_task["experience"]["family_id"] == result["family_id"]
+
+
+@pytest.mark.parametrize(
+    ("compiler_failure", "expected_category"),
+    [
+        (
+            RuntimeError(
+                "Codex did not complete its model response or network reconnect within 300 seconds"
+            ),
+            "codex_connectivity",
+        ),
+        (
+            CodexTurnTimeoutError(
+                "response_in_progress_timeout",
+                "Codex response stopped making progress",
+            ),
+            "response_in_progress_timeout",
+        ),
+    ],
+)
+def test_waa_narration_pair_stops_on_retryable_failure_and_reuses_trace_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compiler_failure: Exception,
+    expected_category: str,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, task_id="waa-retry-example")
+    semantic_calls: list[tuple[Path, bool]] = []
+    deterministic_calls: list[str] = []
+
+    def deterministic_compiler(
+        source: Path,
+        output: Path,
+        *,
+        task_id_override: str,
+    ) -> FakeCompilation:
+        deterministic_calls.append(task_id_override)
+        task_path = _write_windows_task(output / f"variant-{len(deterministic_calls)}")
+        task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+        task["id"] = task_id_override
+        task_path.write_text(
+            yaml.safe_dump(task, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        (task_path.parent / "compiler-report.json").write_text(
+            json.dumps({"source": {"trace": str(source)}}),
+            encoding="utf-8",
+        )
+        return FakeCompilation(task_path=str(task_path))
+
+    def unavailable_compiler(
+        task_path: Path,
+        *,
+        model: str,
+        reasoning_effort: str,
+        use_narration: bool,
+    ) -> FakeSemanticCompilation:
+        semantic_calls.append((task_path, use_narration))
+        raise compiler_failure
+
+    monkeypatch.setattr(
+        web_console,
+        "compile_windows_semantic_experience",
+        unavailable_compiler,
+    )
+    monkeypatch.setattr(web_console, "compile_trace", deterministic_compiler)
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    failed = controller._compile_waa_narration_pair(
+        trace_path,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["variants"]["compiled"]["status"] == "failed"
+    assert failed["variants"]["compiled"]["failure_category"] == expected_category
+    assert failed["variants"]["compiled"]["retryable"] is True
+    assert failed["variants"]["narrated_compiled"]["status"] == "skipped", failed[
+        "variants"
+    ]
+    assert [use_narration for _path, use_narration in semantic_calls] == [False]
+    assert deterministic_calls == ["waa-retry-example · 纯Trace"]
+
+    def available_compiler(
+        task_path: Path,
+        *,
+        model: str,
+        reasoning_effort: str,
+        use_narration: bool,
+    ) -> FakeSemanticCompilation:
+        semantic_calls.append((task_path, use_narration))
+        return FakeSemanticCompilation(
+            experience_path=str(task_path.with_name("experience.yaml"))
+        )
+
+    monkeypatch.setattr(
+        web_console,
+        "compile_windows_semantic_experience",
+        available_compiler,
+    )
+    retried = controller._compile_waa_narration_pair(
+        trace_path,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert retried["status"] == "completed"
+    assert retried["variants"]["compiled"]["deterministic_compilation"][
+        "reused_taskpack"
+    ] is True
+    assert retried["variants"]["narrated_compiled"]["deterministic_compilation"][
+        "reused_taskpack"
+    ] is False
+    assert [use_narration for _path, use_narration in semantic_calls] == [False, False, True]
+    assert deterministic_calls == [
+        "waa-retry-example · 纯Trace",
+        "waa-retry-example · 人工讲解",
+    ]
+
+
+def test_waa_narration_pair_preflight_failure_skips_both_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, task_id="waa-preflight-example")
+    monkeypatch.setattr(
+        web_console,
+        "probe_codex_compiler_connection",
+        lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError(
+                "Codex did not complete its model response or network reconnect within 45 seconds"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        web_console,
+        "compile_trace",
+        lambda *args, **kwargs: pytest.fail("preflight failure must stop deterministic compile"),
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    result = controller._compile_waa_narration_pair(
+        trace_path,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert result["status"] == "failed"
+    assert result["compiler_preflight"]["status"] == "failed"
+    assert {variant["status"] for variant in result["variants"].values()} == {"skipped"}
+
+
 def test_web_compilation_job_gives_immediate_feedback_and_rejects_duplicates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1141,6 +1866,48 @@ def test_web_compilation_job_gives_immediate_feedback_and_rejects_duplicates(
     completed = controller.wait(job["job_id"])
     assert completed["status"] == "completed"
     assert completed["result"]["semantic_compilation"]["status"] == "completed"
+
+
+def test_web_retry_routes_a_narrated_waa_recording_to_both_compiler_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, task_id="waa-retry-route")
+    metadata_path = trace_path.with_name("metadata.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["waa_task_id"] = "waa-task-id"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    trace_path.with_name("narration.json").write_text(
+        json.dumps({"transcript": "human narration", "segments": []}),
+        encoding="utf-8",
+    )
+    calls: list[Path] = []
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    def compile_pair(source: Path, **kwargs: Any) -> dict[str, Any]:
+        calls.append(source)
+        return {
+            "status": "completed",
+            "source_trace": str(source),
+            "variants": {
+                "compiled": {"status": "completed"},
+                "narrated_compiled": {"status": "completed"},
+            },
+        }
+
+    monkeypatch.setattr(controller, "_compile_waa_narration_pair", compile_pair)
+    monkeypatch.setattr(
+        controller,
+        "_compile_trace_bundle",
+        lambda *args, **kwargs: pytest.fail("WAA narrated retry used the single compiler"),
+    )
+
+    started = controller.start_compilation(trace_path.relative_to(tmp_path).as_posix())
+    completed = controller.wait(started["job_id"])
+
+    assert completed["status"] == "completed"
+    assert calls == [trace_path]
+    assert set(completed["result"]["variants"]) == {"compiled", "narrated_compiled"}
 
 
 def test_recompiling_same_trace_reuses_latest_taskpack(
@@ -1356,22 +2123,32 @@ def test_web_server_serves_console_state_and_job_api(
         return {"status": "draft", "summary": summary}
 
     monkeypatch.setattr(controller, "update_candidate_revision_summary", update_summary)
+    monkeypatch.setattr(
+        controller,
+        "list_waa_tasks",
+        lambda root: [{"id": "waa-task", "example_path": "example.json"}],
+    )
     server = create_web_server(tmp_path, port=0, controller=controller)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
+    opener = build_opener(ProxyHandler({}))
     try:
-        with urlopen(f"{base}/", timeout=2) as response:
+        with opener.open(f"{base}/", timeout=5) as response:
             html = response.read().decode("utf-8")
-        with urlopen(f"{base}/app.js", timeout=2) as response:
+        with opener.open(f"{base}/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
-        with urlopen(f"{base}/api/state", timeout=2) as response:
+        with opener.open(f"{base}/api/state", timeout=5) as response:
             state = json.loads(response.read())
+        with opener.open(
+            f"{base}/api/waa/tasks?root={quote('D:/WAA')}", timeout=5
+        ) as response:
+            waa_tasks = json.loads(response.read())
         evidence_path = state["taskpacks"][0]["semantic_experience"]["stages"][0][
             "evidence_frame"
         ]
-        with urlopen(
-            f"{base}/api/local-image?path={quote(evidence_path)}", timeout=2
+        with opener.open(
+            f"{base}/api/local-image?path={quote(evidence_path)}", timeout=5
         ) as response:
             evidence_bytes = response.read()
         route_request = Request(
@@ -1380,7 +2157,7 @@ def test_web_server_serves_console_state_and_job_api(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(route_request, timeout=2) as response:
+        with opener.open(route_request, timeout=5) as response:
             route = json.loads(response.read())
         payload = json.dumps(
             {
@@ -1397,7 +2174,7 @@ def test_web_server_serves_console_state_and_job_api(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=2) as response:
+        with opener.open(request, timeout=5) as response:
             job = json.loads(response.read())
         summary_request = Request(
             f"{base}/api/candidates/revisions/summary",
@@ -1407,7 +2184,7 @@ def test_web_server_serves_console_state_and_job_api(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(summary_request, timeout=2) as response:
+        with opener.open(summary_request, timeout=5) as response:
             summary_result = json.loads(response.read())
         completed = controller.wait(job["job_id"])
     finally:
@@ -1418,6 +2195,8 @@ def test_web_server_serves_console_state_and_job_api(
     assert "用一句话，调用一次示范经验" in html
     assert "录制新经验" in html
     assert "同时录制人工讲解" in html
+    assert "放弃本次录制" in html
+    assert '<select id="waa-example">' in html
     assert "经验与录制" in html
     assert "执行 Agent 模型" in html
     assert "后台执行 · 可同时使用电脑" in html
@@ -1438,6 +2217,9 @@ def test_web_server_serves_console_state_and_job_api(
     assert "/api/taskpacks/guidance/delete" in javascript
     assert "/api/recordings/narration" in javascript
     assert "/api/recordings/transcribe" in javascript
+    assert "/api/waa/recordings" in javascript
+    assert "/api/waa/recordings/go" in javascript
+    assert "/api/waa/tasks" in javascript
     assert "/api/transcribe" in javascript
     assert "语音输入" in javascript
     assert "不保存录音" in javascript
@@ -1461,7 +2243,12 @@ def test_web_server_serves_console_state_and_job_api(
         "independent_guidance_delete": True,
         "system_multi_action_planning": True,
         "voice_dictation": True,
-    }
+        "waa_narrated_recording": True,
+        "waa_task_catalog": True,
+        }
+    assert waa_tasks["tasks"] == [
+        {"id": "waa-task", "example_path": "example.json"}
+    ]
     assert route["task_id"] == "wechat-example"
     assert summary_result["summary"] == "人工微调后的摘要"
     assert summary_updates == [("runs/candidates/example", "人工微调后的摘要")]

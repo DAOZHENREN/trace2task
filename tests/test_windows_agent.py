@@ -15,6 +15,7 @@ from trace2task.windows_agent import (
     MODEL_CURRENT_IMAGE_MAX_EDGE,
     MODEL_REFERENCE_IMAGE_MAX_EDGE,
     WINDOWS_DECISION_TIMEOUT_SECONDS,
+    WINDOWS_EXPERIENCE_MODES,
     CodexWindowsAgent,
     WindowsAgentPlan,
     WindowsPlanTiming,
@@ -341,6 +342,79 @@ def _replace_linear_stage_with_directed_state_graph(task_path: Path) -> None:
         {"state_count": 2, "transition_count": 3, "terminal_count": 1}
     )
     task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+
+
+def test_experiment_modes_isolate_trace_compiler_and_feedback(tmp_path: Path) -> None:
+    task_path = _write_taskpack(
+        tmp_path,
+        confirmed=True,
+        semantic=True,
+        guidance=True,
+    )
+    contract = load_windows_task(task_path)
+    contexts: dict[str, str] = {}
+
+    for mode in WINDOWS_EXPERIENCE_MODES:
+        agent = CodexWindowsAgent(contract, experience_mode=mode)
+        references = agent._reference_paths(fresh_context=True)
+        contexts[mode] = agent._semantic_context(references)
+        if mode == "baseline":
+            assert references == ()
+            assert agent._stage_ids() == ["unknown"]
+        elif mode == "trace":
+            assert [path.name for path in references] == ["after.png", "before.png"]
+            assert agent._stage_ids() == ["unknown"]
+        else:
+            assert references[0] == contract.reference_frame
+            assert "open_target" in agent._stage_ids()
+
+    assert "withheld" in contexts["baseline"]
+    assert "Sanitized action categories" in contexts["trace"]
+    assert "directed state graph" not in contexts["trace"]
+    assert "Avoid redundant replanning" not in contexts["compiled"]
+    assert "Avoid redundant replanning" in contexts["feedback"]
+
+
+@pytest.mark.parametrize(
+    ("reference_frame", "expected_names"),
+    (
+        (
+            "reference/frames/0043.png",
+            ("0000.png", "0002.png", "0005.png", "0043.png"),
+        ),
+        (
+            "reference/success.png",
+            ("0000.png", "0002.png", "0004.png", "0006.png"),
+        ),
+    ),
+    ids=("reference-inside-frames", "reference-beside-frames"),
+)
+def test_trace_mode_samples_frames_for_supported_reference_layouts(
+    tmp_path: Path,
+    reference_frame: str,
+    expected_names: tuple[str, ...],
+) -> None:
+    task_path = _write_taskpack(tmp_path, confirmed=True)
+    task_dir = task_path.parent
+    frames_dir = task_dir / "reference" / "frames"
+    frames_dir.mkdir()
+    frame = pygame.Surface((10, 5))
+    for index in range(7):
+        pygame.image.save(frame, frames_dir / f"{index:04d}.png")
+    reference_path = task_dir.joinpath(*Path(reference_frame).parts)
+    if not reference_path.exists():
+        pygame.image.save(frame, reference_path)
+
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["verifier"]["reference_frame"] = reference_frame
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+    contract = load_windows_task(task_path)
+    agent = CodexWindowsAgent(contract, experience_mode="trace")
+
+    references = agent._reference_paths(fresh_context=True)
+
+    assert tuple(path.name for path in references) == expected_names
+    assert len(references) == 4
 
 
 class FakeSession:
@@ -1379,6 +1453,10 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     )
 
     assert result.task_complete
+    assert result.verification_outcome == "completed_unverified"
+    assert result.verified is False
+    assert result.verification_receipt_path is not None
+    assert Path(result.verification_receipt_path).is_file()
     assert result.executed_actions == 1
     assert result.replans == 2
     assert result.stop_reason == "model_complete"
@@ -1402,6 +1480,54 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
     )
     assert any("Received in" in status for status in statuses)
     assert any("click completed" in status for status in statuses)
+
+
+def test_pixel_reference_verifier_owns_the_final_success_decision(tmp_path: Path) -> None:
+    task_path = _write_taskpack(tmp_path, confirmed=True)
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["verifier"].update({"type": "pixel_reference", "threshold": 0.01})
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+
+    result = run_windows_agent(
+        task_path,
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=ColorSequenceCapture([(30, 120, 70)]),
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: ScriptedAgent([_plan(complete=True)]),
+    )
+
+    assert result.task_complete is True
+    assert result.verified is True
+    assert result.verification_outcome == "verified"
+    receipt = json.loads(Path(result.verification_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["evidence"]["difference"] == 0.0
+
+
+def test_pixel_reference_disagreement_stops_before_blind_retry(tmp_path: Path) -> None:
+    task_path = _write_taskpack(tmp_path, confirmed=True)
+    task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
+    task["verifier"].update({"type": "pixel_reference", "threshold": 0.01})
+    task_path.write_text(yaml.safe_dump(task, sort_keys=False), encoding="utf-8")
+    statuses: list[str] = []
+
+    result = run_windows_agent(
+        task_path,
+        execute=True,
+        output_root=tmp_path / "runs",
+        backend=FakeBackend(),
+        capture=ColorSequenceCapture([(220, 20, 20)]),
+        emergency_stop=FakeEmergencyStop(),
+        agent_factory=lambda contract: ScriptedAgent([_plan(complete=True)]),
+        status_callback=statuses.append,
+    )
+
+    assert result.task_complete is False
+    assert result.verified is False
+    assert result.stop_reason == "reconciliation_required"
+    assert result.verification_outcome == "reconciliation_required"
+    assert any("before any blind retry" in status for status in statuses)
 
 
 def test_cycle_task_must_leave_initial_reference_before_completion(

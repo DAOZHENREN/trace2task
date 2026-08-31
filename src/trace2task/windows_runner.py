@@ -34,6 +34,13 @@ from trace2task.windows_control import (
     WindowsMotorExecutor,
 )
 from trace2task.windows_task import WindowsTaskContract, load_windows_task
+from trace2task.windows_verification import (
+    VerificationOutcome,
+    VerificationRequest,
+    terminal_receipt,
+    verify_effect,
+    write_verification_receipt,
+)
 
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
@@ -415,6 +422,9 @@ class WindowsAgentResult:
     performance: dict[str, object]
     stage_timings: list[dict[str, object]]
     failure_message: str | None = None
+    verification_outcome: str = "not_run"
+    verified: bool = False
+    verification_receipt_path: str | None = None
 
 
 class WindowsAgentRunFailed(RuntimeError):
@@ -602,6 +612,9 @@ def run_windows_agent(
     cycle_started_at_reference = False
     cycle_departed = True
     completion_rejections = 0
+    verification_outcome = "not_run"
+    verified = False
+    verification_receipt_path: str | None = None
 
     def stage_bucket(stage_id: str) -> dict[str, float | int | str]:
         return stage_performance.setdefault(
@@ -824,11 +837,29 @@ def run_windows_agent(
                         stop_reason = "cycle_progress_not_observed"
                         break
                     continue
+                receipt = verify_effect(
+                    contract.effect_verifier,
+                    VerificationRequest(
+                        task_id=contract.task.task_id,
+                        run_dir=writer.run_dir,
+                        observed_frame=surface,
+                        agent_claimed_complete=True,
+                        agent_reason=plan.reason,
+                        agent_confidence=plan.confidence,
+                    ),
+                )
+                receipt_path = write_verification_receipt(writer.run_dir, receipt)
+                verification_outcome = receipt.outcome
+                verified = receipt.verified
+                verification_receipt_path = str(receipt_path)
                 writer.record(
-                    "success_marker",
+                    "verification_result",
                     surface,
                     details={
-                        "verifier": "model_reference_comparison",
+                        "outcome": receipt.outcome,
+                        "verified": receipt.verified,
+                        "verifier": receipt.verifier_type,
+                        "receipt_path": receipt_path.name,
                         "reason": plan.reason,
                         "confidence": plan.confidence,
                         "planning_ms": planning_ms,
@@ -838,8 +869,20 @@ def run_windows_agent(
                         "performance": asdict(plan_timing),
                     },
                 )
-                task_complete = True
-                stop_reason = "model_complete"
+                if receipt.accepts_completion:
+                    task_complete = True
+                    stop_reason = "model_complete"
+                    status_callback(
+                        f"Completion outcome: {receipt.outcome} via "
+                        f"{receipt.verifier_type}."
+                    )
+                else:
+                    task_complete = False
+                    stop_reason = receipt.outcome
+                    status_callback(
+                        "Completion claim was not accepted: "
+                        f"{receipt.outcome}. Execution stopped before any blind retry."
+                    )
                 break
 
             batch_count += 1
@@ -1110,6 +1153,16 @@ def run_windows_agent(
         stop_reason = f"failed:{type(error).__name__}"
         status_callback(f"Execution stopped: {type(error).__name__}: {error}")
         if writer is not None:
+            receipt = terminal_receipt(
+                contract.effect_verifier,
+                task_id=contract.task.task_id,
+                outcome=VerificationOutcome.FAILED_EXECUTION,
+                reason=f"{type(error).__name__}: {error}",
+                evidence={"stop_reason": stop_reason},
+            )
+            receipt_path = write_verification_receipt(writer.run_dir, receipt)
+            verification_outcome = receipt.outcome
+            verification_receipt_path = str(receipt_path)
             performance, stage_timings = performance_snapshot()
             trace = writer.finish(
                 success=False,
@@ -1118,6 +1171,9 @@ def run_windows_agent(
                     "replans": agent.replans,
                     "stop_reason": stop_reason,
                     "failure_message": str(error),
+                    "verification_outcome": verification_outcome,
+                    "verified": False,
+                    "verification_receipt_path": receipt_path.name,
                     "planning_ms": total_planning_ms,
                     "batch_count": batch_count,
                     "planned_actions": planned_actions,
@@ -1171,6 +1227,9 @@ def run_windows_agent(
                 performance=performance,
                 stage_timings=stage_timings,
                 failure_message=str(error),
+                verification_outcome=verification_outcome,
+                verified=False,
+                verification_receipt_path=verification_receipt_path,
             )
             raise WindowsAgentRunFailed(result, error) from error
         raise
@@ -1214,6 +1273,30 @@ def run_windows_agent(
         )
     if writer is None:
         raise RuntimeError("Windows Agent stopped before its execution trace was created")
+    if verification_receipt_path is None:
+        terminal_outcome = (
+            VerificationOutcome.CANCELED
+            if stop_reason == "emergency_stop"
+            else VerificationOutcome.FAILED_EXECUTION
+        )
+        receipt = terminal_receipt(
+            contract.effect_verifier,
+            task_id=contract.task.task_id,
+            outcome=terminal_outcome,
+            reason=(
+                "Execution was canceled by the user."
+                if terminal_outcome is VerificationOutcome.CANCELED
+                else f"Execution stopped without an accepted completion: {stop_reason}."
+            ),
+            evidence={
+                "stop_reason": stop_reason,
+                "executed_actions": executed_actions,
+            },
+        )
+        receipt_path = write_verification_receipt(writer.run_dir, receipt)
+        verification_outcome = receipt.outcome
+        verified = False
+        verification_receipt_path = str(receipt_path)
     performance, stage_timings = performance_snapshot()
     trace = writer.finish(
         success=task_complete,
@@ -1221,7 +1304,10 @@ def run_windows_agent(
             "parameterized_action_count": executed_actions,
             "replans": agent.replans,
             "stop_reason": stop_reason,
-            "verification": "model_reference_comparison",
+            "verification": contract.effect_verifier.verifier_type,
+            "verification_outcome": verification_outcome,
+            "verified": verified,
+            "verification_receipt_path": Path(verification_receipt_path).name,
             "planning_ms": total_planning_ms,
             "batch_count": batch_count,
             "planned_actions": planned_actions,
@@ -1273,4 +1359,7 @@ def run_windows_agent(
         session_resets=getattr(agent, "session_resets", 0),
         performance=performance,
         stage_timings=stage_timings,
+        verification_outcome=verification_outcome,
+        verified=verified,
+        verification_receipt_path=verification_receipt_path,
     )

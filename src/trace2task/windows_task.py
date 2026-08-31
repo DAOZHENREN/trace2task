@@ -12,6 +12,7 @@ from trace2task.taskpack import TaskPack, load_taskpack
 from trace2task.windows_control import WindowSelector
 from trace2task.windows_experience import SemanticExperience, load_semantic_experience
 from trace2task.windows_guidance import HumanGuidance, load_human_guidance
+from trace2task.windows_verification import EffectVerifierSpec
 
 WINDOWS_ADAPTER = "trace2task.windows"
 
@@ -22,6 +23,7 @@ class WindowsTaskContract:
     selector: WindowSelector
     demonstration: tuple[ActionCall, ...]
     reference_frame: Path
+    effect_verifier: EffectVerifierSpec
     semantic_experience: SemanticExperience | None = None
     human_guidance: HumanGuidance | None = None
     runtime_instruction: str | None = None
@@ -41,6 +43,7 @@ class WindowsTaskContract:
             selector=self.selector,
             demonstration=self.demonstration,
             reference_frame=self.reference_frame,
+            effect_verifier=self.effect_verifier,
             semantic_experience=self.semantic_experience,
             human_guidance=self.human_guidance,
             runtime_instruction=normalized,
@@ -122,6 +125,22 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
         verifier.get("reference_frame"),
         "verifier.reference_frame",
     )
+    verifier_type = verifier.get("type")
+    expected = verifier.get("expected")
+    if not isinstance(verifier_type, str) or not verifier_type.strip():
+        raise ValueError("Windows verifier.type must be a non-empty string")
+    if not isinstance(expected, str) or not expected.strip():
+        raise ValueError("Windows verifier.expected must be a non-empty string")
+    effect_verifier = EffectVerifierSpec(
+        verifier_type=verifier_type.strip(),
+        expected=" ".join(expected.split()),
+        reference_frame=reference_frame,
+        options={
+            key: value
+            for key, value in verifier.items()
+            if key not in {"type", "expected", "reference_frame", "completion"}
+        },
+    )
     semantic_experience: SemanticExperience | None = None
     semantic_config = root.get("semantic_experience")
     if semantic_config is not None:
@@ -190,6 +209,7 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
         selector=selector,
         demonstration=tuple(actions),
         reference_frame=reference_frame,
+        effect_verifier=effect_verifier,
         semantic_experience=semantic_experience,
         human_guidance=human_guidance,
     )

@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -30,6 +32,7 @@ from trace2task.codex_app_server import (
     CODEX_REASONING_EFFORTS,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
+    classify_codex_failure,
 )
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.experience import route_experience
@@ -46,6 +49,7 @@ from trace2task.windows_experience import (
     DEFAULT_COMPILER_MODEL,
     DEFAULT_COMPILER_REASONING_EFFORT,
     compile_windows_semantic_experience,
+    probe_codex_compiler_connection,
 )
 from trace2task.windows_guidance import (
     DEFAULT_REVISION_MODEL,
@@ -73,10 +77,81 @@ from trace2task.windows_task_model import (
 MAX_REQUEST_BYTES = 16_384
 MAX_NARRATION_REQUEST_BYTES = 30 * 1024 * 1024
 MAX_LOG_ENTRIES = 300
+WAA_CONTROL_EVENT_PREFIX = "TRACE2TASK_EVENT "
+DEFAULT_WAA_ROOT = Path(r"D:\MyProject\WindowsAgentArena")
+DEFAULT_WAA_DISTRO = "Trace2Task-WAA"
+DEFAULT_WAA_CONTAINER = "winarena"
+RETRYABLE_CODEX_FAILURE_CATEGORIES = frozenset(
+    {
+        "codex_connectivity",
+        "first_token_timeout",
+        "response_in_progress_timeout",
+        "hard_timeout",
+    }
+)
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _compiler_failure(error: BaseException, *, fallback: str) -> tuple[str, bool]:
+    category = classify_codex_failure(error) or fallback
+    return category, category in RETRYABLE_CODEX_FAILURE_CATEGORIES
+
+
+def _compiler_failure_summary(category: str) -> str:
+    return {
+        "codex_connectivity": "Codex 连接中断",
+        "first_token_timeout": "Codex 在首个响应期限内没有开始输出",
+        "response_in_progress_timeout": "Codex 已开始输出，但随后长时间没有新进度",
+        "hard_timeout": "Codex 编译超过总时限",
+    }.get(category, "Compiler 运行失败")
+
+
+def _waa_reset_contracts(project_root: Path) -> dict[str, dict[str, Any]]:
+    reset_root = (
+        project_root
+        / "integrations"
+        / "windows_agent_arena"
+        / "reset_specs"
+    )
+    contracts: dict[str, dict[str, Any]] = {}
+    for path in sorted(reset_root.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != "0.1":
+            raise ValueError(f"WAA reset spec 格式无效：{path}")
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, dict):
+            raise TypeError(f"WAA reset spec 缺少 tasks：{path}")
+        for task_id, task_spec in tasks.items():
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError(f"WAA reset spec 包含无效任务 id：{path}")
+            paths = (
+                task_spec.get("must_not_exist")
+                if isinstance(task_spec, dict)
+                else None
+            )
+            if not isinstance(paths, list) or not paths or not all(
+                isinstance(item, str) and item.strip() for item in paths
+            ):
+                raise ValueError(f"WAA reset spec 未定义有效的 must_not_exist：{path}")
+            if task_id in contracts:
+                raise ValueError(f"WAA 任务 {task_id!r} 匹配到多个 reset spec")
+            contracts[task_id] = {
+                "reset_spec": path.resolve(),
+                "reset_paths": list(paths),
+            }
+    return contracts
+
+
+def _matching_waa_reset_spec(project_root: Path, task_id: str) -> Path:
+    contract = _waa_reset_contracts(project_root).get(task_id)
+    if contract is None:
+        raise FileNotFoundError(
+            f"WAA 任务 {task_id!r} 没有匹配的 reset spec；为避免脏环境，禁止录制"
+        )
+    return Path(contract["reset_spec"])
 
 
 def _jsonable(value: Any) -> Any:
@@ -377,6 +452,7 @@ class WebConsoleController:
         self._lock = threading.RLock()
         self._jobs: dict[str, ConsoleJob] = {}
         self._active_job_id: str | None = None
+        self._waa_processes: dict[str, subprocess.Popen[str]] = {}
 
     def _cleanup_pending_deletions(self) -> None:
         for root in (self.task_root, (self.project_root / "runs").resolve()):
@@ -454,9 +530,20 @@ class WebConsoleController:
                                     ),
                                     "reason": semantic.completion_reason,
                                 },
-                                "model": semantic.model,
-                                "reasoning_effort": semantic.reasoning_effort,
-                                "stage_count": len(semantic.stages),
+                                 "model": semantic.model,
+                                 "reasoning_effort": semantic.reasoning_effort,
+                                 "narration_available": semantic.narration_available,
+                                 "narration_kind": semantic.narration_kind,
+                                 "compiler_variant": (
+                                     "narrated_compiled"
+                                     if semantic.narration_kind == "human"
+                                     else (
+                                         "instruction_compiled"
+                                         if semantic.narration_kind == "task_instruction"
+                                         else "compiled"
+                                     )
+                                 ),
+                                 "stage_count": len(semantic.stages),
                                 "state_count": len(semantic.states),
                                 "transition_count": len(semantic.transitions),
                                 "terminal_count": len(semantic.terminal_states),
@@ -599,6 +686,59 @@ class WebConsoleController:
 
     def list_windows(self) -> list[dict[str, Any]]:
         return list_window_records(backend=Win32Backend())["windows"]
+
+    def list_waa_tasks(self, waa_root: object) -> list[dict[str, Any]]:
+        if not isinstance(waa_root, (str, Path)) or not str(waa_root).strip():
+            raise ValueError("请输入 WAA 根目录")
+        root = Path(waa_root).expanduser().resolve()
+        client_root = (root / "src" / "win-arena-container" / "client").resolve()
+        example_root = client_root / "evaluation_examples_windows" / "examples"
+        if not example_root.is_dir():
+            raise FileNotFoundError("WAA 标准任务目录不存在")
+        contracts = _waa_reset_contracts(self.project_root)
+        tasks: list[dict[str, Any]] = []
+        for path in example_root.rglob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            task_id = payload.get("id") if isinstance(payload, dict) else None
+            if not isinstance(task_id, str) or task_id not in contracts:
+                continue
+            instruction = payload.get("instruction")
+            if not isinstance(instruction, str) or not instruction.strip():
+                continue
+            evaluator = payload.get("evaluator")
+            evaluator_functions = (
+                evaluator.get("func") if isinstance(evaluator, dict) else []
+            )
+            if isinstance(evaluator_functions, str):
+                evaluator_functions = [evaluator_functions]
+            if not isinstance(evaluator_functions, list):
+                evaluator_functions = []
+            related_apps = payload.get("related_apps")
+            if not isinstance(related_apps, list):
+                related_apps = []
+            relative = path.relative_to(client_root)
+            contract = contracts[task_id]
+            tasks.append(
+                {
+                    "id": task_id,
+                    "domain": path.parent.name,
+                    "instruction": instruction.strip(),
+                    "related_apps": [
+                        app for app in related_apps if isinstance(app, str)
+                    ],
+                    "evaluator": [
+                        name for name in evaluator_functions if isinstance(name, str)
+                    ],
+                    "example_path": relative.as_posix(),
+                    "reset_spec": str(contract["reset_spec"]),
+                    "reset_paths": list(contract["reset_paths"]),
+                }
+            )
+        tasks.sort(key=lambda task: (task["domain"], task["instruction"], task["id"]))
+        return tasks
 
     def list_recordings(self) -> list[dict[str, Any]]:
         runs_root = self.project_root / "runs"
@@ -832,6 +972,145 @@ class WebConsoleController:
         thread.start()
         return job.snapshot()
 
+    def start_waa_recording(
+        self,
+        *,
+        waa_root: object,
+        example_path: object,
+        task_id: str,
+        narrated: bool = True,
+        model: str = DEFAULT_COMPILER_MODEL,
+        reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+        distro: str = DEFAULT_WAA_DISTRO,
+        container: str = DEFAULT_WAA_CONTAINER,
+    ) -> dict[str, Any]:
+        normalized_task_id = " ".join(task_id.split())
+        if not normalized_task_id:
+            raise ValueError("请输入经验名称")
+        if len(normalized_task_id) > 80:
+            raise ValueError("经验名称不能超过 80 个字符")
+        if re.search(r"[\\/:*?\"<>|\x00-\x1f]", normalized_task_id):
+            raise ValueError("经验名称包含 Windows 路径不支持的字符")
+        if model not in CODEX_MODELS:
+            raise ValueError(f"不支持的模型：{model}")
+        if reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        if not isinstance(narrated, bool):
+            raise TypeError("讲解录制开关必须是布尔值")
+        if not isinstance(waa_root, (str, Path)):
+            raise TypeError("WAA 根目录必须是路径")
+        root = Path(waa_root).expanduser().resolve()
+        client_root = (root / "src" / "win-arena-container" / "client").resolve()
+        recorder_path = client_root / "trace2task_human_trace.py"
+        if not recorder_path.is_file():
+            raise FileNotFoundError(
+                "WAA 录制器不存在；请先运行 integrations/windows_agent_arena/install_overlay.py"
+            )
+        if not isinstance(example_path, (str, Path)) or not str(example_path).strip():
+            raise ValueError("请选择 WAA 任务 JSON")
+        raw_example = str(example_path).strip().replace("\\", "/")
+        if raw_example.startswith("/client/"):
+            raw_example = raw_example.removeprefix("/client/")
+        candidate = Path(raw_example).expanduser()
+        example = (candidate if candidate.is_absolute() else client_root / candidate).resolve()
+        if not example.is_relative_to(client_root) or not example.is_file():
+            raise FileNotFoundError("WAA 任务 JSON 必须位于 WAA client 目录中")
+        example_payload = json.loads(example.read_text(encoding="utf-8"))
+        waa_task_id = example_payload.get("id") if isinstance(example_payload, dict) else None
+        if not isinstance(waa_task_id, str) or not waa_task_id.strip():
+            raise ValueError("WAA 任务 JSON 缺少有效的 id")
+        reset_spec = _matching_waa_reset_spec(self.project_root, waa_task_id)
+        if not isinstance(distro, str) or Path(distro).name != distro or not distro.strip():
+            raise ValueError("WSL 发行版名称无效")
+        if not isinstance(container, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]*", container
+        ):
+            raise ValueError("WAA 容器名称无效")
+        session_id = (
+            datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+            + f"-{uuid.uuid4().hex[:8]}-waa-windows-human"
+        )
+        relative_example = example.relative_to(client_root).as_posix()
+        with self._lock:
+            self._require_idle()
+            self._ensure_experience_name_available(normalized_task_id)
+            job = ConsoleJob(
+                job_id=uuid.uuid4().hex,
+                task_path="",
+                task_id=normalized_task_id,
+                instruction=f"录制 WAA 任务：{relative_example}",
+                mode="record",
+                kind="waa_recording",
+                narrated=narrated,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                result={
+                    "capture_status": "launching",
+                    "session_id": session_id,
+                    "waa_root": str(root),
+                    "example_path": relative_example,
+                    "waa_task_id": waa_task_id,
+                    "reset_spec": str(reset_spec),
+                },
+            )
+            self._jobs[job.job_id] = job
+            self._active_job_id = job.job_id
+        thread = threading.Thread(
+            target=self._run_waa_recording,
+            args=(
+                job,
+                client_root,
+                relative_example,
+                reset_spec,
+                distro,
+                container,
+            ),
+            name=f"trace2task-waa-record-{job.job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return job.snapshot()
+
+    def go_waa_recording(
+        self,
+        job_id: str,
+        *,
+        audio_started_at_epoch_ms: object = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            if job.kind != "waa_recording":
+                raise ValueError("该任务不是 WAA 录制")
+            if job.status != "awaiting_recording_start":
+                raise RuntimeError("WAA 录制尚未就绪，或已经开始")
+            if job.narrated:
+                if (
+                    not isinstance(audio_started_at_epoch_ms, (int, float))
+                    or isinstance(audio_started_at_epoch_ms, bool)
+                    or not math.isfinite(float(audio_started_at_epoch_ms))
+                ):
+                    raise ValueError("缺少有效的麦克风开始时间")
+                audio_epoch_ms: float | None = round(
+                    float(audio_started_at_epoch_ms), 3
+                )
+            else:
+                audio_epoch_ms = None
+            process = self._waa_processes.get(job_id)
+            if process is None or process.stdin is None or process.poll() is not None:
+                raise RuntimeError("WAA 录制进程已经退出")
+            payload = dict(job.result or {})
+            payload["capture_status"] = "starting"
+            payload["audio_started_at_epoch_ms"] = audio_epoch_ms
+            job.result = payload
+            job.status = "running"
+            job.logs.append("麦克风与 WAA 已握手，Trace 现在正式开始。")
+            job.updated_at = _now()
+            process.stdin.write("GO\n")
+            process.stdin.flush()
+            return job.snapshot()
+
     def transcribe_recording_narration(
         self,
         job_id: str,
@@ -851,7 +1130,7 @@ class WebConsoleController:
             job = self._jobs.get(job_id)
             if job is None:
                 raise KeyError(f"Unknown job: {job_id}")
-            if job.kind != "recording" or not job.narrated:
+            if job.kind not in {"recording", "waa_recording"} or not job.narrated:
                 raise ValueError("该任务不是带讲解的录制")
             if job.status != "awaiting_narration":
                 raise RuntimeError("录制尚未等待讲解转写")
@@ -859,7 +1138,12 @@ class WebConsoleController:
                 raise RuntimeError("录制结果缺少 Trace 路径")
             trace_path = self._resolve_recording_trace(job.result["trace_path"])
             payload = dict(job.result)
-            payload["narration"] = {"status": "transcribing", "model": "turbo"}
+            audio_offset = payload.get("audio_start_trace_elapsed_ms")
+            payload["narration"] = {
+                "status": "transcribing",
+                "model": "turbo",
+                "audio_start_trace_elapsed_ms": audio_offset,
+            }
             job.result = payload
             job.logs.append("正在使用本地 Whisper Turbo 转写讲解；首次使用需要下载模型。")
             job.updated_at = _now()
@@ -906,6 +1190,7 @@ class WebConsoleController:
             "transcript_chars": len(transcription.transcript),
             "transcript": transcription.transcript,
             "segments": transcription.segments,
+            "audio_start_trace_elapsed_ms": audio_offset,
         }
         self._update(
             job,
@@ -976,7 +1261,7 @@ class WebConsoleController:
             job = self._jobs.get(job_id)
             if job is None:
                 raise KeyError(f"Unknown job: {job_id}")
-            if job.kind != "recording" or not job.narrated:
+            if job.kind not in {"recording", "waa_recording"} or not job.narrated:
                 raise ValueError("该任务不是带讲解的录制")
             if job.status != "awaiting_narration":
                 raise RuntimeError("讲解已经提交，或录制尚未等待讲解确认")
@@ -989,6 +1274,13 @@ class WebConsoleController:
                 else {}
             )
             pending_audio_path: Path | None = None
+            audio_start_trace_elapsed_ms = pending.get(
+                "audio_start_trace_elapsed_ms"
+            )
+            if audio_start_trace_elapsed_ms is None:
+                audio_start_trace_elapsed_ms = job.result.get(
+                    "audio_start_trace_elapsed_ms"
+                )
             if audio is None and isinstance(pending.get("audio_path"), str):
                 candidate = Path(pending["audio_path"]).expanduser().resolve()
                 if candidate.parent == trace_path.parent.resolve() and candidate.is_file():
@@ -1008,6 +1300,7 @@ class WebConsoleController:
                 existing_audio_path=pending_audio_path,
                 mime_type=mime_type,
                 transcription_engine=transcription_engine or "manual",
+                audio_start_trace_elapsed_ms=audio_start_trace_elapsed_ms,
             )
         except Exception:
             self._update(job, status="awaiting_narration")
@@ -1020,6 +1313,7 @@ class WebConsoleController:
             "transcript_chars": len(narration.transcript),
             "segments": narration.segment_count,
             "audio_path": str(narration.audio_path) if narration.audio_path else None,
+            "audio_start_trace_elapsed_ms": audio_start_trace_elapsed_ms,
         }
         self._update(job, result=payload)
         thread = threading.Thread(
@@ -1315,6 +1609,10 @@ class WebConsoleController:
                     f"已经存在同名任务经验“{recording_task_id.strip()}”，"
                     "请使用现有经验，或先删除同名任务经验后再编译"
                 )
+        report("正在检查 Codex Compiler 连接，失败时不会进入长时间编译。")
+        preflight = probe_codex_compiler_connection()
+        report(f"Codex Compiler 连接正常（{preflight['elapsed_ms']:.0f}ms）。")
+        if existing_task is None:
             report("正在把原始输入编译为确定性动作证据。")
             result = compile_trace(
                 trace_path,
@@ -1340,6 +1638,7 @@ class WebConsoleController:
                 "requires_confirmation": contract.task.requires_confirmation,
                 "reused_taskpack": True,
             }
+        payload["compiler_preflight"] = preflight
         report("动作证据已就绪，Compiler Agent 正在理解阶段、状态和动作意图。")
         try:
             semantic = compile_windows_semantic_experience(
@@ -1348,10 +1647,21 @@ class WebConsoleController:
                 reasoning_effort=reasoning_effort,
             )
         except Exception as error:  # noqa: BLE001 - deterministic artifact remains useful
+            failure_category, retryable = _compiler_failure(
+                error,
+                fallback="compiler_error",
+            )
             payload["semantic_compilation"] = {
                 "status": "failed",
                 "error": f"{type(error).__name__}: {error}",
+                "failure_category": failure_category,
+                "retryable": retryable,
             }
+            if retryable:
+                report(
+                    f"{_compiler_failure_summary(failure_category)}；"
+                    "动作任务包已保留，可稍后直接重试。"
+                )
         else:
             payload["review_status"] = "draft"
             payload["requires_confirmation"] = True
@@ -1373,7 +1683,152 @@ class WebConsoleController:
                     )
         return payload
 
-    def _find_taskpack_for_trace(self, trace_path: Path) -> Path | None:
+    def _compile_waa_narration_pair(
+        self,
+        trace_path: Path,
+        *,
+        model: str,
+        reasoning_effort: str,
+        status_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        report = status_callback or (lambda message: None)
+        metadata = json.loads(
+            trace_path.with_name("metadata.json").read_text(encoding="utf-8")
+        )
+        base_task_id = str(metadata.get("task_id") or "").strip()
+        if not base_task_id:
+            raise ValueError("WAA 原始录制缺少有效的经验名称")
+        variants = (
+            ("compiled", f"{base_task_id} · 纯Trace", False),
+            ("narrated_compiled", f"{base_task_id} · 人工讲解", True),
+        )
+        existing_tasks: dict[str, Path | None] = {}
+        for variant, task_id, _ in variants:
+            existing_task = self._find_taskpack_for_trace(trace_path, task_id=task_id)
+            existing_tasks[variant] = existing_task
+            if existing_task is None:
+                self._ensure_experience_name_available(task_id)
+        report("正在检查 Codex Compiler 连接，失败时不会连续等待两个变体。")
+        try:
+            preflight = probe_codex_compiler_connection()
+        except Exception as error:  # noqa: BLE001 - report one actionable pair failure
+            error_text = f"{type(error).__name__}: {error}"
+            failure_category, retryable = _compiler_failure(
+                error,
+                fallback="preflight_error",
+            )
+            report(f"Codex Compiler 连接预检失败，已跳过两个变体：{error_text}")
+            return {
+                "status": "failed",
+                "source_trace": str(trace_path),
+                "family_id": base_task_id,
+                "compiler_preflight": {
+                    "status": "failed",
+                    "error": error_text,
+                    "failure_category": failure_category,
+                    "retryable": retryable,
+                },
+                "variants": {
+                    variant: {
+                        "status": "skipped",
+                        "task_id": task_id,
+                        "reason": "Codex Compiler 连接预检失败；请稍后从此录制重试。",
+                    }
+                    for variant, task_id, _ in variants
+                },
+            }
+        report(f"Codex Compiler 连接正常（{preflight['elapsed_ms']:.0f}ms）。")
+        results: dict[str, Any] = {}
+        for variant_index, (variant, task_id, use_narration) in enumerate(variants):
+            report(
+                "正在生成“人工讲解”Compiler 变体。"
+                if use_narration
+                else "正在生成“纯 Trace”Compiler 变体；本轮强制忽略讲解。"
+            )
+            try:
+                task_path = existing_tasks[variant]
+                if task_path is None:
+                    compiled = compile_trace(
+                        trace_path,
+                        self.project_root / "taskpacks" / "generated" / "web",
+                        task_id_override=task_id,
+                    )
+                    task_path = Path(compiled.task_path)
+                    deterministic_compilation = _jsonable(compiled)
+                    deterministic_compilation["reused_taskpack"] = False
+                    self._set_experience_family(task_path, base_task_id)
+                else:
+                    report(f"检测到“{task_id}”的已有动作任务包，将只重试语义编译。")
+                    deterministic_compilation = {
+                        "task_id": task_id,
+                        "task_path": str(task_path),
+                        "source_trace": str(trace_path),
+                        "reused_taskpack": True,
+                    }
+                semantic = compile_windows_semantic_experience(
+                    task_path,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    use_narration=use_narration,
+                )
+            except Exception as error:  # noqa: BLE001 - keep the successful sibling
+                failure_category, retryable = _compiler_failure(
+                    error,
+                    fallback="compiler_error",
+                )
+                results[variant] = {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "error": f"{type(error).__name__}: {error}",
+                    "failure_category": failure_category,
+                    "retryable": retryable,
+                }
+                if retryable:
+                    report(
+                        f"{_compiler_failure_summary(failure_category)}，"
+                        "已立即停止剩余 Compiler 变体。"
+                    )
+                    for skipped_variant, skipped_task_id, _ in variants[variant_index + 1 :]:
+                        results[skipped_variant] = {
+                            "status": "skipped",
+                            "task_id": skipped_task_id,
+                            "reason": (
+                                f"前一个变体发生可重试的 Codex 故障：{failure_category}；"
+                                "请稍后从此录制重试。"
+                            ),
+                        }
+                    break
+                continue
+            results[variant] = {
+                "status": "completed",
+                "task_id": task_id,
+                "task_path": str(task_path),
+                "use_narration": use_narration,
+                "source_trace": str(trace_path),
+                "deterministic_compilation": deterministic_compilation,
+                "semantic_compilation": _jsonable(semantic),
+            }
+        completed = sum(
+            result.get("status") == "completed" for result in results.values()
+        )
+        return {
+            "status": (
+                "completed"
+                if completed == len(variants)
+                else ("partial" if completed else "failed")
+            ),
+            "source_trace": str(trace_path),
+            "family_id": base_task_id,
+            "compiler_preflight": preflight,
+            "variants": results,
+        }
+
+    def _find_taskpack_for_trace(
+        self,
+        trace_path: Path,
+        *,
+        task_id: str | None = None,
+    ) -> Path | None:
         source_trace = trace_path.resolve()
         matches: list[Path] = []
         if not self.task_root.is_dir():
@@ -1390,8 +1845,15 @@ class WebConsoleController:
                 if not candidate_source.is_absolute():
                     candidate_source = self.project_root / candidate_source
                 task_path = report_path.with_name("task.yaml")
-                if candidate_source.resolve() == source_trace and task_path.is_file():
-                    matches.append(task_path)
+                if candidate_source.resolve() != source_trace or not task_path.is_file():
+                    continue
+                if task_id is not None:
+                    contract = load_windows_task(task_path)
+                    if self._experience_name_key(contract.task.task_id) != self._experience_name_key(
+                        task_id
+                    ):
+                        continue
+                matches.append(task_path)
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         if not matches:
@@ -1883,20 +2345,68 @@ class WebConsoleController:
             job = self._jobs.get(job_id)
             if job is None:
                 raise KeyError(f"Unknown job: {job_id}")
-            if job.status not in {"queued", "running", "stopping"}:
+            if job.status == "awaiting_narration":
+                payload = dict(job.result or {})
+                narration = (
+                    payload.get("narration")
+                    if isinstance(payload.get("narration"), dict)
+                    else {}
+                )
+                audio_discarded = False
+                audio_path = narration.get("audio_path")
+                trace_path = payload.get("trace_path")
+                if isinstance(audio_path, str) and isinstance(trace_path, str):
+                    audio_candidate = Path(audio_path).expanduser().resolve()
+                    trace_candidate = Path(trace_path).expanduser().resolve()
+                    if (
+                        audio_candidate.parent == trace_candidate.parent
+                        and audio_candidate.name.startswith("narration.")
+                    ):
+                        audio_candidate.unlink(missing_ok=True)
+                        audio_discarded = True
+                payload["narration"] = {
+                    "status": "discarded",
+                    "audio_discarded": audio_discarded,
+                }
+                job.result = payload
+                job.stop_requested = True
+                job.status = "stopped"
+                job.updated_at = _now()
+                job.logs.append(
+                    "已放弃本次讲解和编译；保留原始 Trace，临时录音已删除。"
+                )
+                return job.snapshot()
+            if job.status not in {
+                "queued",
+                "running",
+                "stopping",
+                "awaiting_recording_start",
+            }:
                 return job.snapshot()
             job.stop_requested = True
             job.status = "stopping"
             job.updated_at = _now()
             job.logs.append("网页控制台已请求停止；正在等待当前安全边界。")
             job.stop_event.set()
+            process = self._waa_processes.get(job_id)
+            if process is not None and process.stdin is not None and process.poll() is None:
+                try:
+                    process.stdin.write("STOP\n")
+                    process.stdin.flush()
+                except OSError:
+                    pass
             return job.snapshot()
 
     def wait(self, job_id: str, timeout: float = 10) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             snapshot = self.get_job(job_id)
-            if snapshot["status"] not in {"queued", "running", "stopping"}:
+            if snapshot["status"] not in {
+                "queued",
+                "running",
+                "stopping",
+                "awaiting_recording_start",
+            }:
                 return snapshot
             time.sleep(0.01)
         raise TimeoutError(f"Job {job_id} did not finish within {timeout:g}s")
@@ -1939,7 +2449,13 @@ class WebConsoleController:
         if self._active_job_id is None:
             return
         active = self._jobs[self._active_job_id]
-        if active.status in {"queued", "running", "stopping", "awaiting_narration"}:
+        if active.status in {
+            "queued",
+            "running",
+            "stopping",
+            "awaiting_recording_start",
+            "awaiting_narration",
+        }:
             raise RuntimeError("已有任务正在运行，请先等待或停止它")
 
     def _run_recording(
@@ -1999,6 +2515,242 @@ class WebConsoleController:
                 log=f"录制失败：{type(error).__name__}: {error}",
             )
 
+    def _run_waa_recording(
+        self,
+        job: ConsoleJob,
+        client_root: Path,
+        relative_example: str,
+        reset_spec: Path,
+        distro: str,
+        container: str,
+    ) -> None:
+        self._update(
+            job,
+            status="running",
+            log="正在连接 WAA 虚拟机并准备初始任务画面。",
+        )
+        session_id = str((job.result or {}).get("session_id") or "")
+        source_dir = client_root / "trace2task_recordings" / session_id
+        bundled_recorder = (
+            self.project_root
+            / "integrations"
+            / "windows_agent_arena"
+            / "client"
+            / "trace2task_human_trace.py"
+        )
+        installed_recorder = client_root / "trace2task_human_trace.py"
+        bundled_reset_helper = (
+            self.project_root
+            / "integrations"
+            / "windows_agent_arena"
+            / "client"
+            / "trace2task_reset.py"
+        )
+        installed_reset_helper = client_root / "trace2task_reset.py"
+        session_reset_dir = client_root / "trace2task_reset_specs"
+        installed_reset_spec = session_reset_dir / f"{session_id}.json"
+        process: subprocess.Popen[str] | None = None
+        completed_result: dict[str, Any] | None = None
+        try:
+            if bundled_recorder.is_file() and (
+                not installed_recorder.is_file()
+                or installed_recorder.read_bytes() != bundled_recorder.read_bytes()
+            ):
+                shutil.copy2(bundled_recorder, installed_recorder)
+                self._update(job, log="已同步最新 WAA Trace 录制器。")
+            if not bundled_reset_helper.is_file():
+                raise FileNotFoundError("Trace2Task WAA reset helper 不存在")
+            if (
+                not installed_reset_helper.is_file()
+                or installed_reset_helper.read_bytes() != bundled_reset_helper.read_bytes()
+            ):
+                shutil.copy2(bundled_reset_helper, installed_reset_helper)
+            session_reset_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(reset_spec, installed_reset_spec)
+            command = [
+                "wsl",
+                "-d",
+                distro,
+                "--",
+                "docker",
+                "exec",
+                "-i",
+                "-e",
+                (
+                    "TRACE2TASK_WAA_RESET_SPEC="
+                    f"/client/trace2task_reset_specs/{installed_reset_spec.name}"
+                ),
+                container,
+                "python",
+                "-u",
+                "/client/trace2task_human_trace.py",
+                "--example",
+                f"/client/{relative_example}",
+                "--task-id",
+                job.task_id,
+                "--output",
+                "/client/trace2task_recordings",
+                "--session-id",
+                session_id,
+                "--wait-for-go",
+                "--require-reset-verification",
+            ]
+            if job.narrated:
+                command.append("--no-task-narration")
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            with self._lock:
+                self._waa_processes[job.job_id] = process
+            if process.stdout is None:
+                raise RuntimeError("WAA 录制进程没有标准输出")
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if not line.startswith(WAA_CONTROL_EVENT_PREFIX):
+                    self._update(job, log=line)
+                    continue
+                event = json.loads(line.removeprefix(WAA_CONTROL_EVENT_PREFIX))
+                if not isinstance(event, dict):
+                    raise TypeError("WAA 录制器事件必须是 JSON 对象")
+                event_type = event.get("type")
+                if event_type == "ready":
+                    reset_receipt = event.get("reset_receipt")
+                    if not isinstance(reset_receipt, dict) or reset_receipt.get(
+                        "status"
+                    ) != "verified":
+                        raise RuntimeError("WAA 任务初始状态没有通过 reset 验证")
+                    payload = dict(job.result or {})
+                    payload.update(
+                        {
+                            "capture_status": "ready",
+                            "ready_at": event.get("ready_at"),
+                            "waa_task_id": event.get("waa_task_id"),
+                            "reset_receipt": reset_receipt,
+                        }
+                    )
+                    self._update(
+                        job,
+                        status="awaiting_recording_start",
+                        result=payload,
+                        log=(
+                            "WAA 任务状态已清理并验证；网页启动麦克风后会自动发送 GO。"
+                        ),
+                    )
+                elif event_type == "started":
+                    trace_started_at = str(event.get("trace_started_at") or "")
+                    trace_epoch_ms = datetime.fromisoformat(trace_started_at).timestamp() * 1000
+                    payload = dict(job.result or {})
+                    audio_epoch_ms = payload.get("audio_started_at_epoch_ms")
+                    audio_offset = (
+                        round(float(audio_epoch_ms) - trace_epoch_ms, 3)
+                        if isinstance(audio_epoch_ms, (int, float))
+                        and not isinstance(audio_epoch_ms, bool)
+                        else None
+                    )
+                    payload.update(
+                        {
+                            "capture_status": "recording",
+                            "trace_started_at": trace_started_at,
+                            "audio_start_trace_elapsed_ms": audio_offset,
+                        }
+                    )
+                    self._update(
+                        job,
+                        status="running",
+                        result=payload,
+                        log="WAA Trace 与讲解正在同一时间轴录制；按 F8 验证成功，F9 取消。",
+                    )
+                elif event_type == "completed":
+                    raw_result = event.get("result")
+                    if isinstance(raw_result, dict):
+                        completed_result = dict(raw_result)
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"WAA 录制器退出码为 {return_code}")
+            if completed_result is None:
+                raise RuntimeError("WAA 录制器没有返回完成结果")
+            if not source_dir.is_dir():
+                raise FileNotFoundError(f"WAA 录制目录不存在：{source_dir}")
+            destination = self.project_root / "runs" / session_id
+            if destination.exists():
+                raise FileExistsError(f"录制目标目录已存在：{destination}")
+            shutil.copytree(source_dir, destination)
+            trace_path = destination / "trace.jsonl"
+            metadata_path = destination / "metadata.json"
+            reset_receipt_path = destination / "reset-receipt.json"
+            if (
+                not trace_path.is_file()
+                or not metadata_path.is_file()
+                or not reset_receipt_path.is_file()
+            ):
+                raise RuntimeError(
+                    "WAA 录制结果缺少 trace.jsonl、metadata.json 或 reset-receipt.json"
+                )
+            payload = dict(job.result or {})
+            audio_offset = payload.get("audio_start_trace_elapsed_ms")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["narration_alignment"] = {
+                "method": "web_ready_go_v1",
+                "audio_start_trace_elapsed_ms": audio_offset,
+            }
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            completed_result["trace_path"] = str(trace_path)
+            payload.update(completed_result)
+            payload["capture_status"] = "finished"
+            payload["audio_start_trace_elapsed_ms"] = audio_offset
+            payload["reset_receipt_path"] = str(reset_receipt_path)
+            if completed_result.get("success") is True:
+                if job.narrated:
+                    payload["narration"] = {
+                        "status": "awaiting_review",
+                        "audio_start_trace_elapsed_ms": audio_offset,
+                    }
+                    self._update(
+                        job,
+                        status="awaiting_narration",
+                        result=payload,
+                        log="WAA 示范成功；正在停止麦克风并准备 Turbo 转写。",
+                    )
+                    return
+                self._update(
+                    job,
+                    result=payload,
+                    log="WAA 示范成功，正在生成 Compiler Agent 经验。",
+                )
+                self._run_recording_compilation(job, trace_path, payload)
+                return
+            self._update(
+                job,
+                status="stopped",
+                result=payload,
+                log="WAA 录制已取消，或 F8 验证未通过。",
+            )
+        except Exception as error:  # noqa: BLE001 - WAA failures must become UI state
+            self._update(
+                job,
+                status="failed",
+                error=f"{type(error).__name__}: {error}",
+                log=f"WAA 录制失败：{type(error).__name__}: {error}",
+            )
+        finally:
+            with self._lock:
+                self._waa_processes.pop(job.job_id, None)
+            installed_reset_spec.unlink(missing_ok=True)
+            if process is not None and process.poll() is None:
+                process.terminate()
+
     def _run_recording_compilation(
         self,
         job: ConsoleJob,
@@ -2011,30 +2763,52 @@ class WebConsoleController:
             log="正在编译动作证据并由 Compiler Agent 理解任务说明、阶段与完成条件。",
         )
         try:
-            compilation = self._compile_trace_bundle(
-                trace_path,
-                model=job.model,
-                reasoning_effort=job.reasoning_effort,
-                status_callback=lambda message: self._update(job, log=message),
-            )
+            if job.kind == "waa_recording" and job.narrated:
+                compilation = self._compile_waa_narration_pair(
+                    trace_path,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                    status_callback=lambda message: self._update(job, log=message),
+                )
+                compilation_status = compilation["status"]
+            else:
+                compilation = self._compile_trace_bundle(
+                    trace_path,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                    status_callback=lambda message: self._update(job, log=message),
+                )
+                compilation_status = (
+                    "completed"
+                    if compilation["semantic_compilation"]["status"] == "completed"
+                    else "partial"
+                )
         except Exception as error:  # noqa: BLE001 - preserve successful recording
+            failure_category, retryable = _compiler_failure(
+                error,
+                fallback="compiler_error",
+            )
             payload["compilation"] = {
                 "status": "failed",
                 "error": f"{type(error).__name__}: {error}",
+                "failure_category": failure_category,
+                "retryable": retryable,
             }
             self._update(
                 job,
                 status="partial",
                 result=payload,
-                log="录制已保存，但自动编译失败：" f"{type(error).__name__}: {error}",
+                log=(
+                    f"录制已完整保存，但{_compiler_failure_summary(failure_category)}。"
+                    "可直接从此录制重试，无需重新录制。"
+                    if retryable
+                    else "录制已保存，但自动编译失败："
+                    f"{type(error).__name__}: {error}"
+                ),
             )
             return
         payload["compilation"] = {
-            "status": (
-                "completed"
-                if compilation["semantic_compilation"]["status"] == "completed"
-                else "partial"
-            ),
+            "status": compilation_status,
             "result": compilation,
         }
         self._update(
@@ -2044,36 +2818,82 @@ class WebConsoleController:
             log=(
                 "语义经验草稿已生成，请审查任务说明、阶段截图与循环完成条件。"
                 if payload["compilation"]["status"] == "completed"
-                else "动作任务包已生成，但 Compiler Agent 语义编译失败，可稍后重试。"
+                else (
+                    "仅部分 Compiler 变体成功；失败变体可直接从此录制重试。"
+                    if payload["compilation"]["status"] == "partial"
+                    else "Codex Compiler 当前不可用，两个变体已快速停止；"
+                    "网络恢复后可直接从此录制重试。"
+                )
             ),
         )
 
     def _run_compilation(self, job: ConsoleJob, trace_path: Path) -> None:
         self._update(job, status="running", log="编译任务已启动。")
         try:
-            payload = self._compile_trace_bundle(
-                trace_path,
-                model=job.model,
-                reasoning_effort=job.reasoning_effort,
-                status_callback=lambda message: self._update(job, log=message),
+            metadata = json.loads(
+                trace_path.with_name("metadata.json").read_text(encoding="utf-8")
             )
-            semantic_status = payload["semantic_compilation"]["status"]
+            is_narrated_waa_recording = bool(metadata.get("waa_task_id")) and trace_path.with_name(
+                "narration.json"
+            ).is_file()
+            if is_narrated_waa_recording:
+                self._update(
+                    job,
+                    log="检测到 WAA 同步讲解录制，将重试纯 Trace 与人工讲解两个变体。",
+                )
+                payload = self._compile_waa_narration_pair(
+                    trace_path,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                    status_callback=lambda message: self._update(job, log=message),
+                )
+                compilation_status = str(payload["status"])
+            else:
+                payload = self._compile_trace_bundle(
+                    trace_path,
+                    model=job.model,
+                    reasoning_effort=job.reasoning_effort,
+                    status_callback=lambda message: self._update(job, log=message),
+                )
+                compilation_status = (
+                    "completed"
+                    if payload["semantic_compilation"]["status"] == "completed"
+                    else "partial"
+                )
             self._update(
                 job,
-                status="completed" if semantic_status == "completed" else "partial",
+                status=compilation_status,
                 result=payload,
                 log=(
                     "语义经验草稿已生成，请展开阶段并审核确认。"
-                    if semantic_status == "completed"
-                    else "动作任务包已保留，但 Compiler Agent 语义编译失败，可再次重试。"
+                    if compilation_status == "completed"
+                    else (
+                        "仅部分 Compiler 变体成功；可从原始录制再次重试。"
+                        if compilation_status == "partial"
+                        else "Codex Compiler 当前不可用；录制已保留，可稍后再次重试。"
+                    )
                 ),
             )
         except Exception as error:  # noqa: BLE001 - compilation must become UI state
+            failure_category, retryable = _compiler_failure(
+                error,
+                fallback="compiler_error",
+            )
             self._update(
                 job,
                 status="failed",
                 error=f"{type(error).__name__}: {error}",
-                log=f"编译失败：{type(error).__name__}: {error}",
+                result={
+                    "source_trace": str(trace_path),
+                    "failure_category": failure_category,
+                    "retryable": retryable,
+                },
+                log=(
+                    f"{_compiler_failure_summary(failure_category)}；"
+                    "可从原始录制重试，无需重新录制。"
+                    if retryable
+                    else f"编译失败：{type(error).__name__}: {error}"
+                ),
             )
 
     def _run_revision(
@@ -2249,6 +3069,13 @@ class WebConsoleController:
             "task_complete": payload.get("task_complete") is True,
             "stop_reason": payload.get("stop_reason"),
         }
+        verification_outcome = payload.get("verification_outcome")
+        if isinstance(verification_outcome, str) and verification_outcome.strip():
+            outcome["verification_outcome"] = verification_outcome.strip()
+            outcome["verified"] = payload.get("verified") is True
+        verification_receipt_path = payload.get("verification_receipt_path")
+        if isinstance(verification_receipt_path, str) and verification_receipt_path.strip():
+            outcome["verification_receipt_path"] = verification_receipt_path.strip()
         failure_message = payload.get("failure_message")
         if isinstance(failure_message, str) and failure_message.strip():
             outcome["failure_message"] = failure_message.strip()
@@ -2353,6 +3180,8 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "independent_guidance_delete": True,
                         "system_multi_action_planning": True,
                         "voice_dictation": True,
+                        "waa_narrated_recording": True,
+                        "waa_task_catalog": True,
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
@@ -2379,12 +3208,34 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                                 DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT
                             ),
                         },
+                        "waa_defaults": {
+                            "root": str(DEFAULT_WAA_ROOT),
+                            "example_path": (
+                                "evaluation_examples_windows/examples/notepad/"
+                                "366de66e-cbae-4d72-b042-26390db2b145-WOS.json"
+                            ),
+                        },
                     },
                 }
             )
             return
         if parsed.path == "/api/windows":
             self._json({"windows": self.controller.list_windows()})
+            return
+        if parsed.path == "/api/waa/tasks":
+            try:
+                values = parse_qs(parsed.query).get("root", [])
+                self._json(
+                    {
+                        "tasks": self.controller.list_waa_tasks(
+                            values[0] if values else DEFAULT_WAA_ROOT
+                        )
+                    }
+                )
+            except FileNotFoundError as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         if parsed.path == "/api/local-image":
             try:
@@ -2466,6 +3317,31 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/waa/recordings":
+                result = self.controller.start_waa_recording(
+                    waa_root=payload.get("waa_root", DEFAULT_WAA_ROOT),
+                    example_path=payload.get("example_path", ""),
+                    task_id=payload.get("task_id", ""),
+                    narrated=payload.get("narrated", True),
+                    model=payload.get("model", DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get(
+                        "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
+                    ),
+                    distro=payload.get("distro", DEFAULT_WAA_DISTRO),
+                    container=payload.get("container", DEFAULT_WAA_CONTAINER),
+                )
+                self._json(result, status=HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/waa/recordings/go":
+                self._json(
+                    self.controller.go_waa_recording(
+                        payload.get("job_id", ""),
+                        audio_started_at_epoch_ms=payload.get(
+                            "audio_started_at_epoch_ms"
+                        ),
+                    )
+                )
                 return
             if parsed.path == "/api/recordings/narration":
                 self._json(

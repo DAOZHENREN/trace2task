@@ -629,6 +629,8 @@ def compile_windows_trace(
     metadata: dict[str, Any],
     events: list[dict[str, Any]],
     output_root: Path,
+    *,
+    task_id_override: str | None = None,
 ) -> WindowsCompilation:
     """Compile one successful Windows demonstration into deterministic motor skills."""
 
@@ -652,7 +654,9 @@ def compile_windows_trace(
     )
     if not inferred:
         raise ValueError("Windows trace did not produce any supported motor actions")
-    task_id = str(metadata["task_id"]).strip()
+    task_id = str(task_id_override or metadata["task_id"]).strip()
+    if not task_id:
+        raise ValueError("Compiled Windows task id must not be empty")
     success_hotkey = str(metadata.get("success_hotkey") or "f8").upper()
     process_name = initial_window.get("process_name")
     title = initial_window.get("title")

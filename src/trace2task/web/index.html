@@ -145,14 +145,36 @@
               <span class="step">02</span>
             </div>
 
-            <div class="field-row">
-              <label class="field-label" for="record-window">本地目标窗口</label>
-              <button class="text-button" id="refresh-windows" type="button">刷新窗口</button>
-            </div>
+            <label class="field-label" for="record-source">录制环境</label>
             <div class="select-wrap">
-              <select id="record-window"></select>
+              <select id="record-source">
+                <option value="local">本机窗口</option>
+                <option value="waa">Windows Agent Arena 虚拟机</option>
+              </select>
             </div>
-            <div class="task-meta" id="window-meta">选择要录制的应用窗口。</div>
+
+            <div id="local-recording-fields">
+              <div class="field-row">
+                <label class="field-label" for="record-window">本地目标窗口</label>
+                <button class="text-button" id="refresh-windows" type="button">刷新窗口</button>
+              </div>
+              <div class="select-wrap">
+                <select id="record-window"></select>
+              </div>
+              <div class="task-meta" id="window-meta">选择要录制的应用窗口。</div>
+            </div>
+
+            <div class="hidden" id="waa-recording-fields">
+              <label class="field-label instruction-label" for="waa-root">WAA 根目录</label>
+              <input class="text-input" id="waa-root" value="D:\MyProject\WindowsAgentArena">
+              <label class="field-label instruction-label" for="waa-example">WAA 标准任务</label>
+              <div class="select-wrap">
+                <select id="waa-example">
+                  <option value="">正在加载已配置 Reset 的任务…</option>
+                </select>
+              </div>
+              <div class="task-meta" id="waa-task-meta">只显示任务 JSON 与 Reset 规则都可用的任务。</div>
+            </div>
 
             <label class="field-label instruction-label" for="record-name">经验名称</label>
             <input
@@ -187,7 +209,7 @@
             </label>
 
             <div class="record-flow">
-              <div><span>1</span><p>点击开始后自动切换到目标窗口</p></div>
+              <div><span>1</span><p>点击开始；WAA 模式会先等待虚拟机 READY</p></div>
               <div><span>2</span><p>正常示范，同时说清意图、诀窍和完成条件</p></div>
               <div><span>3</span><p>按 F8 成功；检查讲解后生成语义经验，F9 取消</p></div>
             </div>
@@ -196,6 +218,9 @@
             <button class="button primary full-button" id="record-button" type="button">
               <span class="button-icon">●</span>
               开始录制
+            </button>
+            <button class="button secondary full-button hidden" id="record-stop-button" type="button">
+              停止并放弃本次录制
             </button>
 
             <div class="narration-review hidden" id="narration-review">
@@ -212,6 +237,9 @@
               <p>Turbo 首次使用会下载约 1.6 GB 模型；时间片只是辅助线索，原始 Trace 和截图仍是发生了什么的强证据。</p>
               <button class="button primary full-button" id="narration-submit" type="button">
                 确认讲解并开始编译
+              </button>
+              <button class="button secondary full-button" id="narration-discard" type="button">
+                放弃本次录制（保留原始 Trace）
               </button>
             </div>
 

@@ -19,6 +19,50 @@ CODEX_MODELS = (
     "gpt-5.6-terra",
     "gpt-5.6-luna",
 )
+
+_CODEX_CONNECTIVITY_ERROR_MARKERS = (
+    "network reconnect",
+    "tls handshake",
+    "stream disconnected",
+    "connection failed",
+    "error sending request",
+)
+
+
+class CodexTurnTimeoutError(RuntimeError):
+    """A model turn missed a specific response-progress deadline."""
+
+    def __init__(self, category: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+
+
+class _CodexReceiveTimeout(RuntimeError):
+    pass
+
+
+def classify_codex_failure(error: BaseException) -> str | None:
+    """Classify transport and progress timeouts without treating all delays as network faults."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, CodexTurnTimeoutError):
+            return current.category
+        text = str(current).casefold()
+        if any(marker in text for marker in _CODEX_CONNECTIVITY_ERROR_MARKERS):
+            return "codex_connectivity"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def is_codex_connectivity_error(error: BaseException) -> bool:
+    """Return whether an exception chain indicates Codex transport unavailability."""
+
+    return classify_codex_failure(error) == "codex_connectivity"
+
+
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
@@ -179,6 +223,8 @@ class CodexAppServerSession:
         reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
         cwd: Path,
         timeout_seconds: float = 120,
+        progress_timeout_seconds: float | None = None,
+        hard_timeout_seconds: float | None = None,
         transport_factory: TransportFactory = StdioJsonTransport,
     ) -> None:
         if reasoning_effort not in CODEX_REASONING_EFFORTS:
@@ -186,10 +232,18 @@ class CodexAppServerSession:
                 "Codex reasoning effort must be one of "
                 f"{', '.join(CODEX_REASONING_EFFORTS)}"
             )
+        if timeout_seconds <= 0:
+            raise ValueError("Codex timeout must be positive")
+        if progress_timeout_seconds is not None and progress_timeout_seconds <= 0:
+            raise ValueError("Codex progress timeout must be positive")
+        if hard_timeout_seconds is not None and hard_timeout_seconds < timeout_seconds:
+            raise ValueError("Codex hard timeout cannot be shorter than the initial timeout")
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.cwd = cwd.resolve()
         self.timeout_seconds = timeout_seconds
+        self.progress_timeout_seconds = progress_timeout_seconds
+        self.hard_timeout_seconds = hard_timeout_seconds
         self._transport = transport_factory(codex_executable)
         self._request_id = 0
         self._thread_id: str | None = None
@@ -247,7 +301,7 @@ class CodexAppServerSession:
         self,
         *,
         prompt: str,
-        image_path: Path,
+        image_path: Path | None,
         output_schema: dict[str, Any],
         additional_image_paths: tuple[Path, ...] = (),
         model: str | None = None,
@@ -264,8 +318,16 @@ class CodexAppServerSession:
         thread_started = time.perf_counter()
         thread_id = self.start()
         thread_start_ms = (time.perf_counter() - thread_started) * 1000
-        deadline = time.monotonic() + self.timeout_seconds
-        image_paths = (image_path, *additional_image_paths)
+        turn_started_at = time.monotonic()
+        deadline = turn_started_at + self.timeout_seconds
+        hard_deadline = (
+            turn_started_at + self.hard_timeout_seconds
+            if self.hard_timeout_seconds is not None
+            else None
+        )
+        if image_path is None and additional_image_paths:
+            raise ValueError("Additional images require a primary image")
+        image_paths = () if image_path is None else (image_path, *additional_image_paths)
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [
@@ -296,12 +358,44 @@ class CodexAppServerSession:
             raise TypeError("Codex App Server returned no turn id")
         turn_id = turn["id"]
         completion_started = time.perf_counter()
+        response_progress_seen = False
 
         while True:
-            message = self._receive(deadline)
+            active_deadline = (
+                min(deadline, hard_deadline) if hard_deadline is not None else deadline
+            )
+            try:
+                message = self._receive(active_deadline)
+            except _CodexReceiveTimeout as error:
+                if hard_deadline is not None and active_deadline >= hard_deadline:
+                    raise CodexTurnTimeoutError(
+                        "hard_timeout",
+                        "Codex model response exceeded the hard limit of "
+                        f"{self.hard_timeout_seconds:g} seconds",
+                    ) from error
+                if response_progress_seen:
+                    idle_seconds = self.progress_timeout_seconds or self.timeout_seconds
+                    raise CodexTurnTimeoutError(
+                        "response_in_progress_timeout",
+                        "Codex model response stopped before completion; no progress arrived for "
+                        f"{idle_seconds:g} seconds",
+                    ) from error
+                raise CodexTurnTimeoutError(
+                    "first_token_timeout",
+                    "Codex did not begin its model response within "
+                    f"{self.timeout_seconds:g} seconds",
+                ) from error
             if self._handle_server_request(message):
                 continue
-            if message.get("method") != "turn/completed":
+            method = message.get("method")
+            if isinstance(method, str) and method.startswith("item/"):
+                response_progress_seen = True
+                if self.progress_timeout_seconds is not None:
+                    deadline = max(
+                        deadline,
+                        time.monotonic() + self.progress_timeout_seconds,
+                    )
+            if method != "turn/completed":
                 continue
             completion = message.get("params")
             if not isinstance(completion, dict) or completion.get("threadId") != thread_id:
@@ -385,14 +479,14 @@ class CodexAppServerSession:
             return self._pending_messages.popleft()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(
+            raise _CodexReceiveTimeout(
                 "Codex did not complete its model response or network reconnect within "
                 f"{self.timeout_seconds:g} seconds"
             )
         try:
             return self._transport.receive(remaining)
         except TimeoutError as error:
-            raise RuntimeError(
+            raise _CodexReceiveTimeout(
                 "Codex did not complete its model response or network reconnect within "
                 f"{self.timeout_seconds:g} seconds"
             ) from error

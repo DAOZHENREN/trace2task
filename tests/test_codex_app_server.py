@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from trace2task.codex_app_server import CodexAppServerSession
+from trace2task.codex_app_server import (
+    CodexAppServerSession,
+    CodexTurnTimeoutError,
+    classify_codex_failure,
+    is_codex_connectivity_error,
+)
 
 
 class ScriptedTransport:
@@ -137,6 +142,55 @@ def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path:
     assert transport.closed
 
 
+def test_session_supports_a_text_only_connectivity_turn(tmp_path: Path) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+            completed_turn("turn-1", '{"status":"ok"}'),
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-luna",
+        reasoning_effort="low",
+        cwd=tmp_path,
+        transport_factory=lambda executable: transport,
+    )
+
+    result = session.run_turn(
+        prompt="preflight",
+        image_path=None,
+        output_schema={"type": "object"},
+    )
+
+    assert result == '{"status":"ok"}'
+    assert transport.sent[3]["params"]["input"] == [
+        {"type": "text", "text": "preflight"}
+    ]
+    assert session.last_turn_metrics is not None
+    assert session.last_turn_metrics.image_count == 0
+
+
+def test_connectivity_error_detection_checks_exception_chain() -> None:
+    try:
+        try:
+            raise TimeoutError("tls handshake eof")
+        except TimeoutError as error:
+            raise RuntimeError("compiler preflight failed") from error
+    except RuntimeError as error:
+        assert is_codex_connectivity_error(error) is True
+
+    assert is_codex_connectivity_error(ValueError("invalid semantic schema")) is False
+    timeout = CodexTurnTimeoutError(
+        "response_in_progress_timeout",
+        "response stalled",
+    )
+    assert classify_codex_failure(timeout) == "response_in_progress_timeout"
+    assert is_codex_connectivity_error(timeout) is False
+
+
 def test_session_resets_only_the_thread_and_keeps_the_codex_process(tmp_path: Path) -> None:
     transport = ScriptedTransport(
         [
@@ -218,9 +272,7 @@ def test_session_reports_failed_turn(tmp_path: Path) -> None:
         session.run_turn(prompt="test", image_path=image_path, output_schema={})
 
 
-def test_session_timeout_explains_that_network_reconnect_is_included(
-    tmp_path: Path,
-) -> None:
+def test_session_classifies_timeout_before_the_first_response_item(tmp_path: Path) -> None:
     transport = ScriptedTransport(
         [
             {"id": 1, "result": {}},
@@ -238,8 +290,96 @@ def test_session_timeout_explains_that_network_reconnect_is_included(
     image_path = tmp_path / "observation.png"
     image_path.write_bytes(b"png")
 
-    with pytest.raises(
-        RuntimeError,
-        match="model response or network reconnect within 300 seconds",
-    ):
+    with pytest.raises(CodexTurnTimeoutError, match="begin its model response") as raised:
         session.run_turn(prompt="test", image_path=image_path, output_schema={})
+
+    assert raised.value.category == "first_token_timeout"
+
+
+def test_session_extends_the_deadline_while_response_items_are_arriving(
+    tmp_path: Path,
+) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"},
+            },
+            completed_turn("turn-1", '{"status":"ok"}'),
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-sol",
+        cwd=tmp_path,
+        timeout_seconds=300,
+        progress_timeout_seconds=90,
+        hard_timeout_seconds=600,
+        transport_factory=lambda executable: transport,
+    )
+    image_path = tmp_path / "observation.png"
+    image_path.write_bytes(b"png")
+
+    result = session.run_turn(prompt="test", image_path=image_path, output_schema={})
+
+    assert result == '{"status":"ok"}'
+
+
+def test_session_reports_when_an_in_progress_response_stalls(tmp_path: Path) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"},
+            },
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-sol",
+        cwd=tmp_path,
+        timeout_seconds=300,
+        progress_timeout_seconds=90,
+        hard_timeout_seconds=600,
+        transport_factory=lambda executable: transport,
+    )
+    image_path = tmp_path / "observation.png"
+    image_path.write_bytes(b"png")
+
+    with pytest.raises(CodexTurnTimeoutError, match="no progress") as raised:
+        session.run_turn(prompt="test", image_path=image_path, output_schema={})
+
+    assert raised.value.category == "response_in_progress_timeout"
+
+
+def test_session_enforces_a_separate_hard_limit(tmp_path: Path) -> None:
+    transport = ScriptedTransport(
+        [
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+            {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+            {"method": "item/agentMessage/delta", "params": {}},
+        ]
+    )
+    session = CodexAppServerSession(
+        "codex",
+        model="gpt-5.6-sol",
+        cwd=tmp_path,
+        timeout_seconds=1,
+        progress_timeout_seconds=100,
+        hard_timeout_seconds=2,
+        transport_factory=lambda executable: transport,
+    )
+    image_path = tmp_path / "observation.png"
+    image_path.write_bytes(b"png")
+
+    with pytest.raises(CodexTurnTimeoutError, match="hard limit") as raised:
+        session.run_turn(prompt="test", image_path=image_path, output_schema={})
+
+    assert raised.value.category == "hard_timeout"

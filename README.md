@@ -8,7 +8,22 @@ It observes the current screen, retrieves the relevant parts of the reviewed exp
 bounded sequence of actions, executes them through a guarded local motor layer, and replans when the
 visible state changes.
 
-The current release is **v0.14.6**. It is a Windows-first research prototype with a local web console.
+The current release is **v0.17.5**. It is a Windows-first research prototype with a local web console.
+
+## Release progression
+
+| Release | Main change |
+|---|---|
+| v0.14.6 | Established the adaptive experience console: reviewed semantic experience, iterative human guidance, and visible task details. |
+| v0.15.x | Added an independent Effect Verifier and a repeatable reset-run-evaluate protocol so experience quality can be measured rather than judged only by observation. |
+| v0.16.x | Added the Windows Agent Arena bridge and controlled `baseline` / `trace` / `compiled` / `feedback` ablations with aggregated success and efficiency metrics. |
+| v0.17.0-v0.17.3 | Added synchronized WAA action recording and optional human narration, task-catalog-driven verified reset, recording cancellation, and residue cleanup. |
+| v0.17.4 | Added a lightweight Compiler connection preflight, fail-fast paired compilation, and retry from preserved recordings without recording again. |
+| v0.17.5 | Replaced the fixed Compiler response deadline with progress-aware streaming, a 90-second inactivity deadline, a 600-second hard limit, and precise retryable failure categories. |
+
+The architectural direction remains unchanged across these releases: immutable human Trace is the
+primary evidence; Compiler output is reviewable derived knowledge; feedback is versioned; and the
+runtime Agent must be evaluated behind an independent reset and effect-verification boundary.
 
 ## Why Trace2Task?
 
@@ -36,9 +51,11 @@ flowchart LR
     G[Relevant active Guidance]
     H[Multimodal Agent<br/>multi-action plan]
     I[Guarded local execution]
-    J[Run Trace + outcome]
+    J[Independent Effect Verifier]
     K[Human feedback]
     L[Guidance or task-model revision draft]
+    M[Verification receipt]
+    N[Repeatable evaluation suite]
 
     A --> B
     B --> C
@@ -50,8 +67,11 @@ flowchart LR
     F --> H
     H --> I
     I -->|visual checkpoint or exception| H
-    I --> J
-    J --> K
+    I -->|Agent claims completion| J
+    J --> M
+    M --> K
+    N -->|reset + repeat| F
+    M --> N
     K --> L
     L -->|human review and confirmation| G
     L -->|structural correction| E
@@ -110,6 +130,31 @@ global rules plus rules relevant to the current graph neighborhood. Older revisi
 and merge-operation explanations remain audit history and are not repeatedly injected into the
 runtime model.
 
+### Verify effects and run repeatable evaluations
+
+The runtime Agent may propose that a task is complete, but it no longer owns the final verification
+label. A separate Effect Verifier writes `verification.json` for every executed run with an explicit
+outcome:
+
+- `verified`: an independent configured verifier accepted the effect;
+- `completed_unverified`: the Agent visually judged the task complete, but no independent effect
+  verifier was configured;
+- `reconciliation_required`: the Agent and independent evidence disagree, so execution stops before
+  a blind retry;
+- `failed_execution` or `canceled`: execution did not reach an accepted completion.
+
+Existing task packs use `reviewed_reference_frame` and therefore remain compatible, but their result
+is honestly labeled `completed_unverified`. A task can opt into the deterministic
+`pixel_reference` verifier with a reviewed threshold. The verifier registry is intentionally small:
+application-specific UIA, API, file, database, or OSWorld evaluators can implement the same interface
+without replacing the runtime Agent.
+
+Evaluation suites define task cases, reset adapters, instructions, and repetition counts. Each
+attempt preserves its Agent trace and verification receipt; the suite writes `attempts.jsonl` and a
+machine-readable `summary.json` containing verified/completion rates, outcome counts, latency, model
+turns, and action counts. This protocol follows the reset-run-evaluate separation used by desktop
+benchmarks while remaining usable for local Trace2Task tasks.
+
 ### Use voice throughout the console
 
 Every natural-language field has a reusable **Voice input** control, including the runtime
@@ -159,11 +204,17 @@ app when the normal terminal `PATH` entry is unavailable.
 ### 1. Record an experience
 
 1. Open **Record experience**.
-2. Select the target window and enter a unique experience name.
+2. Select either a local target window or **Windows Agent Arena VM**, then enter a unique
+   experience name.
 3. Choose the Compiler Agent model and reasoning effort.
 4. Leave narrated recording enabled if spoken intent or task tricks would help the compiler.
 5. Start recording, complete the task normally, and press `F8` at the successful state.
 6. Review or correct the Turbo transcript, then start compilation.
+
+For WAA narration recording, the console waits for the VM recorder to report `READY`, starts the
+browser microphone, and then sends `GO` so the microphone and Trace share one timeline. `F8` stops
+both sides after the WAA evaluator confirms success. After transcript review, the console generates
+two task packs from the same immutable Trace: `· 纯Trace` and `· 人工讲解`.
 
 The recording and compilation are separate outcomes. If semantic compilation fails, the raw Trace is
 still retained and can be compiled again from **Local experience**.
@@ -293,6 +344,191 @@ uv run trace2task windows agent `
   --execute
 ```
 
+Run a repeatable evaluation suite:
+
+```yaml
+# evaluations/fgo-smoke.yaml
+schema_version: "0.1"
+id: fgo-smoke
+cases:
+  - id: one-battle
+    task: ../taskpacks/generated/<task-pack>/task.yaml
+    instruction: 完成一次当前副本
+    repetitions: 5
+    reset:
+      type: command
+      argv: ["powershell", "-NoProfile", "-File", "reset-fgo.ps1"]
+      timeout_seconds: 60
+```
+
+```powershell
+uv run trace2task eval run `
+  --suite evaluations\fgo-smoke.yaml `
+  --model gpt-5.6-terra `
+  --reasoning-effort low `
+  --execute
+```
+
+Use `reset: {type: none}` only when the application is already self-resetting or when a dry-run suite
+does not mutate it. New reset backends, including an OSWorld environment adapter, can be registered
+without changing the evaluation runner. A `command` reset executes the listed local program, so only
+run evaluation suites you have reviewed and trust.
+
+### Windows Agent Arena controlled ablations (experimental)
+
+The WAA adapter keeps the benchmark and Trace2Task responsibilities separate:
+
+- Windows Agent Arena resets the Windows VM, supplies the task and screenshot, executes `pyautogui`
+  actions, and owns the independent task evaluator.
+- Trace2Task runs Codex on the Windows host using the existing subscription login and injects exactly
+  one controlled evidence condition: `baseline`, `trace`, `compiled`, `narrated_compiled`, or
+  `feedback`.
+- Every condition uses the same fixed general motor-action policy. Trace-derived allowed-skill lists
+  are deliberately not exposed to the baseline.
+
+Keep WAA in a separate checkout because it owns a large VM image and generated benchmark results. A
+checkout on `D:\MyProject\WindowsAgentArena` keeps those artifacts off the system drive. Download the
+official Windows 11 Enterprise Evaluation x64 ISO from the
+[Microsoft Evaluation Center](https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise),
+rename it to `setup.iso`, and place it under
+`src\win-arena-container\vm\image`. Then install the small Trace2Task overlay:
+
+```powershell
+uv run python integrations\windows_agent_arena\install_overlay.py `
+  D:\MyProject\WindowsAgentArena
+```
+
+On the first machine setup, build the development container and let WAA create its Windows golden
+image. This is a one-time, disk- and network-heavy step; keep the checkout, Docker data, ISO, and VM
+storage on `D:`:
+
+```powershell
+wsl -d Trace2Task-WAA -- bash -lc "cd /mnt/d/MyProject/WindowsAgentArena/scripts && \
+  export TRACE2TASK_DOCKER_BUILD_ARGS='--network=host' && \
+  ./run.sh --mode dev --prepare-image true --start-client false \
+  --openai-api-key trace2task-bridge-unused"
+```
+
+If the WSL distribution needs the Windows host's local HTTP proxy while building, append proxy
+build arguments to `TRACE2TASK_DOCKER_BUILD_ARGS`, for example
+`--build-arg HTTP_PROXY=http://127.0.0.1:7892 --build-arg HTTPS_PROXY=http://127.0.0.1:7892`.
+If that proxy rejects Debian package traffic, leave those proxy arguments empty and pass a reachable
+mirror instead, for example `--build-arg TRACE2TASK_DEBIAN_MIRROR=https://mirrors.ustc.edu.cn/debian`
+and `--build-arg TRACE2TASK_DEBIAN_SECURITY_MIRROR=https://mirrors.ustc.edu.cn/debian-security`.
+
+Wait for the preparation container to finish and shut down cleanly. The overlay also installs a
+VM-native human recorder. For later runs, start the prepared WAA VM without an Agent:
+
+```powershell
+wsl -d Trace2Task-WAA -- bash -lc "cd /mnt/d/MyProject/WindowsAgentArena/scripts && \
+  ./run.sh --mode dev --skip-build true --start-client false \
+  --openai-api-key trace2task-bridge-unused"
+```
+
+Open `http://localhost:8006`. The recommended recording path is now the Trace2Task web console:
+
+1. Open **Record experience** and choose **Windows Agent Arena VM**.
+2. Keep the default WAA root or select another checkout, and choose a WAA example JSON under its
+   `client` directory.
+3. Ensure the task id is covered by one JSON file under
+   `integrations/windows_agent_arena/reset_specs`. Recording is blocked when no deterministic reset
+   contract exists.
+4. Enable narration and click **Start recording**. Before `READY`, the console closes task apps,
+   applies the matching reset spec, verifies every invariant, and writes `reset-receipt.json`. It then
+   performs a `READY → microphone → GO` handshake; no second PowerShell recorder command is needed.
+5. Operate inside the VM and press `F8`. Review the Turbo transcript before compilation.
+
+The archived `narration.json` stores `audio_start_trace_elapsed_ms`, so each speech segment is moved
+onto the Trace clock before Compiler alignment. A bounded four-second forward window handles the
+common case where the demonstrator explains an action shortly before performing it.
+
+The following container command remains available as a narration-free/manual fallback:
+
+```powershell
+wsl -d Trace2Task-WAA -- bash -lc "docker exec -it winarena bash -lc 'cd /client && \
+  python trace2task_human_trace.py \
+  --example evaluation_examples_windows/examples/notepad/366de66e-cbae-4d72-b042-26390db2b145-WOS.json \
+  --task-id waa-notepad-draft'"
+```
+
+Operate only inside the VM and press `F8` when done (`F9` cancels). A recording allows 30 minutes by
+default and reports its remaining time every 30 seconds. `F8` now runs the independent WAA evaluator
+before stopping: if validation fails, the same Trace remains active so the human can correct the
+task and press `F8` again. The recorder saves raw key and mouse edges plus the corresponding VM
+screenshots under `client\trace2task_recordings`, and marks the Trace successful only when the WAA
+score is `1.0`.
+Compile the saved `trace.jsonl` in the normal Trace2Task workflow, review the Compiler Agent state
+graph, and add feedback revisions before using the `compiled` and `feedback` conditions. For a
+narration ablation, generate two task packs from the same immutable Trace. Compile the first while
+explicitly ignoring narration and compile the second with the reviewed human transcript:
+
+```powershell
+uv run trace2task windows compile-experience `
+  --task taskpacks\generated\<plain-task-pack>\task.yaml `
+  --ignore-narration `
+  --model gpt-5.6-sol `
+  --reasoning-effort high
+
+uv run trace2task windows compile-experience `
+  --task taskpacks\generated\<narrated-task-pack>\task.yaml `
+  --model gpt-5.6-sol `
+  --reasoning-effort high
+```
+
+`narrated_compiled` accepts only actual human narration. The WAA recorder's synthetic
+`waa_task_instruction` transcript is labelled separately and does not qualify as human narration.
+
+The bundled experimental task list selects one standard WAA Notepad task with a deterministic file
+evaluator. Before an experiment, confirm the task pack and review its semantic experience. Then the
+recommended one-command runner executes the same task three times per condition:
+
+```powershell
+uv run trace2task waa experiment `
+  --waa-root D:\MyProject\WindowsAgentArena `
+  --task taskpacks\generated\<plain-task-pack>\task.yaml `
+  --narrated-task taskpacks\generated\<narrated-task-pack>\task.yaml `
+  --reset-spec integrations\windows_agent_arena\reset_specs\notepad.json `
+  --conditions baseline trace compiled narrated_compiled `
+  --repetitions 3 `
+  --model gpt-5.6-terra `
+  --reasoning-effort low
+```
+
+The WAA VM and `winarena` container must already be running, but no second bridge terminal is needed.
+The runner keeps the model, reasoning effort, task list, action policy, and plan horizon fixed. Before
+every repetition it closes benchmark applications, moves the declared output files to the Windows
+Recycle Bin, resets WAA, and verifies that the reset invariant still holds. A failed reset aborts the
+episode before any model action. The Notepad reset declaration is intentionally explicit:
+
+```json
+{
+  "schema_version": "0.1",
+  "tasks": {
+    "366de66e-cbae-4d72-b042-26390db2b145-WOS": {
+      "must_not_exist": ["C:\\Users\\Docker\\Documents\\draft.txt"]
+    }
+  }
+}
+```
+
+Reset paths must be absolute files below `C:\Users\Docker`; directories and the profile root are
+rejected. WAA writes an independent `result.txt`, trajectory screenshots, actions, and timestamps
+beneath `client\results\trace2task-experiments\<experiment-id>`. Trace2Task writes the aggregated
+JSON and Markdown report under `evaluations\windows-agent-arena\<experiment-id>`. This makes the
+baseline/Trace/compiled comparison use WAA's evaluator rather than model self-reports.
+
+For diagnostics, a single condition can still be served manually with `trace2task waa bridge` and
+existing result trees can be re-aggregated with:
+
+```powershell
+uv run trace2task waa report `
+  --results-root D:\MyProject\WindowsAgentArena\src\win-arena-container\client\results `
+  --output evaluations\windows-agent-arena
+```
+
+The report contains evaluator success rate, success-rate delta versus baseline, executed actions,
+model plan calls, model round-trip seconds, and wall-clock task time for every condition.
+
 Add `--background` only when the target accepts directed Win32 window messages and can render through
 `PrintWindow`. Add `--focus` to a dry run when a GPU-rendered target requires foreground screen-pixel
 capture.
@@ -311,8 +547,11 @@ capture.
   input.
 - Screenshots used for model planning are sent through the signed-in Codex service. Do not run tasks
   on content you do not want that model to process.
-- Visual completion and dynamic UI interpretation are still model-assisted. Supervise new task packs
-  until their graph, Guidance, and verifier behavior have been reviewed across multiple runs.
+- `reviewed_reference_frame` is model-assisted and is deliberately reported as unverified. A
+  `pixel_reference` match is independent of the model but still proves pixels, not a backend business
+  transaction. High-impact tasks need an application-specific effect verifier.
+- Supervise new task packs until their graph, Guidance, and verifier behavior have been reviewed
+  across multiple reset variants.
 
 ## Legacy mini-game demo
 
@@ -332,15 +571,31 @@ node --check src\trace2task\web\app.js
 ```
 
 The current test suite covers the deterministic compiler, semantic experience loading, directed task
-graphs, Guidance fusion and migration, Windows action validation, runtime recovery, web APIs, and
-voice transcription integration.
+graphs, Guidance fusion and migration, Windows action validation, runtime recovery, effect receipts,
+repeatable evaluation aggregation, web APIs, and voice transcription integration.
 
 ## Project status
 
-Trace2Task is an evolving research prototype. Near-term work includes stronger deterministic visual
-verification, better learned motor-skill boundaries, finer narration/action alignment, explicit
-approval policies for higher-impact actions, and reproducible quality/latency evaluation across task
-families.
+Trace2Task is an evolving research prototype. V0.17.5 replaces the Compiler's fixed absolute response
+deadline with progress-aware streaming, a separate inactivity deadline, and a bounded hard limit, while
+reporting first-token, stalled-response, hard-timeout, and connectivity failures separately. V0.17.4 added
+a lightweight Codex connectivity preflight, fail-fast paired Compiler behavior, and retryable compilation
+from preserved recordings. V0.17.3 added
+explicit narrated-recording cancellation and
+residue-free deletion for reset-spec benchmark artifacts. V0.17.2 added a reset-gated WAA task catalog and verified
+task-level reset receipts to synchronized Windows Agent Arena Trace plus human-narration recording while retaining the controlled
+four-condition experience ablations on top of the V0.15 verification boundary; it does not claim
+that pixel verification proves every application effect. The experimental bridge provides an independent reset,
+execution, and evaluator boundary for controlled experience ablations. Near-term work includes
+repeated ablation reports, application-specific effect adapters,
+better learned motor-skill boundaries, and finer narration/action alignment.
+
+The verification contract is inspired by [OpenAdapt](https://github.com/OpenAdaptAI/OpenAdapt), and
+the reset-run-evaluate separation is inspired by
+[Windows Agent Arena](https://github.com/microsoft/WindowsAgentArena) and
+[OSWorld](https://github.com/xlang-ai/OSWorld).
+Trace2Task reimplements these boundaries around its own Trace-to-experience runtime rather than
+embedding either project's control loop.
 
 ## License
 

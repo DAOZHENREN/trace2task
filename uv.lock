@@ -664,7 +664,7 @@ wheels = [
 
 [[package]]
 name = "trace2task"
-version = "0.14.6"
+version = "0.17.5"
 source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },

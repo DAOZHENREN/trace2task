@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +72,18 @@ def _normalize_segments(value: object) -> list[dict[str, object]]:
     return segments
 
 
+def _normalize_audio_start_trace_elapsed_ms(value: object) -> float | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError("audio_start_trace_elapsed_ms must be a finite number")
+    return round(float(value), 3)
+
+
 def save_narration_audio(
     recording_dir: Path,
     *,
@@ -102,6 +115,7 @@ def archive_narration(
     existing_audio_path: Path | None = None,
     mime_type: str | None = None,
     transcription_engine: str = "browser_web_speech",
+    audio_start_trace_elapsed_ms: object = None,
 ) -> NarrationArchive:
     """Archive an optional microphone track next to an immutable human Trace."""
 
@@ -110,6 +124,9 @@ def archive_narration(
         raise FileNotFoundError("Narration target has no trace.jsonl")
     normalized_transcript = _normalize_transcript(transcript)
     normalized_segments = _normalize_segments(segments)
+    normalized_audio_offset = _normalize_audio_start_trace_elapsed_ms(
+        audio_start_trace_elapsed_ms
+    )
     audio_path: Path | None = None
     audio_payload: dict[str, object] | None = None
     if audio:
@@ -139,6 +156,7 @@ def archive_narration(
         "transcription_engine": transcription_engine,
         "transcript": normalized_transcript,
         "segments": normalized_segments,
+        "audio_start_trace_elapsed_ms": normalized_audio_offset,
         "audio": audio_payload,
     }
     manifest_path = root / "narration.json"
@@ -168,4 +186,7 @@ def load_narration(path: Path) -> dict[str, Any] | None:
         "transcript": transcript,
         "segments": segments,
         "transcription_engine": str(payload.get("transcription_engine") or "unknown"),
+        "audio_start_trace_elapsed_ms": _normalize_audio_start_trace_elapsed_ms(
+            payload.get("audio_start_trace_elapsed_ms")
+        ),
     }

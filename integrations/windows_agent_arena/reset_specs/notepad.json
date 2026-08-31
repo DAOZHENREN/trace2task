@@ -1,0 +1,10 @@
+{
+  "schema_version": "0.1",
+  "tasks": {
+    "366de66e-cbae-4d72-b042-26390db2b145-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\draft.txt"
+      ]
+    }
+  }
+}

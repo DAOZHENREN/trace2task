@@ -30,6 +30,13 @@ MAX_DECISION_REPAIR_ATTEMPTS = 1
 WINDOWS_DECISION_TIMEOUT_SECONDS = 300
 MODEL_CURRENT_IMAGE_MAX_EDGE = 1_440
 MODEL_REFERENCE_IMAGE_MAX_EDGE = 1_280
+WINDOWS_EXPERIENCE_MODES = (
+    "baseline",
+    "trace",
+    "compiled",
+    "narrated_compiled",
+    "feedback",
+)
 
 
 class _IncompletePlanWithoutActionsError(RuntimeError):
@@ -88,11 +95,17 @@ class CodexWindowsAgent:
         timeout_seconds: float = WINDOWS_DECISION_TIMEOUT_SECONDS,
         background: bool = False,
         adaptive_reasoning: bool = True,
+        experience_mode: str = "feedback",
         binary_resolver: BinaryResolver = resolve_codex_binary,
         session_factory: SessionFactory = CodexAppServerSession,
     ) -> None:
         if plan_horizon <= 0 or plan_horizon > 12:
             raise ValueError("Windows plan_horizon must be between 1 and 12")
+        if experience_mode not in WINDOWS_EXPERIENCE_MODES:
+            raise ValueError(
+                "Windows experience_mode must be one of "
+                f"{', '.join(WINDOWS_EXPERIENCE_MODES)}"
+            )
         self.contract = contract
         self.model = model
         self.reasoning_effort = reasoning_effort
@@ -101,6 +114,7 @@ class CodexWindowsAgent:
         self.timeout_seconds = timeout_seconds
         self.background = background
         self.adaptive_reasoning = adaptive_reasoning
+        self.experience_mode = experience_mode
         self.binary_resolver = binary_resolver
         self.session_factory = session_factory
         self.replans = 0
@@ -288,6 +302,22 @@ class CodexWindowsAgent:
     def _reference_paths(self, *, fresh_context: bool) -> tuple[Path, ...]:
         if not fresh_context:
             return ()
+        if self.experience_mode == "baseline":
+            return ()
+        if self.experience_mode == "trace":
+            trace_frames = self.contract.reference_frame.parent
+            if trace_frames.name != "frames":
+                trace_frames /= "frames"
+            candidates = sorted(trace_frames.glob("*.png"))
+            if not candidates:
+                candidates = [self.contract.reference_frame]
+            if len(candidates) > 4:
+                indexes = {
+                    round(index * (len(candidates) - 1) / 3)
+                    for index in range(4)
+                }
+                candidates = [candidates[index] for index in sorted(indexes)]
+            return tuple(candidates)
         paths = [self.contract.reference_frame]
         experience = self.contract.semantic_experience
         if experience is not None:
@@ -345,7 +375,7 @@ class CodexWindowsAgent:
         if not self.adaptive_reasoning:
             self._escalation_level = 0
         elif (
-            self.contract.semantic_experience is not None
+            self._uses_compiled_experience()
             and plan.stage_id == "unknown"
         ) or plan.confidence < 0.7:
             self._escalation_level = 2
@@ -418,11 +448,12 @@ class CodexWindowsAgent:
         completion_context = self._completion_context()
         if self._turn_index > 0:
             stage_context = self._active_stage_context(reference_paths)
+            evidence_images = self._evidence_image_context(reference_paths)
             session_intro = (
                 "This is a fresh bounded model session for the current semantic state. No prior "
                 "messages are available; the compact authoritative stage context and exact "
                 "stage-boundary images below are self-contained. Image 1 is the current target "
-                "client area and Image 2 is the final success reference.\n"
+                f"client area. {evidence_images}\n"
                 if fresh_context
                 else "Continue the current semantic stage/state using Image 1 as the new authoritative "
                 "target screenshot.\n"
@@ -455,13 +486,16 @@ class CodexWindowsAgent:
 
         semantic_context = self._semantic_context(reference_paths)
         allowed_skills = self._allowed_skills()
+        evidence_images = self._evidence_image_context(reference_paths)
         execution_context = (
             "Execution mode: background window messages. The target stays behind the user's "
             "foreground app. Never return focus_window.\n"
             if self.background
             else "Execution mode: guarded foreground input.\n"
         )
-        if self.contract.runtime_instruction is None:
+        if self.experience_mode in {"baseline", "trace"}:
+            task_context = f"Task instruction for this run: {self.contract.instruction}\n"
+        elif self.contract.runtime_instruction is None:
             task_context = (
                 f"Task: {task.instruction}\n"
                 f"Success condition: {task.expected_result}\n"
@@ -479,8 +513,8 @@ class CodexWindowsAgent:
         return (
             "This is the first observation in a new Windows task run.\n"
             "You are the visual planner of a constrained Windows agent. Do not run commands, "
-            "read files, or use tools. Image 1 is the current target client area. Image 2 is the "
-            "human-reviewed successful reference frame. Compare them visually. The local motor "
+            "read files, or use tools. Image 1 is the current target client area. "
+            f"{evidence_images}The local motor "
             "controller alone will execute your structured actions.\n\n"
             "Evidence priority is: current pixels and local safety, confirmed human guidance, "
             "reviewed semantic state graph, then raw Trace motor evidence. The Trace proves observed "
@@ -526,6 +560,11 @@ class CodexWindowsAgent:
 
     def _completion_context(self) -> str:
         task = self.contract.task
+        if self.experience_mode == "baseline":
+            return (
+                "Completion policy: use only the current task instruction and visible pixels. "
+                "A separate benchmark evaluator, not this model, will decide final success.\n"
+            )
         if task.completion_mode == "cycle":
             return (
                 "Completion policy: cycle. The reviewed reference is both a possible start anchor "
@@ -539,6 +578,33 @@ class CodexWindowsAgent:
         )
 
     def _semantic_context(self, references: tuple[Path, ...]) -> str:
+        if self.experience_mode == "baseline":
+            return (
+                "Human Trace, Compiler Agent interpretation, and human feedback are withheld for "
+                "this controlled baseline run.\n"
+            )
+        if self.experience_mode == "trace":
+            categories: dict[str, int] = {}
+            for action in self.contract.demonstration:
+                category = {
+                    "drag": "unverified_pointer_gesture",
+                    "hold_mouse": "unverified_pointer_gesture",
+                    "wait": "observed_transition_wait",
+                    "click": "pointer_activation",
+                }.get(action.skill, action.skill)
+                categories[category] = categories.get(category, 0) + 1
+            image_map = [
+                {"image": index, "path": path.name}
+                for index, path in enumerate(references, start=2)
+            ]
+            return (
+                "Immutable human Trace evidence is available without Compiler Agent semantics or "
+                "human feedback. It is one observed example, not a replay script. Recorded "
+                "coordinates, hold durations, drag paths, and fixed waits remain withheld. "
+                f"Sanitized action categories: {json.dumps(categories, ensure_ascii=False, separators=(',', ':'))}\n"
+                "Evenly sampled Trace evidence images after the current screenshot: "
+                f"{json.dumps(image_map, ensure_ascii=False, separators=(',', ':'))}\n"
+            )
         experience = self.contract.semantic_experience
         if experience is None:
             return "Semantic stage interpretation: unavailable; rely on raw demonstration evidence.\n"
@@ -549,7 +615,7 @@ class CodexWindowsAgent:
             }
             for index, path in enumerate(references[1:], start=3)
         ]
-        guidance = self.contract.human_guidance
+        guidance = self.contract.human_guidance if self.experience_mode == "feedback" else None
         guidance_payload = guidance.prompt_payload() if guidance is not None else None
         return (
             "Compiler Agent semantic stage index and directed state graph (derived and reviewable "
@@ -568,6 +634,8 @@ class CodexWindowsAgent:
         )
 
     def _active_stage_context(self, references: tuple[Path, ...]) -> str:
+        if not self._uses_compiled_experience():
+            return self._semantic_context(references)
         experience = self.contract.semantic_experience
         if experience is None:
             return "Active semantic state: unavailable.\n"
@@ -600,6 +668,8 @@ class CodexWindowsAgent:
         )
 
     def _guidance_for_state(self, state_id: str | None) -> dict[str, Any] | None:
+        if self.experience_mode != "feedback":
+            return None
         guidance = self.contract.human_guidance
         experience = self.contract.semantic_experience
         if guidance is None or experience is None:
@@ -777,9 +847,28 @@ class CodexWindowsAgent:
 
     def _stage_ids(self) -> list[str]:
         experience = self.contract.semantic_experience
-        if experience is None:
+        if experience is None or not self._uses_compiled_experience():
             return ["unknown"]
         return [*experience.state_ids, "unknown"]
+
+    def _uses_compiled_experience(self) -> bool:
+        return (
+            self.experience_mode in {"compiled", "narrated_compiled", "feedback"}
+            and self.contract.semantic_experience is not None
+        )
+
+    def _evidence_image_context(self, references: tuple[Path, ...]) -> str:
+        if self.experience_mode == "baseline" or not references:
+            return "No human demonstration image is attached in this controlled condition. "
+        if self.experience_mode == "trace":
+            return (
+                f"Images 2 through {len(references) + 1} are evenly sampled immutable human "
+                "Trace frames; treat them as observed evidence, never fixed coordinates. "
+            )
+        return (
+            "Image 2 is the human-reviewed successful reference frame. Additional images, when "
+            "present, are exact human Trace evidence selected for the reviewed semantic state. "
+        )
 
     def _parse_payload(
         self,

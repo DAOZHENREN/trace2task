@@ -9,7 +9,10 @@ import pygame
 import yaml
 
 from trace2task.compiler import confirm_taskpack
-from trace2task.windows_experience import compile_windows_semantic_experience
+from trace2task.windows_experience import (
+    compile_windows_semantic_experience,
+    probe_codex_compiler_connection,
+)
 from trace2task.windows_task import load_windows_task
 
 
@@ -247,6 +250,35 @@ class FakeSession:
         self.closed = True
 
 
+def test_compiler_connectivity_preflight_is_text_only_and_low_effort() -> None:
+    sessions: list[FakeSession] = []
+    calls: list[dict[str, Any]] = []
+
+    def session_factory(codex_executable: str, **kwargs: Any) -> FakeSession:
+        assert kwargs["model"] == "gpt-5.6-sol"
+        assert kwargs["reasoning_effort"] == "low"
+        assert kwargs["timeout_seconds"] == 23
+        session = FakeSession(
+            codex_executable,
+            responses=iter([{"status": "ok"}]),
+            calls=calls,
+            **kwargs,
+        )
+        sessions.append(session)
+        return session
+
+    result = probe_codex_compiler_connection(
+        model="gpt-5.6-sol",
+        timeout_seconds=23,
+        binary_resolver=lambda requested: requested,
+        session_factory=session_factory,
+    )
+
+    assert result["status"] == "completed"
+    assert calls[0]["image_path"] is None
+    assert sessions[0].closed is True
+
+
 def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path) -> None:
     task_path = _write_taskpack(tmp_path)
     (task_path.parent / "reference" / "narration.json").write_text(
@@ -270,6 +302,9 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     sessions: list[FakeSession] = []
 
     def session_factory(codex_executable: str, **kwargs: Any) -> FakeSession:
+        assert kwargs["timeout_seconds"] == 300
+        assert kwargs["progress_timeout_seconds"] == 90
+        assert kwargs["hard_timeout_seconds"] == 600
         session = FakeSession(
             codex_executable,
             responses=iter([_semantic_response()]),
@@ -307,6 +342,8 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert root["verifier"]["completion"]["mode"] == "cycle"
     assert root["verifier"]["completion"]["require_departure_from_reference"] is True
     assert contract.semantic_experience is not None
+    assert contract.semantic_experience.narration_available is True
+    assert contract.semantic_experience.narration_kind == "human"
     assert contract.task.completion_mode == "cycle"
     assert contract.semantic_experience.stages[0].state_after.evidence_frame.endswith(
         "0002.png"
@@ -337,6 +374,101 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert confirmed.review_status == "confirmed"
     assert confirmed_experience["review"]["status"] == "confirmed"
     assert load_windows_task(task_path).semantic_experience is not None
+
+
+def test_semantic_experience_classifies_narration_provenance(tmp_path: Path) -> None:
+    for engine, expected_kind in (
+        ("faster_whisper", "human"),
+        ("manual", "human"),
+        ("browser", "human"),
+        ("waa_task_instruction", "task_instruction"),
+    ):
+        task_path = _write_taskpack(tmp_path / engine)
+        (task_path.parent / "reference" / "narration.json").write_text(
+            json.dumps(
+                {
+                    "transcript": "Narration provenance fixture.",
+                    "segments": [
+                        {
+                            "start_ms": 0,
+                            "end_ms": 800,
+                            "text": "Narration provenance fixture.",
+                        }
+                    ],
+                    "transcription_engine": engine,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = compile_windows_semantic_experience(
+            task_path,
+            binary_resolver=lambda requested: requested,
+            session_factory=lambda executable, **kwargs: FakeSession(
+                executable,
+                responses=iter([_semantic_response()]),
+                calls=[],
+                **kwargs,
+            ),
+        )
+        document_path = task_path.parent / "experience.yaml"
+        document = yaml.safe_load(document_path.read_text(encoding="utf-8"))
+        experience = load_windows_task(task_path).semantic_experience
+
+        assert result.narration_kind == expected_kind
+        assert document["source"]["narration_kind"] == expected_kind
+        assert experience is not None
+        assert experience.narration_kind == expected_kind
+
+        document["source"].pop("narration_kind")
+        document_path.write_text(
+            yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        legacy_experience = load_windows_task(task_path).semantic_experience
+        assert legacy_experience is not None
+        assert legacy_experience.narration_kind == expected_kind
+
+
+def test_compiler_can_withhold_narration_for_clean_ablation(tmp_path: Path) -> None:
+    task_path = _write_taskpack(tmp_path)
+    narration_marker = "NARRATION_ONLY_SENTINEL"
+    (task_path.parent / "reference" / "narration.json").write_text(
+        json.dumps(
+            {
+                "transcript": narration_marker,
+                "segments": [
+                    {"start_ms": 0, "end_ms": 800, "text": narration_marker}
+                ],
+                "transcription_engine": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    response = _semantic_response()
+    response["narration_claims"] = []
+    calls: list[dict[str, Any]] = []
+
+    compile_windows_semantic_experience(
+        task_path,
+        use_narration=False,
+        binary_resolver=lambda requested: requested,
+        session_factory=lambda executable, **kwargs: FakeSession(
+            executable,
+            responses=iter([response]),
+            calls=calls,
+            **kwargs,
+        ),
+    )
+    document = yaml.safe_load(
+        (task_path.parent / "experience.yaml").read_text(encoding="utf-8")
+    )
+    experience = load_windows_task(task_path).semantic_experience
+
+    assert narration_marker not in calls[0]["prompt"]
+    assert document["source"]["narration"] is None
+    assert experience is not None
+    assert experience.narration_available is False
+    assert experience.narration_kind == "none"
 
 
 def test_compiler_separates_trace_episodes_from_non_linear_runtime_graph(

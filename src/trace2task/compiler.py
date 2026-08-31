@@ -181,7 +181,12 @@ def _copy_reference_bundle(
         shutil.copy2(frame_path, frames_dir / frame_path.name)
 
 
-def compile_trace(trace_path: Path, output_root: Path) -> CompileResult:
+def compile_trace(
+    trace_path: Path,
+    output_root: Path,
+    *,
+    task_id_override: str | None = None,
+) -> CompileResult:
     """Compile one verified mini-game or Windows demonstration into a task pack."""
 
     source_trace = trace_path.expanduser().resolve()
@@ -200,6 +205,7 @@ def compile_trace(trace_path: Path, output_root: Path) -> CompileResult:
             metadata,
             events,
             output_root,
+            task_id_override=task_id_override,
         )
         compiled_task = load_taskpack(windows_result.task_path)
         return CompileResult(
@@ -215,7 +221,7 @@ def compile_trace(trace_path: Path, output_root: Path) -> CompileResult:
     frame_paths = _validate_trace_bundle(source_trace, metadata, events)
     actions = [event["action"] for event in events if isinstance(event.get("action"), str)]
     stages = _infer_stages(events)
-    task_id = str(metadata["task_id"]).strip()
+    task_id = str(task_id_override or metadata["task_id"]).strip()
 
     output_dir = make_run_dir(output_root, f"{task_id}-taskpack")
     output_dir.mkdir(parents=True, exist_ok=False)

@@ -8,8 +8,17 @@ from pathlib import Path
 from trace2task import __version__
 from trace2task.codex_app_server import CODEX_REASONING_EFFORTS
 from trace2task.compiler import compile_trace, confirm_taskpack
+from trace2task.evaluation import run_evaluation_suite
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
+from trace2task.waa_bridge import serve_waa_bridge
+from trace2task.waa_experiment import (
+    DEFAULT_WAA_CONDITIONS,
+    DEFAULT_WAA_RESET_SPEC,
+    run_waa_experiment,
+)
+from trace2task.waa_results import write_waa_report
 from trace2task.web_console import serve_web_console
+from trace2task.windows_agent import WINDOWS_EXPERIENCE_MODES
 from trace2task.windows_capture import GdiWindowCapture, capture_window_once
 from trace2task.windows_control import (
     Win32Backend,
@@ -17,6 +26,11 @@ from trace2task.windows_control import (
     list_window_records,
     probe_window_key,
     probe_window_mouse_button,
+)
+from trace2task.windows_experience import (
+    DEFAULT_COMPILER_MODEL,
+    DEFAULT_COMPILER_REASONING_EFFORT,
+    compile_windows_semantic_experience,
 )
 from trace2task.windows_recording import (
     CONTROL_KEY_CODES,
@@ -94,6 +108,125 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark a reviewed compiler-generated task pack as executable.",
     )
     confirm.add_argument("task", type=Path)
+
+    evaluation = subparsers.add_parser(
+        "eval",
+        help="Run a resettable task suite repeatedly and aggregate verifier outcomes.",
+    )
+    evaluation_subparsers = evaluation.add_subparsers(
+        dest="evaluation_command",
+        required=True,
+    )
+    evaluation_run = evaluation_subparsers.add_parser(
+        "run",
+        help="Run every case in an evaluation suite.",
+    )
+    evaluation_run.add_argument("--suite", type=Path, required=True)
+    evaluation_run.add_argument("--model", default="gpt-5.6-terra")
+    evaluation_run.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="low",
+    )
+    evaluation_run.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evaluations"),
+    )
+    evaluation_run.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute task actions. Without this flag the suite only evaluates dry-run plans.",
+    )
+
+    waa = subparsers.add_parser(
+        "waa",
+        help="Connect Trace2Task to a Windows Agent Arena client.",
+    )
+    waa_subparsers = waa.add_subparsers(dest="waa_command", required=True)
+    waa_bridge = waa_subparsers.add_parser(
+        "bridge",
+        help="Serve Codex decisions to the isolated WAA runner over authenticated HTTP.",
+    )
+    waa_bridge.add_argument("--task", type=Path, required=True)
+    waa_bridge.add_argument(
+        "--experience-mode",
+        choices=WINDOWS_EXPERIENCE_MODES,
+        required=True,
+    )
+    waa_bridge.add_argument("--model", default="gpt-5.6-terra")
+    waa_bridge.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="low",
+    )
+    waa_bridge.add_argument("--codex-bin", default="codex")
+    waa_bridge.add_argument("--plan-horizon", type=int, default=12)
+    waa_bridge.add_argument("--host", default="127.0.0.1")
+    waa_bridge.add_argument("--port", type=int, default=8776)
+    waa_bridge.add_argument(
+        "--token",
+        required=True,
+        help="Shared local token required from the WAA client.",
+    )
+    waa_report = waa_subparsers.add_parser(
+        "report",
+        help="Aggregate WAA evaluator outcomes and efficiency metrics by experience mode.",
+    )
+    waa_report.add_argument("--results-root", type=Path, required=True)
+    waa_report.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evaluations") / "windows-agent-arena",
+    )
+    waa_experiment = waa_subparsers.add_parser(
+        "experiment",
+        help="Run reset-verified WAA experience ablations and write one report.",
+    )
+    waa_experiment.add_argument("--waa-root", type=Path, required=True)
+    waa_experiment.add_argument("--task", type=Path, required=True)
+    waa_experiment.add_argument(
+        "--narrated-task",
+        type=Path,
+        help=(
+            "Separate task pack compiled from the same Trace with human narration; required "
+            "when comparing compiled and narrated_compiled."
+        ),
+    )
+    waa_experiment.add_argument(
+        "--reset-spec",
+        type=Path,
+        default=DEFAULT_WAA_RESET_SPEC,
+    )
+    waa_experiment.add_argument(
+        "--conditions",
+        nargs="+",
+        choices=WINDOWS_EXPERIENCE_MODES,
+        default=DEFAULT_WAA_CONDITIONS,
+    )
+    waa_experiment.add_argument("--repetitions", type=int, default=3)
+    waa_experiment.add_argument("--model", default="gpt-5.6-terra")
+    waa_experiment.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default="low",
+    )
+    waa_experiment.add_argument("--codex-bin", default="codex")
+    waa_experiment.add_argument("--plan-horizon", type=int, default=12)
+    waa_experiment.add_argument("--distro", default="Trace2Task-WAA")
+    waa_experiment.add_argument("--container", default="winarena")
+    waa_experiment.add_argument(
+        "--json-name",
+        default="evaluation_examples_windows/test_trace2task.json",
+    )
+    waa_experiment.add_argument("--token", default="trace2task-local-eval")
+    waa_experiment.add_argument("--bridge-port", type=int, default=8776)
+    waa_experiment.add_argument("--relay-port", type=int, default=8876)
+    waa_experiment.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evaluations") / "windows-agent-arena",
+    )
 
     windows = subparsers.add_parser(
         "windows",
@@ -174,6 +307,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1_000,
         help="Per-message hang timeout (default: 1000ms).",
+    )
+    windows_compile_experience = windows_subparsers.add_parser(
+        "compile-experience",
+        help="Compile one Windows task pack into a semantic state graph.",
+    )
+    windows_compile_experience.add_argument("--task", type=Path, required=True)
+    windows_compile_experience.add_argument("--model", default=DEFAULT_COMPILER_MODEL)
+    windows_compile_experience.add_argument(
+        "--reasoning-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default=DEFAULT_COMPILER_REASONING_EFFORT,
+    )
+    windows_compile_experience.add_argument(
+        "--ignore-narration",
+        action="store_true",
+        help="Compile only from Trace actions and screenshots even if narration.json exists.",
     )
     windows_agent = windows_subparsers.add_parser(
         "agent",
@@ -276,6 +425,50 @@ def main(argv: list[str] | None = None) -> int:
         result = compile_trace(args.trace, args.output)
     elif args.command == "confirm":
         result = confirm_taskpack(args.task)
+    elif args.command == "eval":
+        result = run_evaluation_suite(
+            args.suite,
+            execute=args.execute,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            output_root=args.output,
+        )
+    elif args.command == "waa":
+        if args.waa_command == "bridge":
+            serve_waa_bridge(
+                args.task,
+                experience_mode=args.experience_mode,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                token=args.token,
+                host=args.host,
+                port=args.port,
+                codex_bin=args.codex_bin,
+                plan_horizon=args.plan_horizon,
+            )
+            return 0
+        if args.waa_command == "experiment":
+            result = run_waa_experiment(
+                args.waa_root,
+                args.task,
+                reset_spec=args.reset_spec,
+                conditions=args.conditions,
+                narrated_task_path=args.narrated_task,
+                repetitions=args.repetitions,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                codex_bin=args.codex_bin,
+                plan_horizon=args.plan_horizon,
+                distro=args.distro,
+                container=args.container,
+                json_name=args.json_name,
+                token=args.token,
+                bridge_port=args.bridge_port,
+                relay_port=args.relay_port,
+                output_root=args.output,
+            )
+        else:
+            result = write_waa_report(args.results_root, args.output)
     elif args.command == "windows":
         if args.windows_command == "list":
             result = list_window_records(
@@ -330,6 +523,13 @@ def main(argv: list[str] | None = None) -> int:
                     timeout_ms=args.message_timeout_ms,
                     backend=backend,
                 )
+        elif args.windows_command == "compile-experience":
+            result = compile_windows_semantic_experience(
+                args.task,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                use_narration=not args.ignore_narration,
+            )
         else:
             if args.focus or (args.execute and not args.background):
                 print("Waiting up to 10 seconds for the target to become foreground...")
