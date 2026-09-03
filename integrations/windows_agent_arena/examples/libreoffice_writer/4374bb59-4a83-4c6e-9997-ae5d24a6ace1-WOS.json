@@ -1,0 +1,38 @@
+{
+  "id": "4374bb59-4a83-4c6e-9997-ae5d24a6ace1-WOS",
+  "snapshot": "libreoffice_writer",
+  "instruction": "Open C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.odt in LibreOffice Writer. Apply the Heading 1 paragraph style to the paragraph containing exactly \"Operations Readiness Brief\". Leave the wording and paragraph order unchanged, then save the document.",
+  "source": "Trace2Task parameterized study",
+  "trace2task": {
+    "family_id": "writer-heading-style",
+    "variant_id": "E2",
+    "variant_role": "held_out_evaluation",
+    "recordable": false
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; import subprocess, shutil, time; [subprocess.run(['taskkill','/F','/IM',image], capture_output=True, text=True) for image in ('swriter.exe','soffice.exe','soffice.bin')]; time.sleep(1); p=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.html'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Operations Brief</title></head><body><p>Operations Readiness Brief</p><p>All regional checks have passed.</p><p>The deployment window opens at noon.</p></body></html>', encoding='utf-8'); out=p.with_suffix('.odt'); out.unlink(missing_ok=True); (p.parent / f'.~lock.{out.name}#').unlink(missing_ok=True); profile=Path(r'C:\\Users\\Docker\\AppData\\Local\\Temp\\trace2task-writer-e2-setup'); shutil.rmtree(profile, ignore_errors=True); result=subprocess.run([r'C:\\Program Files\\LibreOffice\\program\\soffice.exe','-env:UserInstallation=file:///C:/Users/Docker/AppData/Local/Temp/trace2task-writer-e2-setup','--headless','--convert-to','odt','--outdir',str(p.parent),str(p)], check=True, timeout=60, capture_output=True, text=True); assert out.is_file(), 'LibreOffice conversion did not create ODT: ' + result.stdout + result.stderr; p.unlink(missing_ok=True); shutil.rmtree(profile, ignore_errors=True)"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["libreoffice_writer"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; import zipfile; import xml.etree.ElementTree as ET; p=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.odt'); ns='urn:oasis:names:tc:opendocument:xmlns:text:1.0'; root=ET.fromstring(zipfile.ZipFile(p).read('content.xml')) if p.is_file() else ET.Element('missing'); heads=[''.join(node.itertext()).strip() for node in root.findall('.//{%s}h' % ns) if node.get('{%s}outline-level' % ns) == '1']; ok=heads == ['Operations Readiness Brief']; marker=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.heading1.complete'); marker.write_text('complete', encoding='utf-8') if ok else marker.unlink(missing_ok=True); print('true' if ok else 'false', end='')"
+      ]
+    },
+    "expected": {"type": "rule", "rules": {"expected": "true"}}
+  }
+}

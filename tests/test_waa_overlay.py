@@ -74,7 +74,7 @@ def _fake_waa_checkout(root: Path) -> Path:
         '    Invoke-Expression $setAliasExpression\n'
         '}\n'
         '    $libreOfficeInstallerFilePath = "$env:TEMP\\libreOffice_installer.exe"\n'
-        "    \n"
+        "\n"
         "    $downloadResult = Invoke-DownloadFileFromAvailableMirrors "
         "-mirrorUrls $libreOfficeToolDetails.mirrors "
         "-outfile $libreOfficeInstallerFilePath\n"
@@ -116,6 +116,30 @@ def test_waa_overlay_is_idempotent_and_preserves_lf(tmp_path: Path) -> None:
     client = checkout / "src" / "win-arena-container" / "client"
     assert (client / "mm_agents" / "trace2task" / "agent.py").is_file()
     assert (client / "evaluation_examples_windows" / "test_trace2task.json").is_file()
+    assert (
+        client
+        / "evaluation_examples_windows"
+        / "test_trace2task_count_token_d0.json"
+    ).is_file()
+    assert (
+        client
+        / "evaluation_examples_windows"
+        / "test_trace2task_find_file_d0.json"
+    ).is_file()
+    assert (
+        client
+        / "evaluation_examples_windows"
+        / "examples"
+        / "notepad"
+        / "351f1d5e-f3f7-4efe-8fda-e8a8e9eacf4c-WOS.json"
+    ).is_file()
+    assert (
+        client
+        / "evaluation_examples_windows"
+        / "examples"
+        / "file_explorer"
+        / "c05b680d-bda5-48db-984b-c1024496d088-WOS.json"
+    ).is_file()
     requirements_path = (
         checkout
         / "src"

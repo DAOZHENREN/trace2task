@@ -348,7 +348,7 @@ class WindowRecorder:
         self.clock = clock
         self.sleeper = sleeper
         self.status_callback = status_callback
-        if capability_profile not in {None, "messaging"}:
+        if capability_profile not in {None, "messaging", "text_entry"}:
             raise ValueError(f"Unsupported recording capability profile: {capability_profile}")
         self.capability_profile = capability_profile
 

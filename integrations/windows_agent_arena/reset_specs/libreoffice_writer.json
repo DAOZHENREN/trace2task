@@ -1,0 +1,37 @@
+{
+  "schema_version": "0.1",
+  "tasks": {
+    "7cfca519-892e-4179-af85-819924deeb16-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.heading1.complete"
+      ],
+      "must_exist_after_setup": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.odt"
+      ]
+    },
+    "0c37db62-b4a6-4f32-ba96-d73666b2601a-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\project_update.heading1.complete"
+      ],
+      "must_exist_after_setup": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\project_update.odt"
+      ]
+    },
+    "4374bb59-4a83-4c6e-9997-ae5d24a6ace1-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.heading1.complete"
+      ],
+      "must_exist_after_setup": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\operations_brief.odt"
+      ]
+    },
+    "9be63c39-3065-4ad9-a419-b359b3517294-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\policy_review.heading1.complete"
+      ],
+      "must_exist_after_setup": [
+        "C:\\Users\\Docker\\Documents\\Writer Tasks\\policy_review.odt"
+      ]
+    }
+  }
+}

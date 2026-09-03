@@ -10,7 +10,9 @@ import trace2task.waa_experiment as experiment_module
 from trace2task.waa_experiment import (
     _client_run_command,
     _load_reset_spec,
+    _require_completed_waa_run,
     _task_ids,
+    _validate_automatic_compiler_snapshot,
     _validate_conditions,
 )
 
@@ -66,6 +68,45 @@ def test_conditions_require_reviewed_semantic_experience() -> None:
     with pytest.raises(RuntimeError, match="semantic experience"):
         _validate_conditions(confirmed, ("baseline", "compiled"))
 
+    automatic = SimpleNamespace(
+        task=SimpleNamespace(requires_confirmation=True),
+        semantic_experience=SimpleNamespace(narration_available=False),
+        human_guidance=None,
+    )
+    assert _validate_conditions(
+        automatic,
+        ("compiled",),
+        allow_automatic_compiler_draft=True,
+    ) == ("compiled",)
+    with pytest.raises(RuntimeError, match="isolated compiled condition"):
+        _validate_conditions(
+            automatic,
+            ("baseline", "compiled"),
+            allow_automatic_compiler_draft=True,
+        )
+
+
+def test_automatic_compiler_draft_requires_matching_frozen_manifest(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "snapshot" / "taskpack" / "task.yaml"
+    task.parent.mkdir(parents=True)
+    task.write_text("id: auto\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="frozen Compiler snapshot"):
+        _validate_automatic_compiler_snapshot(task.resolve())
+
+    manifest = {
+        "kind": "automatic_compiler_output",
+        "task_path": str(task.resolve()),
+        "tree_sha256": "abc",
+    }
+    (task.parent.parent / "snapshot.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    assert _validate_automatic_compiler_snapshot(task.resolve()) == manifest
+
 
 def test_client_command_passes_exact_reset_and_result_scope() -> None:
     command = _client_run_command(
@@ -82,7 +123,28 @@ def test_client_command_passes_exact_reset_and_result_scope() -> None:
     assert "TRACE2TASK_WAA_RESET_SPEC=/client/trace2task_reset_spec.json" in joined
     assert "TRACE2TASK_WAA_BRIDGE_URL=http://172.18.0.1:8876" in joined
     assert "/client/results/experiment/baseline-r01" in command
+    assert command[command.index("--result_dir") + 1] == (
+        "/client/results/experiment/baseline-r01"
+    )
     assert "evaluation_examples_windows/test_trace2task.json" in command
+    assert command[command.index("--observation_type") + 1] == "screenshot"
+    assert "a11y_tree" not in command
+
+
+def test_completed_waa_run_requires_an_evaluator_result(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    failed_task = run_root / "pyautogui" / "screenshot" / "unused" / "0" / "notepad" / "task-1"
+    failed_task.mkdir(parents=True)
+    (failed_task / "traj.jsonl").write_text(
+        json.dumps({"Error": "Exception in notepad/task-1", "Exception": "VM probe timed out"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="VM probe timed out"):
+        _require_completed_waa_run(run_root, expected_task_ids={"task-1"})
+
+    (failed_task / "result.txt").write_text("0.0\n", encoding="utf-8")
+    _require_completed_waa_run(run_root, expected_task_ids={"task-1"})
 
 
 def test_container_gateway_parser_returns_strict_ipv4() -> None:
@@ -193,7 +255,7 @@ def test_experiment_runs_each_condition_and_repetition(
             narration_kind="human",
             source_path=narrated_task.parent / "experience.yaml",
         ),
-        human_guidance=None,
+        human_guidance=SimpleNamespace(revision=1),
     )
 
     def fake_load_windows_task(path: Path) -> SimpleNamespace:
@@ -210,6 +272,11 @@ def test_experiment_runs_each_condition_and_repetition(
     monkeypatch.setattr(experiment_module, "_ensure_relay", lambda *args, **kwargs: None)
     monkeypatch.setattr(experiment_module, "_check_bridge_health", lambda *args, **kwargs: None)
     monkeypatch.setattr(experiment_module, "_stop_relay", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        experiment_module,
+        "_require_completed_waa_run",
+        lambda *args, **kwargs: None,
+    )
 
     commands: list[list[str]] = []
     monkeypatch.setattr(
@@ -251,19 +318,20 @@ def test_experiment_runs_each_condition_and_repetition(
         waa_root,
         task,
         reset_spec=reset_spec,
-        conditions=("baseline", "compiled", "narrated_compiled"),
+        conditions=("baseline", "compiled", "narrated_compiled", "feedback"),
         narrated_task_path=narrated_task,
         repetitions=2,
         output_root=tmp_path / "reports",
     )
 
     assert result["status"] == "completed"
-    assert len(commands) == 6
+    assert len(commands) == 8
     assert sum("trace2task-baseline" in " ".join(command) for command in commands) == 2
     assert sum("trace2task-compiled" in " ".join(command) for command in commands) == 2
     assert sum(
         "trace2task-narrated_compiled" in " ".join(command) for command in commands
     ) == 2
+    assert sum("trace2task-feedback" in " ".join(command) for command in commands) == 2
     assert server_calls == [
         (task.resolve(), "baseline"),
         (task.resolve(), "baseline"),
@@ -271,10 +339,12 @@ def test_experiment_runs_each_condition_and_repetition(
         (task.resolve(), "compiled"),
         (narrated_task.resolve(), "narrated_compiled"),
         (narrated_task.resolve(), "narrated_compiled"),
+        (narrated_task.resolve(), "feedback"),
+        (narrated_task.resolve(), "feedback"),
     ]
     manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["status"] == "completed"
-    assert len(manifest["completed_episodes"]) == 6
+    assert len(manifest["completed_episodes"]) == 8
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ It observes the current screen, retrieves the relevant parts of the reviewed exp
 bounded sequence of actions, executes them through a guarded local motor layer, and replans when the
 visible state changes.
 
-The current release is **v0.17.5**. It is a Windows-first research prototype with a local web console.
+The current release is **v0.18.1**. It is a Windows-first research prototype with a local web console.
 
 ## Release progression
 
@@ -20,6 +20,8 @@ The current release is **v0.17.5**. It is a Windows-first research prototype wit
 | v0.17.0-v0.17.3 | Added synchronized WAA action recording and optional human narration, task-catalog-driven verified reset, recording cancellation, and residue cleanup. |
 | v0.17.4 | Added a lightweight Compiler connection preflight, fail-fast paired compilation, and retry from preserved recordings without recording again. |
 | v0.17.5 | Replaced the fixed Compiler response deadline with progress-aware streaming, a 90-second inactivity deadline, a 600-second hard limit, and precise retryable failure categories. |
+| v0.18.0 | Added a paper-grade WAA study protocol: frozen artifact hashes, held-out variant checks, deterministic interleaved schedules, automatic-versus-reviewed Compiler controls, mismatched-Trace controls, feedback learning curves, and human-cost accounting. |
+| v0.18.1 | Added the first leakage-controlled parameterized WAA family: one recordable D0 demonstration, three hidden held-out variants, self-contained setup/evaluation, and immutable pre-review Compiler snapshots. |
 
 The architectural direction remains unchanged across these releases: immutable human Trace is the
 primary evidence; Compiler output is reviewable derived knowledge; feedback is versioned; and the
@@ -487,12 +489,19 @@ uv run trace2task waa experiment `
   --waa-root D:\MyProject\WindowsAgentArena `
   --task taskpacks\generated\<plain-task-pack>\task.yaml `
   --narrated-task taskpacks\generated\<narrated-task-pack>\task.yaml `
+  --feedback-task taskpacks\generated\<narrated-task-pack>\task.yaml `
   --reset-spec integrations\windows_agent_arena\reset_specs\notepad.json `
-  --conditions baseline trace compiled narrated_compiled `
+  --conditions baseline trace compiled narrated_compiled feedback `
   --repetitions 3 `
   --model gpt-5.6-terra `
   --reasoning-effort low
 ```
+
+The fourth and fifth conditions can deliberately point to the same narrated task pack. In
+`narrated_compiled` mode the Agent receives the narrated Compiler experience but ignores
+`guidance.yaml`; in `feedback` mode it receives that same experience plus the reviewed guidance.
+This keeps the original Trace and Compiler output fixed, so the fifth condition isolates the effect
+of human feedback. `--feedback-task` defaults to `--narrated-task` when it is omitted.
 
 The WAA VM and `winarena` container must already be running, but no second bridge terminal is needed.
 The runner keeps the model, reasoning effort, task list, action policy, and plan horizon fixed. Before
@@ -528,6 +537,62 @@ uv run trace2task waa report `
 
 The report contains evaluator success rate, success-rate delta versus baseline, executed actions,
 model plan calls, model round-trip seconds, and wall-clock task time for every condition.
+
+### Stage 1 paper study protocol
+
+`waa experiment` remains the small runner for one task and several runtime modes. Formal paper
+experiments need another layer that freezes the research question before any result is observed. The
+Stage 1 protocol lives at
+`integrations\windows_agent_arena\studies\stage1.yaml` and currently defines:
+
+- 22 task slots across Notepad, File Explorer, LibreOffice Writer, LibreOffice Calc, and Paint;
+- matched `baseline`, raw Trace, `Trace Compile`, and `Narrated Trace Compile` arms on every task;
+- four cumulative feedback revisions on a five-task subset;
+- a mismatched-Trace negative control on that same subset;
+- three repetitions, deterministic randomized interleaving, and evaluator, latency, planning,
+  action, recovery, and human-effort metrics.
+
+Prepare and audit the study without running an Agent:
+
+```powershell
+uv run trace2task waa study-plan `
+  --spec integrations\windows_agent_arena\studies\stage1.yaml `
+  --waa-root D:\MyProject\WindowsAgentArena
+```
+
+The command writes a frozen `study-manifest.json`, human-readable `episode-schedule.csv`,
+`human-costs.csv`, a readiness report, and `run-ready-episodes.ps1` under
+`evaluations\windows-agent-arena\studies\trace2task-stage1`. Every present task pack, reset declaration,
+WAA task JSON, example JSON, and source specification is content-hashed. The source Git commit, dirty
+status, and tracked-diff hash are recorded as well.
+
+The first parameterized family is `count-token-occurrences`. It contains one visible demonstration
+variant, D0, and three held-out evaluator variants, E1-E3. Only D0 appears in the web recorder. The
+held-out variants use different file names, search tokens, document contents, output names, and exact
+counts; their setup and evaluator run locally inside the WAA VM without a network dependency. A direct
+recording request for E1-E3 is rejected by the server as well as hidden by the UI.
+
+The second parameterized family is `find-file-by-content`. D0 asks the demonstrator to inspect opaque
+text files, identify the one containing a requested marker, copy it into another Documents subfolder,
+rename the copy, and preserve the source. E1-E3 vary the folders, marker, source position, and output
+name. Only D0 is recordable; the held-out variants have deterministic VM setup and exact-content
+evaluators.
+
+Record D0 from the web console with a new experience name such as
+`WAA count-token D0`. Perform the task shown by WAA and optionally narrate the reusable method rather
+than the literal answer. Compiler snapshots remain available for provenance, but confirmation by itself
+is a quality gate rather than a separate experimental method. Current studies report one `Trace Compile`
+condition; create a separate human-edited condition only when a reviewer materially changes the semantic
+graph or runtime guidance.
+
+The checked-in Stage 1 file remains a research backlog rather than a fabricated completed dataset.
+The count-token family has completed its first formal run. The three find-file evaluation rows remain
+`planned` until its D0 recording, confirmed Compiler artifacts, and human costs have been attached. Use
+`--strict` in CI or before a formal run to turn any remaining gap into a failing command.
+
+When the manifest reaches `READY`, review its hashes and schedule, commit a clean checkout, and run
+the generated PowerShell script in order. Do not manually regroup conditions: interleaving them is
+part of the protocol and reduces time/model-drift bias.
 
 Add `--background` only when the target accepts directed Win32 window messages and can render through
 `PrintWindow`. Add `--focus` to a dry run when a GPU-rendered target requires foreground screen-pixel
@@ -576,7 +641,11 @@ repeatable evaluation aggregation, web APIs, and voice transcription integration
 
 ## Project status
 
-Trace2Task is an evolving research prototype. V0.17.5 replaces the Compiler's fixed absolute response
+Trace2Task is an evolving research prototype. V0.18.1 adds the first D0-to-held-out WAA task family
+and freezes automatic Compiler output before review; V0.18.0 added a frozen, auditable WAA study-design layer
+for measuring whether matched Trace and iterative experience improve success or efficiency. It does
+not claim paper evidence before the declared held-out task slots are recorded and the readiness gate
+passes. V0.17.5 replaced the Compiler's fixed absolute response
 deadline with progress-aware streaming, a separate inactivity deadline, and a bounded hard limit, while
 reporting first-token, stalled-response, hard-timeout, and connectivity failures separately. V0.17.4 added
 a lightweight Codex connectivity preflight, fail-fast paired Compiler behavior, and retryable compilation

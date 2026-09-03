@@ -1313,8 +1313,77 @@ def test_web_controller_lists_only_reset_ready_waa_tasks(tmp_path: Path) -> None
             ),
             "reset_spec": str(reset_spec.resolve()),
             "reset_paths": [r"C:\Users\Docker\Documents\draft.txt"],
+            "experience_family_id": None,
+            "variant_id": None,
+            "variant_role": None,
+            "recordable": True,
         }
     ]
+
+
+def test_web_controller_hides_and_rejects_held_out_waa_variants(
+    tmp_path: Path,
+) -> None:
+    waa_root = tmp_path / "WindowsAgentArena"
+    client_root = waa_root / "src" / "win-arena-container" / "client"
+    example_root = client_root / "evaluation_examples_windows" / "examples" / "notepad"
+    example_root.mkdir(parents=True)
+    recorder = client_root / "trace2task_human_trace.py"
+    recorder.write_text("# recorder\n", encoding="utf-8")
+    demonstration = example_root / "demo.json"
+    held_out = example_root / "held-out.json"
+    for path, task_id, variant_id, role, recordable in (
+        (demonstration, "demo-task", "D0", "demonstration", True),
+        (held_out, "eval-task", "E1", "held_out_evaluation", False),
+    ):
+        path.write_text(
+            json.dumps(
+                {
+                    "id": task_id,
+                    "instruction": f"Run {variant_id}",
+                    "trace2task": {
+                        "family_id": "count-token-occurrences",
+                        "variant_id": variant_id,
+                        "variant_role": role,
+                        "recordable": recordable,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    reset_spec = (
+        tmp_path
+        / "integrations"
+        / "windows_agent_arena"
+        / "reset_specs"
+        / "notepad.json"
+    )
+    reset_spec.parent.mkdir(parents=True)
+    reset_spec.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "tasks": {
+                    task_id: {"must_not_exist": [rf"C:\\Documents\\{task_id}.txt"]}
+                    for task_id in ("demo-task", "eval-task")
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+
+    tasks = controller.list_waa_tasks(waa_root)
+
+    assert [task["id"] for task in tasks] == ["demo-task"]
+    assert tasks[0]["variant_id"] == "D0"
+    assert tasks[0]["experience_family_id"] == "count-token-occurrences"
+    with pytest.raises(ValueError, match="held-out"):
+        controller.start_waa_recording(
+            waa_root=waa_root,
+            example_path=held_out,
+            task_id="forbidden-evaluation-recording",
+        )
 
 
 def test_waa_recording_reuses_turbo_review_and_narration_archive(
@@ -1553,7 +1622,10 @@ def test_web_controller_can_retry_compiling_a_saved_recording(
 
     def compiler(source: Path, output: Path) -> FakeCompilation:
         calls.append((source, output))
-        return FakeCompilation(task_path=str(output / "generated" / "task.yaml"))
+        task_path = output / "generated" / "task.yaml"
+        task_path.parent.mkdir(parents=True)
+        task_path.write_text("id: generated\n", encoding="utf-8")
+        return FakeCompilation(task_path=str(task_path))
 
     def semantic_compiler(
         task_path: Path,
@@ -1668,6 +1740,29 @@ def test_waa_narration_pair_preserves_trace_and_compiler_variants(
     assert compiled_task["id"] != narrated_task["id"]
     assert compiled_task["experience"]["family_id"] == result["family_id"]
     assert narrated_task["experience"]["family_id"] == result["family_id"]
+    for variant in ("compiled", "narrated_compiled"):
+        snapshot = result["variants"][variant]["automatic_snapshot"]
+        snapshot_task = Path(snapshot["task_path"])
+        assert snapshot_task.is_file()
+        assert snapshot_task.is_relative_to(
+            (tmp_path / "evaluations" / "compiler-snapshots").resolve()
+        )
+        assert snapshot["fresh_taskpack"] is True
+        assert json.loads(
+            (Path(snapshot["taskpack_root"]).parent / "snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )["tree_sha256"] == snapshot["tree_sha256"]
+        source_task = Path(result["variants"][variant]["task_path"])
+        marker = json.loads(
+            source_task.with_name(".automatic-compiler-snapshot.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        frozen_before = snapshot_task.read_bytes()
+        source_task.write_text("id: human-reviewed-later\n", encoding="utf-8")
+        assert snapshot_task.read_bytes() == frozen_before
+        assert marker["task_path"] == str(snapshot_task)
 
 
 @pytest.mark.parametrize(
@@ -2223,6 +2318,9 @@ def test_web_server_serves_console_state_and_job_api(
     assert "/api/transcribe" in javascript
     assert "语音输入" in javascript
     assert "不保存录音" in javascript
+    assert "查看轨迹与截图" in javascript
+    assert "人工审查视图" in javascript
+    assert "WAA 人工运行反馈" in javascript
     assert state["taskpacks"][0]["process_name"] == "Weixin.exe"
     assert evidence_bytes.startswith(b"\x89PNG")
     assert state["recordings"] == []

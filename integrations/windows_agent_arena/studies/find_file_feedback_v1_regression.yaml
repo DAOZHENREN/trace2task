@@ -1,0 +1,80 @@
+schema_version: "0.1"
+study_id: trace2task-find-file-feedback-v1-regression
+title: Trace2Task Find-File Human-Feedback Revision 1 Regression
+path_base: ../../..
+seed: 20260902
+repetitions: 1
+model: gpt-5.6-terra
+reasoning_effort: low
+
+targets:
+  apps: 1
+  task_instances: 3
+  parameterized_families: 1
+
+primary_metrics:
+  - evaluator_success
+  - wall_time_seconds
+  - model_time_seconds
+  - plan_calls
+  - action_count
+  - recovery_count
+
+analysis_plan:
+  primary_endpoint: evaluator_success
+  pairing_unit: held_out_variant
+  intent_to_treat: Every scheduled regression episode remains in the denominator.
+  interpretation: Post-hoc regression on E1-E3; diagnostic only, not a new held-out estimate.
+  freeze_rule: Freeze the confirmed narrated task pack at semantic experience revision 1.
+
+conditions:
+  - id: feedback_v1
+    runtime_mode: narrated_compiled
+    taskpack_role: feedback_v1
+    purpose: Confirmed narrated Trace Compile after human structural feedback revision 1.
+
+tasks:
+  - id: explorer-find-file-e1
+    app: file_explorer
+    family_id: find-file-by-content
+    split: development_regression
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 01b0e251-121d-4918-b36d-290447122566-WOS
+    status: ready
+    waa_task_id: 01b0e251-121d-4918-b36d-290447122566-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e1.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      feedback_v1: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml
+
+  - id: explorer-find-file-e2
+    app: file_explorer
+    family_id: find-file-by-content
+    split: development_regression
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    status: ready
+    waa_task_id: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e2.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      feedback_v1: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml
+
+  - id: explorer-find-file-e3
+    app: file_explorer
+    family_id: find-file-by-content
+    split: development_regression
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    status: ready
+    waa_task_id: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e3.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      feedback_v1: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml

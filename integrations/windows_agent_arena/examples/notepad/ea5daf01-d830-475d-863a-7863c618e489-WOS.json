@@ -1,0 +1,42 @@
+{
+  "id": "ea5daf01-d830-475d-863a-7863c618e489-WOS",
+  "snapshot": "notepad",
+  "instruction": "Open alpha_corpus.txt from Documents and count the case-sensitive whole-word occurrences of banana. Save only the decimal count in Documents\\banana_count.txt, then open the output and verify it.",
+  "source": "Trace2Task parameterized study",
+  "_comments": "E1 held-out evaluation variant. Never use it for a human demonstration or Compiler input.",
+  "trace2task": {
+    "family_id": "count-token-occurrences",
+    "variant_id": "E1",
+    "variant_role": "held_out_evaluation",
+    "recordable": false
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; source=Path(r'C:\\Users\\Docker\\Documents\\alpha_corpus.txt'); source.write_text('banana red banana\\nBANANA stays uppercase\\nbananas is plural\\nbanana banana blue\\nbanana\\nyellow banana banana\\nbanana split\\nbanana banana\\nbanana\\n', encoding='utf-8'); Path(r'C:\\Users\\Docker\\Documents\\banana_count.txt').unlink(missing_ok=True)"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["notepad"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; p=Path(r'C:\\Users\\Docker\\Documents\\banana_count.txt'); print('true' if p.is_file() and p.read_text(encoding='utf-8-sig').strip() == '11' else 'false', end='')"
+      ]
+    },
+    "expected": {
+      "type": "rule",
+      "rules": {"expected": "true"}
+    }
+  }
+}

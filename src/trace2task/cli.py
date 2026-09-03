@@ -17,6 +17,8 @@ from trace2task.waa_experiment import (
     run_waa_experiment,
 )
 from trace2task.waa_results import write_waa_report
+from trace2task.waa_study import DEFAULT_STUDY_OUTPUT, prepare_waa_study
+from trace2task.waa_study_results import write_waa_study_report
 from trace2task.web_console import serve_web_console
 from trace2task.windows_agent import WINDOWS_EXPERIENCE_MODES
 from trace2task.windows_capture import GdiWindowCapture, capture_window_once
@@ -194,6 +196,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     waa_experiment.add_argument(
+        "--feedback-task",
+        type=Path,
+        help=(
+            "Reviewed task pack containing human guidance for the feedback condition. "
+            "Defaults to --narrated-task when supplied, otherwise --task."
+        ),
+    )
+    waa_experiment.add_argument(
         "--reset-spec",
         type=Path,
         default=DEFAULT_WAA_RESET_SPEC,
@@ -223,9 +233,40 @@ def build_parser() -> argparse.ArgumentParser:
     waa_experiment.add_argument("--bridge-port", type=int, default=8776)
     waa_experiment.add_argument("--relay-port", type=int, default=8876)
     waa_experiment.add_argument(
+        "--allow-automatic-compiler-draft",
+        action="store_true",
+        help=(
+            "Run one frozen, unreviewed Compiler snapshot as an isolated compiled "
+            "research condition. Never enables ordinary draft task packs."
+        ),
+    )
+    waa_experiment.add_argument(
         "--output",
         type=Path,
         default=Path("evaluations") / "windows-agent-arena",
+    )
+    waa_study = waa_subparsers.add_parser(
+        "study-plan",
+        help="Freeze a paper-grade WAA protocol and deterministic episode schedule.",
+    )
+    waa_study.add_argument("--spec", type=Path, required=True)
+    waa_study.add_argument("--waa-root", type=Path, required=True)
+    waa_study.add_argument("--output", type=Path, default=DEFAULT_STUDY_OUTPUT)
+    waa_study.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail after writing the readiness report when any study cell is incomplete.",
+    )
+    waa_study_report = waa_subparsers.add_parser(
+        "study-report",
+        help="Aggregate one completed paper-grade WAA study run.",
+    )
+    waa_study_report.add_argument("--study-root", type=Path, required=True)
+    waa_study_report.add_argument("--run-root", type=Path, required=True)
+    waa_study_report.add_argument(
+        "--output",
+        type=Path,
+        help="Output directory; defaults to <run-root>/analysis.",
     )
 
     windows = subparsers.add_parser(
@@ -454,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 reset_spec=args.reset_spec,
                 conditions=args.conditions,
                 narrated_task_path=args.narrated_task,
+                feedback_task_path=args.feedback_task,
                 repetitions=args.repetitions,
                 model=args.model,
                 reasoning_effort=args.reasoning_effort,
@@ -465,6 +507,20 @@ def main(argv: list[str] | None = None) -> int:
                 token=args.token,
                 bridge_port=args.bridge_port,
                 relay_port=args.relay_port,
+                output_root=args.output,
+                allow_automatic_compiler_draft=args.allow_automatic_compiler_draft,
+            )
+        elif args.waa_command == "study-plan":
+            result = prepare_waa_study(
+                args.spec,
+                args.waa_root,
+                output_root=args.output,
+                strict=args.strict,
+            )
+        elif args.waa_command == "study-report":
+            result = write_waa_study_report(
+                args.study_root,
+                args.run_root,
                 output_root=args.output,
             )
         else:

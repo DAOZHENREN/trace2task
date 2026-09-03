@@ -173,10 +173,17 @@ def install(waa_root: Path) -> None:
     source_agent = Path(__file__).parent / "mm_agents" / "trace2task"
     target_agent = client / "mm_agents" / "trace2task"
     shutil.copytree(source_agent, target_agent, dirs_exist_ok=True)
-    shutil.copy2(
-        Path(__file__).parent / "test_trace2task.json",
-        client / "evaluation_examples_windows" / "test_trace2task.json",
-    )
+    integration_root = Path(__file__).parent
+    task_list_root = client / "evaluation_examples_windows"
+    for source_task_list in sorted(integration_root.glob("test_trace2task*.json")):
+        shutil.copy2(source_task_list, task_list_root / source_task_list.name)
+    source_examples = integration_root / "examples"
+    if source_examples.is_dir():
+        shutil.copytree(
+            source_examples,
+            task_list_root / "examples",
+            dirs_exist_ok=True,
+        )
     requirements_path = root / "src" / "win-arena-container" / "vm" / "setup" / "server" / "requirements.txt"
     if not requirements_path.is_file():
         raise FileNotFoundError(f"WAA VM requirements were not found under {root}")

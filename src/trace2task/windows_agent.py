@@ -421,6 +421,16 @@ class CodexWindowsAgent:
             reset_reason = "initial"
         return self._get_session(), reset_reason, fresh_context
 
+    def reset_planner_session(self) -> None:
+        """Drop only the model transport/session while preserving task state and history."""
+
+        if self._session is not None:
+            self._session.close()
+        self._session = None
+        self._session_context_key = None
+        self._session_turns = 0
+        self.session_resets += 1
+
     def _system_planning_policy(self) -> str:
         return (
             "System multi-action planning policy (applies identically to every task; this is "

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import math
 import os
@@ -43,6 +44,7 @@ from trace2task.narration import (
     save_narration_audio,
 )
 from trace2task.speech_transcription import TurboTranscriber
+from trace2task.waa_results import materialize_waa_feedback_candidates
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import Win32Backend, WindowSelector, list_window_records
 from trace2task.windows_experience import (
@@ -164,6 +166,25 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _taskpack_tree_digest(root: Path) -> tuple[str, int, int]:
+    digest = hashlib.sha256()
+    file_count = 0
+    size_bytes = 0
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        file_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        size = path.stat().st_size
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(file_hash.encode("ascii"))
+        digest.update(b"\n")
+        file_count += 1
+        size_bytes += size
+    return digest.hexdigest(), file_count, size_bytes
 
 
 def _decode_narration_audio(value: object) -> bytes | None:
@@ -708,6 +729,11 @@ class WebConsoleController:
             instruction = payload.get("instruction")
             if not isinstance(instruction, str) or not instruction.strip():
                 continue
+            trace2task_metadata = payload.get("trace2task")
+            if not isinstance(trace2task_metadata, dict):
+                trace2task_metadata = {}
+            if trace2task_metadata.get("recordable") is False:
+                continue
             evaluator = payload.get("evaluator")
             evaluator_functions = (
                 evaluator.get("func") if isinstance(evaluator, dict) else []
@@ -735,6 +761,10 @@ class WebConsoleController:
                     "example_path": relative.as_posix(),
                     "reset_spec": str(contract["reset_spec"]),
                     "reset_paths": list(contract["reset_paths"]),
+                    "experience_family_id": trace2task_metadata.get("family_id"),
+                    "variant_id": trace2task_metadata.get("variant_id"),
+                    "variant_role": trace2task_metadata.get("variant_role"),
+                    "recordable": True,
                 }
             )
         tasks.sort(key=lambda task: (task["domain"], task["instruction"], task["id"]))
@@ -801,6 +831,7 @@ class WebConsoleController:
         return [record for _, record in records]
 
     def list_candidates(self) -> list[dict[str, Any]]:
+        materialize_waa_feedback_candidates(self.project_root, self.candidate_root)
         if not self.candidate_root.is_dir():
             return []
         records: list[tuple[float, dict[str, Any]]] = []
@@ -822,6 +853,34 @@ class WebConsoleController:
                 if isinstance(data.get("task_model_revision"), dict)
                 else None
             )
+            review_timeline = None
+            raw_review_path = data.get("review_timeline")
+            if isinstance(raw_review_path, str) and raw_review_path:
+                review_path = (path.parent / raw_review_path).resolve()
+                if review_path.parent == path.parent.resolve() and review_path.is_file():
+                    try:
+                        loaded_review = json.loads(review_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        loaded_review = None
+                    if isinstance(loaded_review, dict):
+                        review_timeline = loaded_review
+                        for key in ("initial_frame", "final_frame"):
+                            value = review_timeline.get(key)
+                            if isinstance(value, str) and value:
+                                review_timeline[key] = (
+                                    path.parent / value
+                                ).relative_to(self.project_root).as_posix()
+                        rounds = review_timeline.get("rounds")
+                        if isinstance(rounds, list):
+                            for round_data in rounds:
+                                if not isinstance(round_data, dict):
+                                    continue
+                                for key in ("before_frame", "after_frame"):
+                                    value = round_data.get(key)
+                                    if isinstance(value, str) and value:
+                                        round_data[key] = (
+                                            path.parent / value
+                                        ).relative_to(self.project_root).as_posix()
             records.append(
                 (
                     path.stat().st_mtime,
@@ -837,6 +896,9 @@ class WebConsoleController:
                         "metrics": data.get("metrics") or {},
                         "revision": revision,
                         "task_model_revision": task_model_revision,
+                        "source_kind": data.get("source_kind"),
+                        "waa": data.get("waa") if isinstance(data.get("waa"), dict) else None,
+                        "review_timeline": review_timeline,
                         "local_path": path.parent.relative_to(
                             self.project_root
                         ).as_posix(),
@@ -1019,6 +1081,12 @@ class WebConsoleController:
         waa_task_id = example_payload.get("id") if isinstance(example_payload, dict) else None
         if not isinstance(waa_task_id, str) or not waa_task_id.strip():
             raise ValueError("WAA 任务 JSON 缺少有效的 id")
+        trace2task_metadata = example_payload.get("trace2task")
+        if isinstance(trace2task_metadata, dict) and (
+            trace2task_metadata.get("recordable") is False
+            or trace2task_metadata.get("variant_role") == "held_out_evaluation"
+        ):
+            raise ValueError("held-out 测试变体禁止人工录制；请选择对应的 D0 演示变体")
         reset_spec = _matching_waa_reset_spec(self.project_root, waa_task_id)
         if not isinstance(distro, str) or Path(distro).name != distro or not distro.strip():
             raise ValueError("WSL 发行版名称无效")
@@ -1568,6 +1636,74 @@ class WebConsoleController:
             candidate_path = self._resolve_candidate_manifest(raw_path)
             return update_guidance_proposal_summary(candidate_path, summary)
 
+    def _freeze_automatic_compiler_snapshot(
+        self,
+        task_path: Path,
+        *,
+        variant: str,
+        model: str,
+        reasoning_effort: str,
+        source_trace: Path,
+        fresh_taskpack: bool,
+    ) -> dict[str, Any]:
+        task_root = task_path.parent.resolve()
+        marker_path = task_root / ".automatic-compiler-snapshot.json"
+        if marker_path.is_file():
+            existing = json.loads(marker_path.read_text(encoding="utf-8"))
+            snapshot_task = Path(str(existing.get("task_path") or ""))
+            if snapshot_task.is_file():
+                return existing
+
+        safe_variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", variant).strip("-") or "compiled"
+        snapshot_id = (
+            datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+            + f"-{uuid.uuid4().hex[:8]}-{safe_variant}"
+        )
+        snapshot_root = (
+            self.project_root / "evaluations" / "compiler-snapshots" / snapshot_id
+        ).resolve()
+        snapshot_task_root = snapshot_root / "taskpack"
+        try:
+            shutil.copytree(task_root, snapshot_task_root)
+            snapshot_task = snapshot_task_root / task_path.name
+            tree_sha256, file_count, size_bytes = _taskpack_tree_digest(snapshot_task_root)
+            payload = {
+                "schema_version": "0.1",
+                "snapshot_id": snapshot_id,
+                "kind": "automatic_compiler_output",
+                "created_at": _now(),
+                "variant": variant,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "fresh_taskpack": fresh_taskpack,
+                "source_task_path": str(task_path.resolve()),
+                "source_trace": str(source_trace.resolve()),
+                "source_trace_sha256": hashlib.sha256(source_trace.read_bytes()).hexdigest(),
+                "task_path": str(snapshot_task),
+                "taskpack_root": str(snapshot_task_root),
+                "tree_sha256": tree_sha256,
+                "file_count": file_count,
+                "size_bytes": size_bytes,
+                "review_policy": (
+                    "Unreviewed automatic Compiler output. WAA experiments may run this draft "
+                    "only with the explicit --allow-automatic-compiler-draft flag."
+                ),
+            }
+            snapshot_root.mkdir(parents=True, exist_ok=True)
+            (snapshot_root / "snapshot.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            marker_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return payload
+        except Exception:
+            if snapshot_root.exists():
+                shutil.rmtree(snapshot_root)
+            raise
+
     def _compile_trace_bundle(
         self,
         trace_path: Path,
@@ -1663,12 +1799,25 @@ class WebConsoleController:
                     "动作任务包已保留，可稍后直接重试。"
                 )
         else:
+            automatic_snapshot = self._freeze_automatic_compiler_snapshot(
+                semantic_task,
+                variant="compiled",
+                model=model,
+                reasoning_effort=reasoning_effort,
+                source_trace=trace_path,
+                fresh_taskpack=existing_task is None,
+            )
             payload["review_status"] = "draft"
             payload["requires_confirmation"] = True
             payload["semantic_compilation"] = {
                 "status": "completed",
                 "result": _jsonable(semantic),
             }
+            payload["automatic_snapshot"] = automatic_snapshot
+            report(
+                "已冻结人工修改前的 Compiler 输出："
+                f"{automatic_snapshot['task_path']}。"
+            )
             if family_source is not None:
                 inherited = self._inherit_family_guidance(
                     self._resolve_task_path(str(family_source["path"])),
@@ -1747,6 +1896,7 @@ class WebConsoleController:
             )
             try:
                 task_path = existing_tasks[variant]
+                fresh_taskpack = task_path is None
                 if task_path is None:
                     compiled = compile_trace(
                         trace_path,
@@ -1770,6 +1920,14 @@ class WebConsoleController:
                     model=model,
                     reasoning_effort=reasoning_effort,
                     use_narration=use_narration,
+                )
+                automatic_snapshot = self._freeze_automatic_compiler_snapshot(
+                    task_path,
+                    variant=variant,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    source_trace=trace_path,
+                    fresh_taskpack=fresh_taskpack,
                 )
             except Exception as error:  # noqa: BLE001 - keep the successful sibling
                 failure_category, retryable = _compiler_failure(
@@ -1807,7 +1965,12 @@ class WebConsoleController:
                 "source_trace": str(trace_path),
                 "deterministic_compilation": deterministic_compilation,
                 "semantic_compilation": _jsonable(semantic),
+                "automatic_snapshot": automatic_snapshot,
             }
+            report(
+                "已冻结人工修改前的 Compiler 输出："
+                f"{automatic_snapshot['task_path']}。"
+            )
         completed = sum(
             result.get("status") == "completed" for result in results.values()
         )

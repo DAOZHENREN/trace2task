@@ -5,6 +5,31 @@
       "must_not_exist": [
         "C:\\Users\\Docker\\Documents\\draft.txt"
       ]
+    },
+    "a7d4b6c5-569b-452e-9e1d-ffdb3d431d15-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\example_count.txt"
+      ]
+    },
+    "351f1d5e-f3f7-4efe-8fda-e8a8e9eacf4c-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\example_count.txt"
+      ]
+    },
+    "ea5daf01-d830-475d-863a-7863c618e489-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\banana_count.txt"
+      ]
+    },
+    "ef2d1903-cc63-46a7-9c1d-d510ab1960ee-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\window_count.txt"
+      ]
+    },
+    "9d3ab930-5956-4b7c-9592-ffc3c0ded517-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\agent_count.txt"
+      ]
     }
   }
 }

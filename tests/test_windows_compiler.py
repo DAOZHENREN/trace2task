@@ -236,6 +236,39 @@ def test_windows_compiler_declares_messaging_generalization_capabilities(
     ]
 
 
+def test_windows_compiler_infers_text_entry_for_waa_keyboard_bursts(
+    tmp_path: Path,
+) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    metadata["capture_method"] = "waa_vm_desktop"
+    metadata["waa_task_id"] = "notepad-count-example"
+    events[11]["elapsed_ms"] = 700
+    events[11]["details"]["raw_input"]["key"] = "e"
+    events[12]["elapsed_ms"] = 800
+    events[12]["details"]["raw_input"]["key"] = "e"
+    start, success = events[0], events[-1]
+    inputs = sorted(events[1:-1], key=lambda event: event["elapsed_ms"])
+    events = [start, *inputs, success]
+    for seq, event in enumerate(events):
+        event["seq"] = seq
+    _rewrite_bundle(trace_path, events, metadata)
+
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    demonstration = json.loads(
+        (Path(result.task_path).parent / "demonstration.json").read_text(encoding="utf-8")
+    )
+
+    assert report["inference"]["capability_profile"] == "text_entry"
+    assert any(
+        item["action"] == {
+            "skill": "type_text",
+            "args": {"text": "<runtime-text-1>"},
+        }
+        for item in demonstration["actions"]
+    )
+
+
 def test_windows_compiler_rejects_pre_dpi_fix_recording(tmp_path: Path) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
     metadata.pop("coordinate_space")

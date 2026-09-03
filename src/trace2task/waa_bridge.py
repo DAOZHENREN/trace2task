@@ -14,8 +14,8 @@ from typing import Any
 import pygame
 
 from trace2task.actions import ActionCall
+from trace2task.codex_app_server import classify_codex_failure
 from trace2task.windows_agent import (
-    WINDOWS_DECISION_TIMEOUT_SECONDS,
     WINDOWS_EXPERIENCE_MODES,
     CodexWindowsAgent,
     WindowsAgentPlan,
@@ -24,6 +24,8 @@ from trace2task.windows_task import WindowsTaskContract, load_windows_task
 
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
 DEFAULT_WAA_BRIDGE_PORT = 8776
+WAA_PLANNER_ATTEMPT_TIMEOUT_SECONDS = 150
+MAX_WAA_PLANNER_RETRIES = 1
 WAA_MOTOR_SKILLS = (
     "click",
     "double_click",
@@ -52,6 +54,10 @@ class WaaBridgePlan:
     reasoning_effort: str
     experience_mode: str
     timing: dict[str, Any]
+    planner_retries: int
+    planner_retry_categories: tuple[str, ...]
+    planner_failure_category: str | None = None
+    planner_failure_message: str | None = None
 
 
 class CodexWaaAgent(CodexWindowsAgent):
@@ -61,6 +67,21 @@ class CodexWaaAgent(CodexWindowsAgent):
         # Keep the motor policy identical across all controlled experience conditions.
         # Otherwise the task pack's Trace-derived skill list leaks evidence into baseline.
         return WAA_MOTOR_SKILLS
+
+    def _completion_context(self) -> str:
+        # WAA supplies the authoritative task at reset time.  A task pack's terminal
+        # reference frame is evidence about the demonstration, not an extra benchmark
+        # requirement (for example, it must not make the agent close every window just
+        # because the human recording ended on the desktop).
+        return (
+            "Completion policy: Windows Agent Arena task. Judge completion only from the "
+            "current WAA instruction and visible pixels; the task-pack success frame and "
+            "original expected result are demonstration evidence, not additional goals. "
+            "Do not close applications or return to the desktop unless the current WAA "
+            "instruction explicitly requires it. Once the requested result is visibly "
+            "satisfied, return task_complete=true and no actions. A separate WAA evaluator "
+            "will decide final success.\n"
+        )
 
 
 def _pixel(value: float, extent: int) -> int:
@@ -143,7 +164,7 @@ class WaaBridge:
         reasoning_effort: str,
         codex_bin: str = "codex",
         plan_horizon: int = 12,
-        timeout_seconds: float = WINDOWS_DECISION_TIMEOUT_SECONDS,
+        timeout_seconds: float = WAA_PLANNER_ATTEMPT_TIMEOUT_SECONDS,
         agent_type: type[CodexWaaAgent] = CodexWaaAgent,
     ) -> None:
         if experience_mode not in WINDOWS_EXPERIENCE_MODES:
@@ -207,7 +228,52 @@ class WaaBridge:
                 surface = pygame.image.load(io.BytesIO(screenshot))
             except pygame.error as error:
                 raise ValueError("WAA screenshot is not a supported image") from error
-            plan: WindowsAgentPlan = self._agent.plan(surface)
+            planner_retry_categories: list[str] = []
+            while True:
+                try:
+                    plan: WindowsAgentPlan = self._agent.plan(surface)
+                    break
+                except Exception as error:
+                    category = classify_codex_failure(error)
+                    if category is None:
+                        raise
+                    if len(planner_retry_categories) >= MAX_WAA_PLANNER_RETRIES:
+                        print(
+                            "[waa bridge] planner exhausted its bounded response budget: "
+                            f"{category}: {error}"
+                        )
+                        return WaaBridgePlan(
+                            task_complete=False,
+                            actions=("FAIL",),
+                            structured_actions=(),
+                            reason=(
+                                "Planner failed to produce a complete response after one "
+                                "transport-isolated retry."
+                            ),
+                            confidence=0.0,
+                            stage_id="unknown",
+                            stage_goal="Planner response unavailable.",
+                            expected_end_state="No further motor action is executed.",
+                            abort_conditions=("Planner response budget exhausted.",),
+                            model=self.model,
+                            reasoning_effort=self.reasoning_effort,
+                            experience_mode=self.experience_mode,
+                            timing={},
+                            planner_retries=len(planner_retry_categories),
+                            planner_retry_categories=tuple(planner_retry_categories),
+                            planner_failure_category=category,
+                            planner_failure_message=str(error),
+                        )
+                    planner_retry_categories.append(category)
+                    print(
+                        "[waa bridge] planner infrastructure retry "
+                        f"{len(planner_retry_categories)}/{MAX_WAA_PLANNER_RETRIES}: "
+                        f"{category}: {error}"
+                    )
+                    # The failed model turn returned no motor program, so no action can have
+                    # been executed. Preserve semantic stage/history, but replace the unhealthy
+                    # Codex transport before retrying the same authoritative screenshot.
+                    self._agent.reset_planner_session()
             structured = tuple(action.to_payload() for action in plan.actions)
             actions = tuple(
                 action_to_waa(action, width=surface.get_width(), height=surface.get_height())
@@ -231,6 +297,8 @@ class WaaBridge:
                 reasoning_effort=plan.reasoning_effort,
                 experience_mode=self.experience_mode,
                 timing=asdict(plan.timing),
+                planner_retries=len(planner_retry_categories),
+                planner_retry_categories=tuple(planner_retry_categories),
             )
 
     def close(self) -> None:

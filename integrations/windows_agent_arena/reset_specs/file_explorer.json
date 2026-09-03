@@ -1,0 +1,25 @@
+{
+  "schema_version": "0.1",
+  "tasks": {
+    "c05b680d-bda5-48db-984b-c1024496d088-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Selected Files\\orchid_brief.txt"
+      ]
+    },
+    "01b0e251-121d-4918-b36d-290447122566-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Research Results\\quartz_record.txt"
+      ]
+    },
+    "576d7689-7577-40ae-ba79-93efa9504343-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Operations Results\\nebula_report.txt"
+      ]
+    },
+    "9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS": {
+      "must_not_exist": [
+        "C:\\Users\\Docker\\Documents\\Review Results\\lantern_note.txt"
+      ]
+    }
+  }
+}

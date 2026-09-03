@@ -1,0 +1,52 @@
+{
+  "id": "01b0e251-121d-4918-b36d-290447122566-WOS",
+  "snapshot": "file_explorer",
+  "instruction": "In Documents\\Research Inbox, find the text file containing the exact marker QUARTZ-918. Copy that file without moving or modifying the source into Documents\\Research Results, rename the copy to quartz_record.txt, and open the copied file to verify it.",
+  "source": "Trace2Task parameterized study",
+  "_comments": "E1 held-out evaluation variant. Never expose this variant to the recorder.",
+  "trace2task": {
+    "family_id": "find-file-by-content",
+    "variant_id": "E1",
+    "variant_role": "held_out_evaluation",
+    "recordable": false
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; import shutil; root=Path(r'C:\\Users\\Docker\\Documents\\Research Inbox'); destination=Path(r'C:\\Users\\Docker\\Documents\\Research Results'); shutil.rmtree(root, ignore_errors=True); shutil.rmtree(destination, ignore_errors=True); root.mkdir(parents=True); destination.mkdir(parents=True); files={'research-a.txt':'Experiment record\\nReference: QUARTZ-918\\nResult: validated\\n','research-b.txt':'Experiment record\\nReference: COBALT-204\\nResult: pending\\n','research-c.txt':'Literature notes\\nTopic: retrieval systems\\n','research-d.txt':'Lab inventory\\nMicroscopes: 4\\n'}; [(root/name).write_text(text, encoding='utf-8') for name,text in files.items()]"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": ["explorer", "C:\\Users\\Docker\\Documents\\Research Inbox"]
+      }
+    },
+    {
+      "type": "sleep",
+      "parameters": {"seconds": 1}
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["file_explorer", "notepad"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; source=Path(r'C:\\Users\\Docker\\Documents\\Research Inbox\\research-a.txt'); result=Path(r'C:\\Users\\Docker\\Documents\\Research Results\\quartz_record.txt'); print('true' if source.is_file() and result.is_file() and source.read_bytes() == result.read_bytes() else 'false', end='')"
+      ]
+    },
+    "expected": {
+      "type": "rule",
+      "rules": {"expected": "true"}
+    }
+  }
+}

@@ -1,0 +1,127 @@
+schema_version: "0.1"
+study_id: trace2task-find-file-family-v1
+title: Trace2Task Find-File-by-Content Held-Out Family Study
+path_base: ../../..
+seed: 20260902
+repetitions: 3
+model: gpt-5.6-terra
+reasoning_effort: low
+
+targets:
+  apps: 1
+  task_instances: 3
+  parameterized_families: 1
+
+primary_metrics:
+  - evaluator_success
+  - wall_time_seconds
+  - model_time_seconds
+  - plan_calls
+  - action_count
+  - recovery_count
+  - human_cost_seconds
+
+analysis_plan:
+  primary_endpoint: evaluator_success
+  pairing_unit: held_out_variant
+  success_analysis: variant-paired bootstrap with exact per-condition counts
+  efficiency_summary: median, interquartile range, paired effect, and 95% confidence interval
+  intent_to_treat: Every scheduled episode remains in the denominator, including runtime failures.
+  freeze_rule: Freeze the D0 Trace, compiled artifacts, tasks, model settings, and evaluator before the first formal episode.
+
+human_cost_policy:
+  unit: acquisition seconds amortized over the three held-out variants
+  demonstration_wall_seconds_total: 188.813
+  narration_session_seconds_total: 188.540
+  compiler_review_availability_to_confirmation_seconds_total: 252.185
+  provenance:
+    demonstration: runs/20260902-063832-913578-ceca6969-waa-windows-human/metadata.json
+    narration: runs/20260902-063832-913578-ceca6969-waa-windows-human/narration.json
+    review_start: evaluations/compiler-snapshots/20260902-065541-665584-f25caee5-narrated_compiled/snapshot.json
+    review_end: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+  note: Narration overlaps the demonstration. Review time is a conservative availability-to-confirmation proxy after both Compiler variants existed; components are not additive wall-clock time.
+
+conditions:
+  - id: baseline
+    runtime_mode: baseline
+    taskpack_role: execution
+    purpose: Current screenshot and held-out instruction only.
+
+  - id: raw_trace
+    runtime_mode: trace
+    taskpack_role: execution
+    human_cost_keys: [demonstration]
+    purpose: Matched immutable D0 Trace evidence without semantic Compiler output.
+
+  - id: trace_compile
+    runtime_mode: compiled
+    taskpack_role: trace_compile
+    human_cost_keys: [demonstration, compiler_review]
+    purpose: D0 Trace compiled into semantic experience and confirmed before execution.
+
+  - id: narrated_trace_compile
+    runtime_mode: narrated_compiled
+    taskpack_role: narrated_trace_compile
+    human_cost_keys: [demonstration, narration, compiler_review]
+    purpose: D0 Trace plus synchronized narration, compiled into semantic experience and confirmed.
+
+tasks:
+  - id: explorer-find-file-e1
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 01b0e251-121d-4918-b36d-290447122566-WOS
+    status: ready
+    waa_task_id: 01b0e251-121d-4918-b36d-290447122566-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e1.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      trace_compile: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      narrated_trace_compile: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml
+    human_cost_seconds:
+      demonstration: 62.938
+      narration: 62.847
+      compiler_review: 84.062
+
+  - id: explorer-find-file-e2
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    status: ready
+    waa_task_id: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e2.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      trace_compile: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      narrated_trace_compile: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml
+    human_cost_seconds:
+      demonstration: 62.938
+      narration: 62.847
+      compiler_review: 84.062
+
+  - id: explorer-find-file-e3
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    status: ready
+    waa_task_id: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e3.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks:
+      execution: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      trace_compile: taskpacks/generated/web/20260902-064708-248245-WAA find-file D0 · 纯Trace-windows-taskpack/task.yaml
+      narrated_trace_compile: taskpacks/generated/web/20260902-065137-389124-WAA find-file D0 · 人工讲解-windows-taskpack/task.yaml
+    human_cost_seconds:
+      demonstration: 62.938
+      narration: 62.847
+      compiler_review: 84.062

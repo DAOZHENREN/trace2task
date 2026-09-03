@@ -62,6 +62,7 @@ const elements = {
   recordingCount: document.querySelector("#recording-count"),
   taskDetailPanel: document.querySelector("#task-detail-panel"),
   taskDetailBack: document.querySelector("#task-detail-back"),
+  taskDetailKicker: document.querySelector("#task-detail-kicker"),
   taskDetailTitle: document.querySelector("#task-detail-title"),
   taskDetailMeta: document.querySelector("#task-detail-meta"),
   taskDetailTags: document.querySelector("#task-detail-tags"),
@@ -220,7 +221,10 @@ function renderWaaTaskMeta() {
   }
   const apps = task.related_apps?.length ? task.related_apps.join("、") : task.domain;
   const evaluator = task.evaluator?.length ? task.evaluator.join(" + ") : "WAA evaluator";
-  elements.waaTaskMeta.textContent = `${task.instruction} · 应用：${apps} · Evaluator：${evaluator} · Reset：${task.reset_paths.length} 条规则已配置`;
+  const variant = task.variant_id
+    ? ` · 经验族：${task.experience_family_id} · ${task.variant_id}（仅演示）`
+    : "";
+  elements.waaTaskMeta.textContent = `${task.instruction}${variant} · 应用：${apps} · Evaluator：${evaluator} · Reset：${task.reset_paths.length} 条规则已配置`;
 }
 
 async function refreshWaaTasks({ force = false } = {}) {
@@ -243,7 +247,8 @@ async function refreshWaaTasks({ force = false } = {}) {
     waaTasks.forEach((task) => {
       const option = document.createElement("option");
       option.value = task.example_path;
-      option.textContent = `${task.domain} · ${task.instruction}`;
+      const variant = task.variant_id ? `参数化演示 ${task.variant_id} · ` : "";
+      option.textContent = `${task.domain} · ${variant}${task.instruction}`;
       elements.waaExample.append(option);
     });
     const selected = waaTasks.find((task) => task.example_path === previous);
@@ -430,6 +435,99 @@ function formatDuration(milliseconds) {
   if (value >= 60_000) return `${(value / 60_000).toFixed(1)} 分`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)} 秒`;
   return `${Math.round(value)} 毫秒`;
+}
+
+function waaConditionLabel(condition) {
+  return {
+    baseline: "无 Trace 基线",
+    trace: "原始 Trace",
+    compiled: "Compiler 经验",
+    narrated_compiled: "人工讲解 Compiler",
+    feedback: "人工反馈经验",
+  }[condition] || condition || "WAA";
+}
+
+function humanActionLabel(action) {
+  const skill = action?.skill;
+  const args = action?.args || {};
+  if (skill === "click") {
+    const x = Number(args.x);
+    const y = Number(args.y);
+    const position = Number.isFinite(x) && Number.isFinite(y)
+      ? `（画面 ${Math.round(x * 100)}%, ${Math.round(y * 100)}%）`
+      : "";
+    return `点击${position}`;
+  }
+  if (skill === "type_text") return `输入文本：“${args.text || ""}”`;
+  if (skill === "press_key") return `按键：${args.key || "未知"}`;
+  if (skill === "hotkey") return `组合键：${(args.keys || []).join(" + ")}`;
+  if (skill === "wait") return `等待 ${formatDuration(args.duration_ms)}`;
+  if (skill) return `${skill} · ${JSON.stringify(args)}`;
+  return action?.raw || "未解析操作";
+}
+
+function makeReviewImage(path, label) {
+  const link = document.createElement("a");
+  link.className = "run-review-image-link";
+  link.href = `/api/local-image?path=${encodeURIComponent(path)}`;
+  link.target = "_blank";
+  link.rel = "noopener";
+  const caption = document.createElement("span");
+  caption.textContent = label;
+  const image = document.createElement("img");
+  image.className = "run-review-image";
+  image.loading = "lazy";
+  image.alt = label;
+  image.src = link.href;
+  link.append(caption, image);
+  return link;
+}
+
+function makeCandidateReview(candidate) {
+  const review = candidate.review_timeline;
+  if (!review || !Array.isArray(review.rounds)) return null;
+  const container = document.createElement("div");
+  container.className = "run-review";
+  review.rounds.forEach((round) => {
+    const card = document.createElement("section");
+    card.className = "run-review-round";
+    const heading = document.createElement("div");
+    heading.className = "run-review-round-heading";
+    const title = document.createElement("strong");
+    title.textContent = `模型回合 ${round.round}${round.stage_id ? ` · ${round.stage_id}` : ""}`;
+    const timing = document.createElement("span");
+    timing.textContent = `${round.actions?.length || 0} 步 · 模型 ${formatDuration(round.model_roundtrip_ms)}`;
+    heading.append(title, timing);
+    const goal = document.createElement("p");
+    goal.className = "run-review-goal";
+    goal.textContent = round.stage_goal || "本轮没有记录阶段目标。";
+    const reason = document.createElement("p");
+    reason.className = "run-review-reason";
+    reason.textContent = `为什么这样做：${round.reason || "模型没有留下理由。"}`;
+    const actions = document.createElement("ol");
+    actions.className = "run-review-actions";
+    if (round.decision) {
+      const decision = document.createElement("li");
+      decision.className = "run-review-decision";
+      decision.textContent = round.decision === "DONE"
+        ? "模型判断：任务已经完成"
+        : "模型判断：任务失败并停止";
+      actions.append(decision);
+    }
+    (round.actions || []).forEach((action) => {
+      const row = document.createElement("li");
+      row.textContent = humanActionLabel(action);
+      if (action.raw) row.title = action.raw;
+      actions.append(row);
+    });
+    const images = document.createElement("div");
+    images.className = "run-review-images";
+    if (round.before_frame) images.append(makeReviewImage(round.before_frame, "执行前"));
+    if (round.after_frame) images.append(makeReviewImage(round.after_frame, "执行后"));
+    card.append(heading, goal, reason, actions, images);
+    container.append(card);
+  });
+  return container;
 }
 
 function makePerformanceTimeline(performance, stages = []) {
@@ -936,6 +1034,12 @@ function renderLibrary() {
       outcome.title = candidate.outcome.failure_message;
     }
     tags.append(status, outcome, metrics);
+    if (candidate.waa) {
+      const experiment = document.createElement("span");
+      experiment.className = "mini-tag info";
+      experiment.textContent = `WAA · ${candidate.waa.condition_label || waaConditionLabel(candidate.waa.condition)} · 第 ${candidate.waa.repetition || 1} 次`;
+      tags.append(experiment);
+    }
     if ((candidate.metrics?.visual_checkpoints || 0) > 0) {
       const checkpoints = document.createElement("span");
       checkpoints.className = `mini-tag ${(candidate.metrics?.visual_checkpoint_failures || 0) > 0 ? "warn" : "ok"}`;
@@ -1120,6 +1224,11 @@ function renderLibrary() {
     taskModelPanel.append(structureActions);
     const actions = document.createElement("div");
     actions.className = "library-actions";
+    if (candidate.review_timeline) {
+      actions.append(
+        makeMiniButton("查看轨迹与截图", () => openCandidateReview(candidate), true),
+      );
+    }
     actions.append(makeMiniButton("在本地查看", () => openLocal(candidate.local_path)));
     const deleteCandidateButton = makeMiniButton("删除", () => deleteCandidate(candidate));
     deleteCandidateButton.classList.add("danger");
@@ -1194,20 +1303,124 @@ function taskDetailPathFromHash() {
   }
 }
 
+function candidateDetailPathFromHash() {
+  const prefix = "#run/";
+  if (!window.location.hash.startsWith(prefix)) return null;
+  try {
+    return decodeURIComponent(window.location.hash.slice(prefix.length));
+  } catch {
+    return null;
+  }
+}
+
 function openTaskDetail(task) {
   window.location.hash = `task/${encodeURIComponent(task.path)}`;
+  renderTaskDetailRoute();
+}
+
+function openCandidateReview(candidate) {
+  window.location.hash = `run/${encodeURIComponent(candidate.local_path)}`;
   renderTaskDetailRoute();
 }
 
 function closeTaskDetail(updateHistory = true) {
   document.body.classList.remove("task-detail-mode");
   elements.taskDetailPanel.classList.add("hidden");
-  if (updateHistory && taskDetailPathFromHash()) {
+  if (updateHistory && (taskDetailPathFromHash() || candidateDetailPathFromHash())) {
     history.pushState(null, "", `${window.location.pathname}${window.location.search}`);
   }
 }
 
+function renderCandidateReviewRoute(candidate) {
+  const review = candidate.review_timeline || {};
+  document.body.classList.add("task-detail-mode", "library-mode");
+  elements.taskDetailPanel.classList.remove("hidden");
+  elements.taskDetailBack.textContent = "← 返回可反馈运行";
+  elements.taskDetailKicker.textContent = "WAA 运行审查";
+  elements.taskDetailTitle.textContent = candidate.task_id || "WAA 运行";
+  elements.taskDetailMeta.textContent = [
+    formatTimestamp(candidate.created_at),
+    candidate.waa?.condition_label || waaConditionLabel(candidate.waa?.condition),
+    `第 ${candidate.waa?.repetition || 1} 次`,
+  ].join(" · ");
+  elements.taskDetailTags.replaceChildren();
+  [
+    candidate.outcome?.task_complete ? "WAA 验证成功" : "WAA 未通过",
+    `${review.round_count || 0} 个模型回合`,
+    `${review.action_count || 0} 个操作`,
+    `模型 ${candidate.waa?.model || "未记录"} / ${candidate.waa?.reasoning_effort || "未记录"}`,
+  ].forEach((label, index) => {
+    const tag = document.createElement("span");
+    tag.className = `mini-tag ${index === 0 && candidate.outcome?.task_complete ? "ok" : ""}`;
+    tag.textContent = label;
+    elements.taskDetailTags.append(tag);
+  });
+  elements.taskDetailBody.replaceChildren();
+  const intro = document.createElement("section");
+  intro.className = "system-planning-policy run-review-intro";
+  const introHeading = document.createElement("div");
+  const introTitle = document.createElement("strong");
+  introTitle.textContent = "人工审查视图";
+  const introBadge = document.createElement("span");
+  introBadge.textContent = "由 WAA 原始证据归一化";
+  introHeading.append(introTitle, introBadge);
+  const instruction = document.createElement("p");
+  instruction.textContent = `任务：${candidate.instruction || "未记录"}`;
+  const explanation = document.createElement("p");
+  explanation.textContent = "每张卡片对应一次真实模型调用；同一回答中的多个操作合并展示，截图分别表示这批操作执行前和执行后。底层 traj.jsonl、逐步截图和 WAA traj.html 均未改写。";
+  intro.append(introHeading, instruction, explanation);
+  elements.taskDetailBody.append(intro);
+  const timeline = makeCandidateReview(candidate);
+  if (timeline) {
+    elements.taskDetailBody.append(timeline);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "empty-list";
+    empty.textContent = "这次 WAA 运行没有可读取的轨迹。";
+    elements.taskDetailBody.append(empty);
+  }
+  if (candidate.status !== "feedback_applied") {
+    const feedbackPanel = document.createElement("section");
+    feedbackPanel.className = "candidate-feedback run-review-feedback";
+    const label = document.createElement("label");
+    label.className = "candidate-feedback-label";
+    label.textContent = "看完轨迹后，告诉 Agent 哪些做法要保留、修改或禁止";
+    const feedback = document.createElement("textarea");
+    feedback.className = "candidate-feedback-input";
+    feedback.rows = 4;
+    feedback.maxLength = 2000;
+    feedback.placeholder = "例如：搜索结果出现后直接打开记事本；保存时应先确认 Documents 路径，不要重复打开开始菜单。";
+    const feedbackActions = document.createElement("div");
+    feedbackActions.className = "library-actions";
+    feedbackActions.append(
+      makeMiniButton(
+        candidate.revision ? "重新融合反馈" : "生成融合草稿",
+        (button) => reviseCandidate(candidate, feedback, button),
+        true,
+      ),
+    );
+    feedbackPanel.append(label, feedback);
+    attachVoiceInput(feedback, "WAA 人工运行反馈");
+    feedbackPanel.append(feedbackActions);
+    elements.taskDetailBody.append(feedbackPanel);
+  }
+  elements.taskDetailActions.replaceChildren(
+    makeMiniButton("在本地查看归一化证据", () => openLocal(candidate.local_path)),
+  );
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
 function renderTaskDetailRoute() {
+  const candidatePath = candidateDetailPathFromHash();
+  if (candidatePath) {
+    const candidate = candidates.find((item) => item.local_path === candidatePath);
+    if (!candidate) {
+      closeTaskDetail();
+      return;
+    }
+    renderCandidateReviewRoute(candidate);
+    return;
+  }
   const path = taskDetailPathFromHash();
   if (!path) {
     closeTaskDetail(false);
@@ -1221,6 +1434,8 @@ function renderTaskDetailRoute() {
   }
   document.body.classList.add("task-detail-mode", "library-mode");
   elements.taskDetailPanel.classList.remove("hidden");
+  elements.taskDetailBack.textContent = "← 返回任务经验";
+  elements.taskDetailKicker.textContent = "任务经验详情";
   elements.taskDetailTitle.textContent = task.task_id;
   elements.taskDetailMeta.textContent = [
     task.process_name || "Windows",

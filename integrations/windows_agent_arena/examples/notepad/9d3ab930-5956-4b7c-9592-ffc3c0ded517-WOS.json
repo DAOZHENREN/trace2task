@@ -1,0 +1,42 @@
+{
+  "id": "9d3ab930-5956-4b7c-9592-ffc3c0ded517-WOS",
+  "snapshot": "notepad",
+  "instruction": "Open gamma_log.txt from Documents and count the case-sensitive whole-word occurrences of agent. Save only the decimal count in Documents\\agent_count.txt, then open the output and verify it.",
+  "source": "Trace2Task parameterized study",
+  "_comments": "E3 held-out evaluation variant. Never use it for a human demonstration or Compiler input.",
+  "trace2task": {
+    "family_id": "count-token-occurrences",
+    "variant_id": "E3",
+    "variant_role": "held_out_evaluation",
+    "recordable": false
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; source=Path(r'C:\\Users\\Docker\\Documents\\gamma_log.txt'); source.write_text('agent agent agent\\nAgent stays capitalized\\nagents is plural\\nagent signal agent\\nagent agent agent agent\\none agent remains\\nagent agent agent\\n', encoding='utf-8'); Path(r'C:\\Users\\Docker\\Documents\\agent_count.txt').unlink(missing_ok=True)"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["notepad"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; p=Path(r'C:\\Users\\Docker\\Documents\\agent_count.txt'); print('true' if p.is_file() and p.read_text(encoding='utf-8-sig').strip() == '13' else 'false', end='')"
+      ]
+    },
+    "expected": {
+      "type": "rule",
+      "rules": {"expected": "true"}
+    }
+  }
+}

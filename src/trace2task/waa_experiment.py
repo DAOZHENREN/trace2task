@@ -67,18 +67,29 @@ def _task_ids(client_root: Path, json_name: str) -> set[str]:
     return task_ids
 
 
-def _validate_conditions(
-    contract: WindowsTaskContract,
-    conditions: Sequence[str],
-) -> tuple[str, ...]:
+def _normalize_conditions(conditions: Sequence[str]) -> tuple[str, ...]:
     normalized = tuple(dict.fromkeys(conditions))
     if not normalized:
         raise ValueError("WAA experiment requires at least one condition")
     unknown = set(normalized) - set(WINDOWS_EXPERIENCE_MODES)
     if unknown:
         raise ValueError(f"Unknown WAA experience conditions: {sorted(unknown)}")
-    if contract.task.requires_confirmation:
+    return normalized
+
+
+def _validate_conditions(
+    contract: WindowsTaskContract,
+    conditions: Sequence[str],
+    *,
+    allow_automatic_compiler_draft: bool = False,
+) -> tuple[str, ...]:
+    normalized = _normalize_conditions(conditions)
+    if contract.task.requires_confirmation and not allow_automatic_compiler_draft:
         raise RuntimeError("WAA experiments require a confirmed task pack")
+    if allow_automatic_compiler_draft and normalized != ("compiled",):
+        raise RuntimeError(
+            "Automatic Compiler drafts may only run as the isolated compiled condition"
+        )
     semantic_conditions = {"compiled", "narrated_compiled", "feedback"}
     if semantic_conditions.intersection(normalized) and contract.semantic_experience is None:
         raise RuntimeError(
@@ -87,6 +98,21 @@ def _validate_conditions(
     if "feedback" in normalized and contract.human_guidance is None:
         raise RuntimeError("The feedback condition requires reviewed human guidance")
     return normalized
+
+
+def _validate_automatic_compiler_snapshot(task_path: Path) -> dict[str, Any]:
+    manifest_path = task_path.parent.parent / "snapshot.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            "--allow-automatic-compiler-draft requires a frozen Compiler snapshot"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("kind") != "automatic_compiler_output":
+        raise RuntimeError("Compiler snapshot manifest is invalid")
+    recorded_task = payload.get("task_path")
+    if not isinstance(recorded_task, str) or Path(recorded_task).resolve() != task_path:
+        raise RuntimeError("Compiler snapshot manifest does not match --task")
+    return payload
 
 
 def _source_trace_path(contract: WindowsTaskContract) -> Path:
@@ -294,18 +320,55 @@ def _client_run_command(
         f"NO_PROXY={no_proxy}",
         "-e",
         f"no_proxy={no_proxy}",
+        "-w",
+        "/client",
         container,
-        "/start_client.sh",
+        "python",
+        "run.py",
         "--agent",
         "trace2task",
         "--model",
         "unused",
-        "--clean-results",
-        "true",
-        "--result-dir",
+        "--observation_type",
+        "screenshot",
+        "--result_dir",
         result_dir,
-        "--json-name",
+        "--test_all_meta_path",
         json_name,
+    )
+
+
+def _require_completed_waa_run(
+    run_root: Path,
+    *,
+    expected_task_ids: set[str],
+) -> None:
+    completed_task_ids = {
+        result_path.parent.name for result_path in run_root.rglob("result.txt")
+    }
+    missing = expected_task_ids - completed_task_ids
+    if not missing:
+        return
+    error_details: list[str] = []
+    for trajectory_path in run_root.rglob("traj.jsonl"):
+        try:
+            records = [
+                json.loads(line)
+                for line in trajectory_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, json.JSONDecodeError):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or "Error" not in record:
+                continue
+            detail = str(record.get("Exception") or record["Error"]).strip()
+            if detail:
+                error_details.append(detail)
+    suffix = f" First WAA error: {error_details[0]}" if error_details else ""
+    raise RuntimeError(
+        "WAA produced no evaluator result for task ids: "
+        f"{sorted(missing)}.{suffix}"
     )
 
 
@@ -316,6 +379,7 @@ def run_waa_experiment(
     reset_spec: Path = DEFAULT_WAA_RESET_SPEC,
     conditions: Sequence[str] = DEFAULT_WAA_CONDITIONS,
     narrated_task_path: Path | None = None,
+    feedback_task_path: Path | None = None,
     repetitions: int = 3,
     model: str = "gpt-5.6-terra",
     reasoning_effort: str = "low",
@@ -328,6 +392,7 @@ def run_waa_experiment(
     bridge_port: int = 8776,
     relay_port: int = 8876,
     output_root: Path = Path("evaluations/windows-agent-arena"),
+    allow_automatic_compiler_draft: bool = False,
 ) -> dict[str, Any]:
     if repetitions <= 0:
         raise ValueError("WAA experiment repetitions must be positive")
@@ -337,7 +402,19 @@ def run_waa_experiment(
         raise FileNotFoundError(f"WAA client directory was not found: {client_root}")
     resolved_task_path = task_path.expanduser().resolve()
     contract = load_windows_task(resolved_task_path)
-    selected_conditions = _validate_conditions(contract, conditions)
+    selected_conditions = _normalize_conditions(conditions)
+    automatic_snapshot = None
+    if allow_automatic_compiler_draft:
+        automatic_snapshot = _validate_automatic_compiler_snapshot(resolved_task_path)
+    primary_conditions = tuple(
+        condition for condition in selected_conditions if condition != "feedback"
+    )
+    if primary_conditions:
+        _validate_conditions(
+            contract,
+            primary_conditions,
+            allow_automatic_compiler_draft=allow_automatic_compiler_draft,
+        )
     condition_task_paths = {
         condition: resolved_task_path for condition in selected_conditions
     }
@@ -371,9 +448,30 @@ def run_waa_experiment(
                 "Compiled and narrated_compiled conditions must derive from the same Trace"
             )
         condition_task_paths["narrated_compiled"] = resolved_narrated_task
+    if "feedback" in selected_conditions:
+        resolved_feedback_task = (
+            feedback_task_path.expanduser().resolve()
+            if feedback_task_path is not None
+            else (
+                narrated_task_path.expanduser().resolve()
+                if narrated_task_path is not None
+                else resolved_task_path
+            )
+        )
+        feedback_contract = load_windows_task(resolved_feedback_task)
+        _validate_conditions(feedback_contract, ("feedback",))
+        if (
+            _source_trace_path(contract).read_bytes()
+            != _source_trace_path(feedback_contract).read_bytes()
+        ):
+            raise RuntimeError(
+                "The feedback condition must derive from the same Trace as the other conditions"
+            )
+        condition_task_paths["feedback"] = resolved_feedback_task
+    selected_task_ids = _task_ids(client_root, json_name)
     reset_payload = _load_reset_spec(
         reset_spec,
-        expected_task_ids=_task_ids(client_root, json_name),
+        expected_task_ids=selected_task_ids,
     )
     installed_reset_spec = client_root / "trace2task_reset_spec.json"
     installed_reset_spec.write_text(
@@ -401,6 +499,8 @@ def run_waa_experiment(
         "repetitions": repetitions,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "allow_automatic_compiler_draft": allow_automatic_compiler_draft,
+        "automatic_compiler_snapshot": automatic_snapshot,
         "reset_spec": str(reset_spec.expanduser().resolve()),
         "status": "running",
         "completed_episodes": [],
@@ -457,6 +557,10 @@ def run_waa_experiment(
                             result_dir=str(PurePosixPath("/client") / result_dir),
                             json_name=json_name,
                         )
+                    )
+                    _require_completed_waa_run(
+                        host_results_root / run_name,
+                        expected_task_ids=selected_task_ids,
                     )
                 finally:
                     server.shutdown()

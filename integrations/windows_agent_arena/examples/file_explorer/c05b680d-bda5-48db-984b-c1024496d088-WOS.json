@@ -1,0 +1,52 @@
+{
+  "id": "c05b680d-bda5-48db-984b-c1024496d088-WOS",
+  "snapshot": "file_explorer",
+  "instruction": "In Documents\\Project Inbox, find the text file containing the exact marker ORCHID-742. Copy that file without moving or modifying the source into Documents\\Selected Files, rename the copy to orchid_brief.txt, and open the copied file to verify it.",
+  "source": "Trace2Task parameterized study",
+  "_comments": "D0 demonstration variant. This is the only recordable member of the family.",
+  "trace2task": {
+    "family_id": "find-file-by-content",
+    "variant_id": "D0",
+    "variant_role": "demonstration",
+    "recordable": true
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; import shutil; root=Path(r'C:\\Users\\Docker\\Documents\\Project Inbox'); destination=Path(r'C:\\Users\\Docker\\Documents\\Selected Files'); shutil.rmtree(root, ignore_errors=True); shutil.rmtree(destination, ignore_errors=True); root.mkdir(parents=True); destination.mkdir(parents=True); files={'item-a.txt':'Project note A\\nStatus: pending\\nOwner: Finance\\n','item-b.txt':'Project note B\\nStatus: active\\nOwner: Support\\n','item-c.txt':'Project brief\\nTracking marker: ORCHID-742\\nOwner: Logistics\\nDo not discard.\\n','item-d.txt':'Project note D\\nStatus: archived\\nOwner: Legal\\n'}; [(root/name).write_text(text, encoding='utf-8') for name,text in files.items()]"
+        ]
+      }
+    },
+    {
+      "type": "launch",
+      "parameters": {
+        "command": ["explorer", "C:\\Users\\Docker\\Documents\\Project Inbox"]
+      }
+    },
+    {
+      "type": "sleep",
+      "parameters": {"seconds": 1}
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["file_explorer", "notepad"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; source=Path(r'C:\\Users\\Docker\\Documents\\Project Inbox\\item-c.txt'); result=Path(r'C:\\Users\\Docker\\Documents\\Selected Files\\orchid_brief.txt'); print('true' if source.is_file() and result.is_file() and source.read_bytes() == result.read_bytes() else 'false', end='')"
+      ]
+    },
+    "expected": {
+      "type": "rule",
+      "rules": {"expected": "true"}
+    }
+  }
+}

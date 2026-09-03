@@ -1,0 +1,42 @@
+{
+  "id": "7cfca519-892e-4179-af85-819924deeb16-WOS",
+  "snapshot": "libreoffice_writer",
+  "instruction": "Open C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.odt in LibreOffice Writer. Apply the Heading 1 paragraph style to the paragraph containing exactly \"Quarterly Research Summary\". Leave the wording and paragraph order unchanged, then save the document.",
+  "source": "Trace2Task parameterized study",
+  "_comments": "D0 demonstration variant. This is the only recordable member of the family.",
+  "trace2task": {
+    "family_id": "writer-heading-style",
+    "variant_id": "D0",
+    "variant_role": "demonstration",
+    "recordable": true
+  },
+  "config": [
+    {
+      "type": "command",
+      "parameters": {
+        "command": [
+          "python",
+          "-c",
+          "from pathlib import Path; import subprocess, shutil, time; [subprocess.run(['taskkill','/F','/IM',image], capture_output=True, text=True) for image in ('swriter.exe','soffice.exe','soffice.bin')]; time.sleep(1); p=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.html'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Research Overview</title></head><body><p>Quarterly Research Summary</p><p>This report reviews the current research milestones.</p><p>The next review is scheduled for Friday.</p></body></html>', encoding='utf-8'); out=p.with_suffix('.odt'); out.unlink(missing_ok=True); (p.parent / f'.~lock.{out.name}#').unlink(missing_ok=True); profile=Path(r'C:\\Users\\Docker\\AppData\\Local\\Temp\\trace2task-writer-d0-setup'); shutil.rmtree(profile, ignore_errors=True); result=subprocess.run([r'C:\\Program Files\\LibreOffice\\program\\soffice.exe','-env:UserInstallation=file:///C:/Users/Docker/AppData/Local/Temp/trace2task-writer-d0-setup','--headless','--convert-to','odt','--outdir',str(p.parent),str(p)], check=True, timeout=60, capture_output=True, text=True); assert out.is_file(), 'LibreOffice conversion did not create ODT: ' + result.stdout + result.stderr; p.unlink(missing_ok=True); shutil.rmtree(profile, ignore_errors=True)"
+        ]
+      }
+    }
+  ],
+  "trajectory": "trajectories/",
+  "related_apps": ["libreoffice_writer"],
+  "evaluator": {
+    "func": "exact_match",
+    "result": {
+      "type": "vm_command_line",
+      "command": [
+        "python",
+        "-c",
+        "from pathlib import Path; import zipfile; import xml.etree.ElementTree as ET; p=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.odt'); ns='urn:oasis:names:tc:opendocument:xmlns:text:1.0'; root=ET.fromstring(zipfile.ZipFile(p).read('content.xml')) if p.is_file() else ET.Element('missing'); heads=[''.join(node.itertext()).strip() for node in root.findall('.//{%s}h' % ns) if node.get('{%s}outline-level' % ns) == '1']; ok=heads == ['Quarterly Research Summary']; marker=Path(r'C:\\Users\\Docker\\Documents\\Writer Tasks\\research_overview.heading1.complete'); marker.write_text('complete', encoding='utf-8') if ok else marker.unlink(missing_ok=True); print('true' if ok else 'false', end='')"
+      ]
+    },
+    "expected": {
+      "type": "rule",
+      "rules": {"expected": "true"}
+    }
+  }
+}

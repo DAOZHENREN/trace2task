@@ -33,6 +33,62 @@ def _reset_paths(example: dict[str, Any]) -> list[str]:
     return paths
 
 
+def _required_after_setup_paths(example: dict[str, Any]) -> list[str]:
+    spec_value = os.environ.get(RESET_SPEC_ENV, "").strip()
+    if not spec_value:
+        return []
+    payload = json.loads(Path(spec_value).read_text(encoding="utf-8"))
+    tasks = payload.get("tasks") if isinstance(payload, dict) else None
+    task_spec = tasks.get(example.get("id")) if isinstance(tasks, dict) else None
+    if not isinstance(task_spec, dict):
+        return []
+    paths = task_spec.get("must_exist_after_setup", [])
+    if not isinstance(paths, list) or not all(
+        isinstance(path, str) and path.strip() for path in paths
+    ):
+        raise TypeError(
+            "Trace2Task WAA reset must_exist_after_setup must be a list of "
+            "non-empty strings"
+        )
+    return paths
+
+
+def _verify_required_after_setup(env, example: dict[str, Any]) -> list[str]:
+    paths = _required_after_setup_paths(example)
+    if not paths:
+        return []
+    code = (
+        "from pathlib import Path; import json; paths = "
+        + json.dumps(paths)
+        + "; print(json.dumps([path for path in paths if not Path(path).exists()]))"
+    )
+    response = requests.post(
+        f"http://{env.vm_ip}:5000/execute",
+        json={"command": ["python", "-c", code], "shell": False},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            "Trace2Task WAA setup readiness check failed "
+            f"({response.status_code}): {response.text}"
+        )
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("returncode") != 0:
+        raise RuntimeError("Trace2Task WAA setup readiness check returned an error")
+    try:
+        missing = json.loads(str(payload.get("output", "")).strip() or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Trace2Task WAA setup readiness check returned invalid output"
+        ) from exc
+    if missing:
+        raise RuntimeError(
+            "Trace2Task WAA setup did not create required files: "
+            + ", ".join(str(path) for path in missing)
+        )
+    return paths
+
+
 def _request_reset(
     env,
     example: dict[str, Any],
@@ -71,4 +127,8 @@ def verify_trace2task_reset(
     env,
     example: dict[str, Any],
 ) -> dict[str, Any] | None:
-    return _request_reset(env, example, "verify")
+    receipt = _request_reset(env, example, "verify")
+    required = _verify_required_after_setup(env, example)
+    if receipt is not None and required:
+        receipt["verified_present"] = required
+    return receipt

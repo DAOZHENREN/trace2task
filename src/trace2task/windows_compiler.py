@@ -31,6 +31,7 @@ DOUBLE_CLICK_GAP_MS = 500
 POINTER_JITTER_TOLERANCE = 0.02
 MODIFIER_KEYS = {"alt", "ctrl", "shift"}
 COMMAND_MODIFIER_KEYS = {"alt", "ctrl"}
+TEXT_ENTRY_CAPABILITY_PROFILES = {"messaging", "text_entry"}
 MESSAGING_TEXT_KEYS = {
     *"abcdefghijklmnopqrstuvwxyz0123456789",
     "backspace",
@@ -491,7 +492,7 @@ def _compile_runtime_text_bursts(
                 source_seqs=source_seqs,
                 evidence_frame=evidence.frame,
                 inference=(
-                    "messaging_keyboard_burst_with_runtime_instruction_value_"
+                    "keyboard_text_burst_with_runtime_instruction_value_"
                     f"{index}"
                 ),
             )
@@ -570,7 +571,7 @@ def _compile_actions(
 ) -> tuple[list[_TimedAction], list[_RawInputEvent]]:
     key_intervals, mouse_intervals, ignored_releases = _pair_input_intervals(raw_events)
     mouse_actions = _compile_mouse(mouse_intervals)
-    if capability_profile == "messaging":
+    if capability_profile in TEXT_ENTRY_CAPABILITY_PROFILES:
         text_intervals, text_shifts, control_intervals = _classify_messaging_keyboard(
             key_intervals
         )
@@ -646,7 +647,12 @@ def compile_windows_trace(
         and process_hint.casefold() in {"weixin.exe", "wechat.exe"}
     ):
         capability_profile = "messaging"
-    if capability_profile not in {None, "messaging"}:
+    if capability_profile is None and (
+        metadata.get("capture_method") == "waa_vm_desktop"
+        or isinstance(metadata.get("waa_task_id"), str)
+    ):
+        capability_profile = "text_entry"
+    if capability_profile not in {None, *TEXT_ENTRY_CAPABILITY_PROFILES}:
         raise ValueError(f"Unsupported Windows capability profile: {capability_profile!r}")
     inferred, ignored_releases = _compile_actions(
         raw_events,
@@ -714,7 +720,7 @@ def compile_windows_trace(
         dict.fromkeys(item["action"]["skill"] for item in demonstration)
     )
     declared_skills = list(observed_skills)
-    if capability_profile == "messaging" or process_name.casefold() in {
+    if capability_profile in TEXT_ENTRY_CAPABILITY_PROFILES or process_name.casefold() in {
         "weixin.exe",
         "wechat.exe",
     }:
@@ -875,12 +881,12 @@ def compile_windows_trace(
             f"The {success_hotkey} success marker is human evidence and still requires visual review.",
             "Unmatched release events are ignored and listed in the compiler report.",
             (
-                "Messaging keyboard bursts are structural text-entry evidence. Their literal IME "
-                "output is unavailable, so reserved placeholders must be resolved from the runtime "
-                "instruction and current field context."
-            )
-            if capability_profile == "messaging"
-            else "No messaging-specific text inference was requested.",
+                    "Keyboard text bursts are structural text-entry evidence. Their literal output is "
+                    "not treated as a fixed script, so reserved placeholders must be resolved from the "
+                    "runtime instruction and current field context."
+                )
+            if capability_profile in TEXT_ENTRY_CAPABILITY_PROFILES
+            else "No text-entry-specific inference was requested.",
             (
                 "Unsupported concurrent input, outside-target mouse input, unreleased input, and "
                 "excessive holds or drags fail closed."

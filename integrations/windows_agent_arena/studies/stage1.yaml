@@ -1,0 +1,308 @@
+schema_version: "0.1"
+study_id: trace2task-stage1
+title: Trace2Task Stage 1 - Trace and Experience Effect Study
+path_base: ../../..
+seed: 20260901
+repetitions: 3
+model: gpt-5.6-terra
+reasoning_effort: low
+
+targets:
+  apps: 5
+  task_instances: 22
+  parameterized_families: 8
+
+primary_metrics:
+  - evaluator_success
+  - wall_time_seconds
+  - model_time_seconds
+  - plan_calls
+  - action_count
+  - recovery_count
+  - human_cost_seconds
+
+analysis_plan:
+  primary_endpoint: evaluator_success
+  pairing_unit: task_variant
+  success_analysis: task-paired bootstrap and mixed-effects logistic regression
+  efficiency_summary: median, interquartile range, paired effect, and 95% confidence interval
+  multiplicity: Holm correction for secondary condition contrasts
+  failure_views:
+    - intent_to_treat
+    - capability_only
+  freeze_rule: Do not change tasks, conditions, model settings, or exclusions after a formal run starts.
+
+conditions:
+  - id: baseline
+    runtime_mode: baseline
+    taskpack_role: execution
+    purpose: Current screenshot and instruction only.
+
+  - id: raw_trace
+    runtime_mode: trace
+    taskpack_role: execution
+    human_cost_keys: [demonstration]
+    purpose: Test whether matched immutable human Trace evidence helps by itself.
+
+  - id: trace_compile
+    runtime_mode: compiled
+    taskpack_role: trace_compile
+    human_cost_keys: [demonstration, compiler_review]
+    purpose: Trace compiled into semantic experience and confirmed before execution.
+
+  - id: narrated_trace_compile
+    runtime_mode: narrated_compiled
+    taskpack_role: narrated_trace_compile
+    human_cost_keys: [demonstration, narration, compiler_review]
+    purpose: Human Trace plus synchronized narration, compiled and reviewed.
+
+  - id: feedback_r1
+    runtime_mode: feedback
+    taskpack_role: feedback_r1
+    include_task_tags: [feedback-curve]
+    human_cost_keys: [demonstration, narration, compiler_review, feedback_r1]
+    purpose: First accumulated human feedback revision.
+
+  - id: feedback_r2
+    runtime_mode: feedback
+    taskpack_role: feedback_r2
+    include_task_tags: [feedback-curve]
+    human_cost_keys: [demonstration, narration, compiler_review, feedback_r1, feedback_r2]
+    purpose: Second accumulated human feedback revision.
+
+  - id: feedback_r3
+    runtime_mode: feedback
+    taskpack_role: feedback_r3
+    include_task_tags: [feedback-curve]
+    human_cost_keys: [demonstration, narration, compiler_review, feedback_r1, feedback_r2, feedback_r3]
+    purpose: Third accumulated human feedback revision.
+
+  - id: feedback_r4
+    runtime_mode: feedback
+    taskpack_role: feedback_r4
+    include_task_tags: [feedback-curve]
+    human_cost_keys: [demonstration, narration, compiler_review, feedback_r1, feedback_r2, feedback_r3, feedback_r4]
+    purpose: Fourth accumulated human feedback revision.
+
+  - id: mismatched_trace
+    runtime_mode: trace
+    taskpack_role: mismatched_trace
+    include_task_tags: [negative-control]
+    human_cost_keys: [demonstration]
+    purpose: A Trace from another family; detects generic extra-context or prompt-length effects.
+
+tasks:
+  # D0 is the only recordable demonstration. E1-E3 are held out from the recorder
+  # and are used only by formal WAA experiments after the D0 artifacts are frozen.
+  - id: notepad-count-token-e1
+    app: notepad
+    family_id: count-token-occurrences
+    split: test
+    parameterized: true
+    demonstration_variant: 351f1d5e-f3f7-4efe-8fda-e8a8e9eacf4c-WOS
+    evaluation_variant: ea5daf01-d830-475d-863a-7863c618e489-WOS
+    status: planned
+    tags: [feedback-curve, negative-control]
+    waa_task_id: ea5daf01-d830-475d-863a-7863c618e489-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_count_token_e1.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/notepad.json
+    taskpacks: {}
+
+  - id: notepad-count-token-e2
+    app: notepad
+    family_id: count-token-occurrences
+    split: test
+    parameterized: true
+    demonstration_variant: 351f1d5e-f3f7-4efe-8fda-e8a8e9eacf4c-WOS
+    evaluation_variant: ef2d1903-cc63-46a7-9c1d-d510ab1960ee-WOS
+    status: planned
+    tags: [feedback-curve, negative-control]
+    waa_task_id: ef2d1903-cc63-46a7-9c1d-d510ab1960ee-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_count_token_e2.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/notepad.json
+    taskpacks: {}
+
+  - id: notepad-count-token-e3
+    app: notepad
+    family_id: count-token-occurrences
+    split: test
+    parameterized: true
+    demonstration_variant: 351f1d5e-f3f7-4efe-8fda-e8a8e9eacf4c-WOS
+    evaluation_variant: 9d3ab930-5956-4b7c-9592-ffc3c0ded517-WOS
+    status: planned
+    tags: [feedback-curve, negative-control]
+    waa_task_id: 9d3ab930-5956-4b7c-9592-ffc3c0ded517-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_count_token_e3.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/notepad.json
+    taskpacks: {}
+
+  - id: notepad-save-exact-text-01
+    app: notepad
+    family_id: save-exact-text
+    split: test
+    parameterized: true
+    status: planned
+    tags: [feedback-curve, negative-control]
+    taskpacks: {}
+
+  - id: explorer-find-file-e1
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    status: planned
+    tags: [feedback-curve, negative-control]
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 01b0e251-121d-4918-b36d-290447122566-WOS
+    waa_task_id: 01b0e251-121d-4918-b36d-290447122566-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e1.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks: {}
+
+  - id: explorer-find-file-e2
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    status: planned
+    tags: [feedback-curve, negative-control]
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    waa_task_id: 576d7689-7577-40ae-ba79-93efa9504343-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e2.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks: {}
+
+  - id: explorer-find-file-e3
+    app: file_explorer
+    family_id: find-file-by-content
+    split: test
+    parameterized: true
+    status: planned
+    tags: [feedback-curve, negative-control]
+    demonstration_variant: c05b680d-bda5-48db-984b-c1024496d088-WOS
+    evaluation_variant: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    waa_task_id: 9cb5bec7-c4f9-4301-b95d-2294d04a31a9-WOS
+    waa_json_name: evaluation_examples_windows/test_trace2task_find_file_e3.json
+    reset_spec: integrations/windows_agent_arena/reset_specs/file_explorer.json
+    taskpacks: {}
+
+  - id: explorer-rename-file-01
+    app: file_explorer
+    family_id: rename-file
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: explorer-move-file-01
+    app: file_explorer
+    family_id: move-file
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: explorer-create-tree-01
+    app: file_explorer
+    family_id: create-folder-tree
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: writer-format-heading-01
+    app: libreoffice_writer
+    family_id: format-heading
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: writer-replace-text-01
+    app: libreoffice_writer
+    family_id: replace-document-text
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: writer-insert-table-01
+    app: libreoffice_writer
+    family_id: insert-table
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: writer-export-pdf-01
+    app: libreoffice_writer
+    family_id: export-document
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: calc-formula-01
+    app: libreoffice_calc
+    family_id: spreadsheet-formula
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: calc-filter-01
+    app: libreoffice_calc
+    family_id: spreadsheet-filter
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: calc-format-01
+    app: libreoffice_calc
+    family_id: spreadsheet-format
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: calc-chart-01
+    app: libreoffice_calc
+    family_id: spreadsheet-chart
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: paint-draw-shape-01
+    app: microsoft_paint
+    family_id: draw-shape
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: paint-annotate-01
+    app: microsoft_paint
+    family_id: annotate-image
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: paint-resize-01
+    app: microsoft_paint
+    family_id: resize-canvas
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}
+
+  - id: paint-export-01
+    app: microsoft_paint
+    family_id: export-image
+    split: test
+    parameterized: true
+    status: planned
+    taskpacks: {}

@@ -329,6 +329,7 @@ def record(args: argparse.Namespace) -> dict[str, Any]:
         },
         "capture_method": "waa_vm_desktop",
         "input_sampling": "waa_vm_edge_poll_v1",
+        "capability_profile": "text_entry",
         "coordinate_space": "physical_pixels",
         "success_hotkey": "f8",
         "cancel_hotkey": "f9",
