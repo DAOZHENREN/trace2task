@@ -1,5 +1,9 @@
 # Trace2Task
 
+<p align="right">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 **Teach a Windows agent with a human demonstration, then improve it through reviewable feedback.**
 
 Trace2Task records how a person completes a task and turns that evidence into a versioned experience
@@ -27,6 +31,11 @@ The architectural direction remains unchanged across these releases: immutable h
 primary evidence; Compiler output is reviewable derived knowledge; feedback is versioned; and the
 runtime Agent must be evaluated behind an independent reset and effect-verification boundary.
 
+The proposed research path for moving model inference off the runtime critical path is documented in
+[Trace-Guided Low-Latency Desktop Agent](docs/research/trace-guided-low-latency-agent.md). It separates
+current observations from hypotheses and defines measurable follow-up experiments for guarded action
+programs, compact runtime context, and hierarchical model routing.
+
 ## Why Trace2Task?
 
 A fixed macro is fast but brittle: a moved button, popup, loading delay, or changed task parameter can
@@ -41,6 +50,13 @@ Trace2Task keeps the useful middle layer:
 - human feedback accumulates as versioned rules instead of silently overwriting earlier knowledge.
 
 ## Current workflow
+
+<p align="center">
+  <img src="docs/research/assets/trace-guided-runtime-architecture-v2.png" alt="Trace2Task architecture: human evidence is compiled into guarded runtime knowledge, independently verified, and revised through a versioned learning loop" width="100%">
+</p>
+
+<details>
+<summary><strong>Detailed control flow</strong></summary>
 
 ```mermaid
 flowchart LR
@@ -78,6 +94,8 @@ flowchart LR
     L -->|human review and confirmation| G
     L -->|structural correction| E
 ```
+
+</details>
 
 ## What the current version can do
 
