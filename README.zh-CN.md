@@ -149,7 +149,7 @@ Guidance 可以作用于全局，也可以只绑定某个状态、转换或终�
 - Windows 10 或 Windows 11。
 - Python 3.11 或更高版本。
 - [uv](https://docs.astral.sh/uv/)。
-- 本地安装并登录 Codex；模型编译和执行可复用 ChatGPT 订阅登录，不要求 OpenAI API Key。
+- 本地安装并登录 Codex，用于经验编译和反馈修订；执行 Agent 可继续使用 Codex 订阅（默认，不需要 API Key），也可单独使用视觉模型 API。
 - 只有使用讲解或语音输入时才需要麦克风。
 
 Whisper Turbo 首次使用时下载到 .cache/faster-whisper/，之后复用缓存，模型约 1.6 GB。兼容 CUDA 12/cuDNN 9 时优先使用 CUDA FP16，否则回退到 CPU INT8。
@@ -173,6 +173,37 @@ codex login
 ~~~
 
 当终端 PATH 中找不到 Codex 时，Trace2Task 也会发现 ChatGPT/Codex Windows 桌面应用内置的版本化 codex.exe。
+
+## 使用模型 API 执行
+
+Windows 执行 Agent 支持 **OpenAI 兼容的 Chat Completions API**。只替换模型调用通道，仍复用 Trace、编译状态图、人工反馈、多动作规划、动作校验、效果验证和运行日志。教师编译、反馈修订及 WAA 实验命令暂时仍使用 Codex。
+
+在“执行任务”中，将“执行模型来源”切换为“模型 API”，填写：
+
+- **Base URL**：服务商的 API 根地址，通常以 `/v1` 结尾；程序会补上 `/chat/completions`，已包含时不会重复添加。
+- **模型 ID**：服务商的 API 模型 ID，而非 Codex 订阅模型别名。本地接受自定义名称，但模型必须支持图片输入和 JSON 输出。
+- **API Key**：密码框输入，不写入任务包、日志或浏览器存储。也可在启动网页前设置环境变量 `TRACE2TASK_API_KEY`；仅官方 `api.openai.com` 地址额外支持回退读取 `OPENAI_API_KEY`。
+- **思考强度**：建议先选“服务商默认”，不发送此参数；只有确认模型支持时才选具体强度。
+- **输出格式**：优先 `json_schema`；不支持严格结构化输出的兼容服务可手动选 `json_object`，本地动作校验仍生效。
+
+先点“只生成计划”，检查后再执行已确认任务。截图和任务经验会发送给所选服务商；API 费用与 ChatGPT 订阅分开。API 模式不会自动升级到另一个模型。拒答、截断、无效 JSON 或不合法动作不会进入执行；网络错误不自动重试。执行期间停止或按 F9 会丢弃迟到的回答，但无法保证撤销服务商已经开始处理的请求。远程 API 必须使用 HTTPS，仅本机回环服务允许 HTTP。
+
+点击 **保存 API 配置** 后，地址、模型、思考强度、输出格式、超时和密钥会在刷新、重启后恢复。Windows 下密钥使用当前账户的 [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata) 加密，存放在仓库之外的 `%LOCALAPPDATA%\Trace2Task\model-api.json`。网页只显示“已保存”，不回显密钥；留空可复用同一地址的密钥，更换地址须重新输入。**清除已保存配置** 只清除这个配置文件，不影响任务和环境变量。非 Windows 系统可保存无密钥配置并使用环境变量，不回退为明文密钥。DPAPI 无法防御已在你当前 Windows 账户下运行的恶意程序。
+
+遇到 HTTP 400，查看报错中的脱敏“服务商返回”以及 `format` / `reasoning` 参数。不支持严格 JSON Schema 或思考参数的服务可尝试 `json_object` 和“服务商默认”。仅凭模型名称不能判断接口或图片兼容性。错误详情会限长并脱敏密钥、URL 和图片数据，不保存原始 HTTP 错误体。
+
+命令行示例（替换地址、模型和任务路径；密钥通过隐藏输入读取，不写入命令历史）：
+
+~~~powershell
+$env:TRACE2TASK_API_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "Model API Key" -AsSecureString)).Password
+uv run trace2task windows agent --task "path\to\task.yaml" --provider api --api-base-url "https://your-provider.example/v1" --model "your-vision-model" --reasoning-effort default
+~~~
+
+确认后增加 `--execute` 才会控制窗口。可选参数：`--api-key-env CUSTOM_KEY_VARIABLE`、`--api-response-format json_object`、`--api-timeout 180`。
+
+更新代码后，须在旧网页终端按 **Ctrl+C** 再重新启动；只刷新页面不会更新后台。如果 8765 已被服务器隧道占用，运行 `uv run trace2task web --port 8766`，打开[本地控制台](http://127.0.0.1:8766/)。
+
+协议参考：[图片输入](https://developers.openai.com/api/docs/guides/images-vision)、[结构化输出](https://developers.openai.com/api/docs/guides/structured-outputs)。
 
 ## 推荐的网页控制台流程
 
@@ -424,7 +455,7 @@ Compiler 快照用于来源审计；单纯“确认”属于质量门，而不�
 - F9 是紧急停止键；中断时 cleanup 会释放所有按住的按键和鼠标按钮。
 - 后台模式要求窗口可见且未最小化，并依赖具体应用。Raw Input、DirectInput、提权进程、纯 GPU 渲染或主动拒绝模拟输入的应用可能无法使用。
 - Trace2Task 不尝试绕过反作弊，也不绕过主动拒绝合成输入的软件。
-- 模型规划截图会通过已登录 Codex 服务处理，不要在不希望模型处理的敏感内容上运行。
+- 模型规划截图会通过 Codex 或所选模型 API 处理，不要在不希望服务商处理的敏感内容上运行。
 - reviewed_reference_frame 属于模型辅助判断，会明确报告为未独立验证；pixel_reference 独立于模型，但只能证明像素相似，不能证明后端业务事务。高影响任务需要应用专用 Effect Verifier。
 - 新任务包需要人工监督，直到其状态图、Guidance 和 verifier 在多个 reset 变体上得到审查。
 

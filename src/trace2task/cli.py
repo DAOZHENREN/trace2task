@@ -9,6 +9,12 @@ from trace2task import __version__
 from trace2task.codex_app_server import CODEX_REASONING_EFFORTS
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.evaluation import run_evaluation_suite
+from trace2task.model_api import (
+    API_REASONING_EFFORTS,
+    API_RESPONSE_FORMATS,
+    DEFAULT_API_BASE_URL,
+    ModelAPIConfig,
+)
 from trace2task.runner import DEFAULT_TASK_PATH, record_human, replay_trace, run_agent, run_demo
 from trace2task.waa_bridge import serve_waa_bridge
 from trace2task.waa_experiment import (
@@ -371,11 +377,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     windows_agent.add_argument("--task", type=Path, required=True)
     windows_agent.add_argument("--model", default="gpt-5.6-terra")
+    windows_agent.add_argument("--provider", choices=("codex", "api"), default="codex")
+    windows_agent.add_argument("--api-base-url", default=DEFAULT_API_BASE_URL)
+    windows_agent.add_argument(
+        "--api-key-env", default="TRACE2TASK_API_KEY",
+        help="Environment variable holding the API key; never pass the key on the command line.",
+    )
+    windows_agent.add_argument(
+        "--api-response-format", choices=API_RESPONSE_FORMATS, default="json_schema",
+    )
+    windows_agent.add_argument("--api-timeout", type=float, default=120)
     windows_agent.add_argument(
         "--reasoning-effort",
-        choices=CODEX_REASONING_EFFORTS,
-        default="low",
-        help="Model reasoning depth (default: low).",
+        choices=tuple(dict.fromkeys((*CODEX_REASONING_EFFORTS, *API_REASONING_EFFORTS))),
+        default=None,
+        help="Model reasoning depth (Codex default: low; API default: omit the parameter).",
     )
     windows_agent.add_argument("--codex-bin", default="codex")
     windows_agent.add_argument(
@@ -587,13 +603,25 @@ def main(argv: list[str] | None = None) -> int:
                 use_narration=not args.ignore_narration,
             )
         else:
+            api_config = (
+                ModelAPIConfig(
+                    base_url=args.api_base_url,
+                    api_key_env=args.api_key_env,
+                    response_format=args.api_response_format,
+                    timeout_seconds=args.api_timeout,
+                ).with_credentials()
+                if args.provider == "api" else None
+            )
             if args.focus or (args.execute and not args.background):
                 print("Waiting up to 10 seconds for the target to become foreground...")
             result = run_windows_agent(
                 args.task,
                 execute=args.execute,
                 model=args.model,
-                reasoning_effort=args.reasoning_effort,
+                reasoning_effort=args.reasoning_effort or (
+                    "default" if api_config is not None else "low"
+                ),
+                api_config=api_config,
                 codex_bin=args.codex_bin,
                 plan_horizon=args.plan_horizon,
                 max_actions=args.max_actions,

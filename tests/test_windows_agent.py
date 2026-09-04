@@ -1349,6 +1349,108 @@ def test_codex_windows_agent_excludes_focus_action_in_background(tmp_path: Path)
     agent.close()
 
 
+def test_model_api_reuses_multistep_planner_without_starting_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trace2task import windows_agent
+    from trace2task.model_api import ModelAPIConfig, ModelAPISession
+
+    calls = []
+    payload = {
+        "task_complete": False,
+        "actions": [
+            {"skill": "click", "args": {"x": 0.25, "y": 0.75, "button": "left"}},
+            {"skill": "click", "args": {"x": 0.5, "y": 0.5, "button": "left"}},
+        ],
+        "reason": "Two visible targets.",
+        "confidence": 0.6,
+    }
+
+    class TestAPISession(ModelAPISession):
+        def __init__(self, config, **kwargs):
+            super().__init__(config, **kwargs, requester=self.request)
+
+        def request(self, config, body):
+            calls.append(body)
+            return {"choices": [{"finish_reason": "stop", "message": {
+                "content": json.dumps(payload),
+            }}]}
+
+    monkeypatch.setattr(windows_agent, "ModelAPISession", TestAPISession)
+    contract = load_windows_task(_write_taskpack(tmp_path))
+    agent = CodexWindowsAgent(
+        contract, model="deepseek-v4-flash-vision-exp", reasoning_effort="default",
+        api_config=ModelAPIConfig(api_key="test-only-key"),
+        binary_resolver=lambda *args: pytest.fail("API must not start Codex"),
+        session_factory=lambda *args, **kwargs: pytest.fail("API must not start Codex"),
+    )
+    try:
+        for _ in range(6):
+            plan = agent.plan(pygame.Surface((100, 50)))
+            assert len(plan.actions) == 2
+            assert plan.model == "deepseek-v4-flash-vision-exp"
+            assert plan.reasoning_effort == "default"
+            assert plan.timing.model_roundtrip_ms >= 0
+        assert agent.adaptive_reasoning is False
+        assert agent.session_resets >= 1
+        assert all(call["model"] == "deepseek-v4-flash-vision-exp" for call in calls)
+        assert all("reasoning_effort" not in call for call in calls)
+        assert "Trace" in calls[0]["messages"][-1]["content"][0]["text"]
+        payload["actions"] = [{"skill": "press_key", "args": {"key": "enter"}}]
+        with pytest.raises(RuntimeError, match="outside the Windows task pack"):
+            agent.plan(pygame.Surface((100, 50)))
+    finally:
+        agent.close()
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_model_api_runner_respects_execution_gate_and_records_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, execute: bool,
+) -> None:
+    from trace2task import windows_agent
+    from trace2task.model_api import ModelAPIConfig, ModelAPISession
+
+    class TestAPISession(ModelAPISession):
+        def __init__(self, config, **kwargs):
+            self.calls = 0
+            super().__init__(config, **kwargs, requester=self.request)
+
+        def request(self, config, body):
+            self.calls += 1
+            return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+                "task_complete": self.calls > 1,
+                "actions": [] if self.calls > 1 else [
+                    {"skill": "click", "args": {"x": 0.5, "y": 0.5}},
+                ],
+                "reason": "Click visible target.", "confidence": 0.95,
+            })}}]}
+
+    monkeypatch.setattr(windows_agent, "ModelAPISession", TestAPISession)
+    backend = FakeBackend()
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, confirmed=execute), backend=backend, capture=FakeCapture(),
+        execute=execute, emergency_stop=FakeEmergencyStop(), output_root=tmp_path / "runs",
+        model="vendor/vision", reasoning_effort="default",
+        api_config=ModelAPIConfig(api_key="test-only-key"),
+    )
+    assert result.provider == "api"
+    if execute:
+        assert result.executed_actions == 1
+        assert result.task_complete is True
+        assert backend.events == [
+            ("focus", 7), ("cursor", 150, 225),
+            ("mouse", "left", True), ("mouse", "left", False),
+        ]
+        trace = Path(result.trace_path).read_text(encoding="utf-8")
+        metadata = (Path(result.trace_path).parent / "metadata.json").read_text(encoding="utf-8")
+        assert '"provider": "api"' in trace
+        assert "test-only-key" not in trace + metadata
+    else:
+        assert result.executed_actions == 0
+        assert len(result.proposed_actions) == 1
+        assert backend.events == []
+
+
 def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) -> None:
     task_path = _write_taskpack(tmp_path)
     backend = FakeBackend()

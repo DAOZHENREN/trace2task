@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from trace2task import web_console
+from trace2task.api_settings import APISettingsStore
 from trace2task.codex_app_server import CodexTurnTimeoutError
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
@@ -24,7 +25,13 @@ from trace2task.windows_runner import WindowsAgentRunFailed
 
 
 @pytest.fixture(autouse=True)
-def _stub_compiler_connectivity_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stub_compiler_connectivity_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        web_console, "APISettingsStore",
+        lambda: APISettingsStore(tmp_path / "user-config" / "model-api.json"),
+    )
     monkeypatch.setattr(
         web_console,
         "probe_codex_compiler_connection",
@@ -298,6 +305,194 @@ class FakeResult:
 class FakeCompilation:
     task_path: str
     review_status: str = "draft"
+
+
+def test_api_job_accepts_custom_model_and_keeps_key_out_of_snapshots(tmp_path: Path) -> None:
+    task = _write_windows_task(tmp_path)
+    calls = []
+    controller = WebConsoleController(
+        tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
+    )
+    job = controller.start_job(
+        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test API plan.",
+        execute=False, provider="api", model="deepseek-v4-flash-vision-exp",
+        reasoning_effort="default", api_options={
+            "base_url": "https://provider.example/v1", "api_key": "test-private-key",
+        },
+    )
+    completed = controller.wait(job["job_id"])
+    assert completed["status"] == "completed"
+    assert completed["provider"] == "api"
+    assert calls[0]["api_config"].api_key == "test-private-key"
+    assert calls[0]["adaptive_reasoning"] is False
+    assert calls[0]["model"] == "deepseek-v4-flash-vision-exp"
+    assert "test-private-key" not in json.dumps([job, completed])
+    assert "api_config" not in completed
+    assert "api_key" not in completed
+    with pytest.raises(ValueError, match="Codex"):
+        controller.start_job(
+            task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
+            execute=False, model="deepseek-v4-flash-vision-exp",
+        )
+
+
+def test_api_job_requires_key_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRACE2TASK_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    task = _write_windows_task(tmp_path)
+    controller = WebConsoleController(
+        tmp_path, runner=lambda *args, **kwargs: pytest.fail("Must not launch without key"),
+    )
+    with pytest.raises(ValueError, match="API Key"):
+        controller.start_job(
+            task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
+            execute=False, provider="api", model="vision", api_options={},
+        )
+
+
+def test_saved_api_key_is_reused_by_jobs_without_returning_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trace2task import api_settings
+    from trace2task.model_api import ModelAPIConfig
+
+    monkeypatch.setattr(
+        api_settings, "_dpapi",
+        lambda data, endpoint, decrypt=False: b"saved-key" if decrypt else b"opaque",
+    )
+    task = _write_windows_task(tmp_path)
+    calls = []
+    store = APISettingsStore(tmp_path / "profile.json")
+    store.save(
+        ModelAPIConfig(base_url="https://service.example/v1", api_key="saved-key"),
+        model="custom-vision", reasoning_effort="default",
+    )
+    controller = WebConsoleController(
+        tmp_path, api_settings_store=APISettingsStore(store.path),
+        runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
+    )
+    job = controller.start_job(
+        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test saved API.",
+        execute=False, provider="api", model="custom-vision", reasoning_effort="default",
+        api_options={"base_url": "https://service.example/v1"},
+    )
+    completed = controller.wait(job["job_id"])
+    assert completed["status"] == "completed"
+    assert calls[0]["api_config"].api_key == "saved-key"
+    assert "saved-key" not in json.dumps(completed)
+
+
+def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Path) -> None:
+    from urllib.error import HTTPError
+
+    task = _write_windows_task(tmp_path)
+    calls = []
+    controller = WebConsoleController(
+        tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
+    )
+    server = create_web_server(tmp_path, port=0, controller=controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    opener = build_opener(ProxyHandler({}))
+    body = json.dumps({
+        "task_path": task.relative_to(tmp_path).as_posix(), "instruction": "Test.",
+        "mode": "plan", "provider": "api", "model": "custom-vision",
+        "reasoning_effort": "default", "api": {"api_key": "test-private-key"},
+    }).encode()
+    try:
+        with opener.open(base + "/") as response:
+            html = response.read().decode()
+        assert 'id="model-provider"' in html
+        assert 'id="api-model"' in html
+        assert 'id="api-key" type="password"' in html
+        with opener.open(base + "/api/state") as response:
+            state = json.loads(response.read())
+        assert "default" in state["agent_options"]["api_defaults"]["reasoning_efforts"]
+        for headers in [
+            {"Origin": "https://unrelated.example"},
+            {"Host": f"rebind.example:{server.server_port}"},
+        ]:
+            request = Request(base + "/api/jobs", data=body, headers={
+                "Content-Type": "application/json", **headers,
+            })
+            with pytest.raises(HTTPError) as error:
+                opener.open(request, timeout=5)
+            assert error.value.code == 400
+            error.value.close()
+        assert not calls
+        request = Request(base + "/api/jobs", data=body, headers={
+            "Content-Type": "application/json", "Origin": base,
+        })
+        with opener.open(request, timeout=5) as response:
+            job = json.loads(response.read())
+        assert controller.wait(job["job_id"])["status"] == "completed"
+        assert len(calls) == 1
+        assert "test-private-key" not in json.dumps(job)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_api_profile_http_save_reload_clear_and_origin_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib.error import HTTPError
+
+    from trace2task import api_settings
+
+    monkeypatch.setattr(
+        api_settings, "_dpapi",
+        lambda data, endpoint, decrypt=False: b"test-private-key" if decrypt else b"opaque",
+    )
+    controller = WebConsoleController(tmp_path)
+    server = create_web_server(tmp_path, port=0, controller=controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    opener = build_opener(ProxyHandler({}))
+    body = json.dumps({
+        "base_url": "https://service.example/v1", "model": "custom-model",
+        "reasoning_effort": "default", "api_key": "test-private-key",
+    }).encode()
+    try:
+        for operation in ("save", "clear"):
+            bad = Request(base + "/api/model-settings/" + operation, data=body, headers={
+                "Content-Type": "application/json", "Origin": "https://unrelated.example",
+            })
+            with pytest.raises(HTTPError) as error:
+                opener.open(bad, timeout=5)
+            assert error.value.code == 400
+            error.value.close()
+        assert not controller.api_settings.path.exists()
+        valid = Request(base + "/api/model-settings/save", data=body, headers={
+            "Content-Type": "application/json", "Origin": base,
+        })
+        with opener.open(valid, timeout=5) as response:
+            saved = json.loads(response.read())
+        assert saved["saved"] and saved["has_saved_key"]
+        assert "test-private-key" not in json.dumps(saved)
+        assert "test-private-key" not in controller.api_settings.path.read_text(encoding="utf-8")
+        reloaded = APISettingsStore(controller.api_settings.path)
+        assert reloaded.public_settings() == saved
+        with opener.open(base + "/api/state", timeout=5) as response:
+            state = json.loads(response.read())
+        assert state["agent_options"]["api_defaults"]["saved_settings"] == saved
+        assert "test-private-key" not in json.dumps(state)
+        clear = Request(base + "/api/model-settings/clear", data=b"{}", headers={
+            "Content-Type": "application/json", "Origin": base,
+        })
+        with opener.open(clear, timeout=5) as response:
+            cleared = json.loads(response.read())
+        assert not cleared["saved"]
+        assert not controller.api_settings.path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @dataclass(frozen=True)

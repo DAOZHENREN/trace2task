@@ -21,6 +21,7 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_REASONING_EFFORT,
     CodexAppServerSession,
 )
+from trace2task.model_api import ModelAPIConfig, ModelAPISession, validate_api_model
 from trace2task.windows_task import WindowsTaskContract
 
 BinaryResolver = Callable[[str], str]
@@ -98,6 +99,7 @@ class CodexWindowsAgent:
         experience_mode: str = "feedback",
         binary_resolver: BinaryResolver = resolve_codex_binary,
         session_factory: SessionFactory = CodexAppServerSession,
+        api_config: ModelAPIConfig | None = None,
     ) -> None:
         if plan_horizon <= 0 or plan_horizon > 12:
             raise ValueError("Windows plan_horizon must be between 1 and 12")
@@ -107,20 +109,26 @@ class CodexWindowsAgent:
                 f"{', '.join(WINDOWS_EXPERIENCE_MODES)}"
             )
         self.contract = contract
+        self.api_config = api_config.with_credentials() if api_config is not None else None
+        if self.api_config is not None:
+            model = validate_api_model(model)
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.codex_bin = codex_bin
         self.plan_horizon = plan_horizon
         self.timeout_seconds = timeout_seconds
         self.background = background
-        self.adaptive_reasoning = adaptive_reasoning
+        # API model names and supported efforts are provider-specific. Never silently
+        # switch a paid API request to a Codex model or a stronger reasoning profile.
+        self.adaptive_reasoning = adaptive_reasoning and api_config is None
         self.experience_mode = experience_mode
         self.binary_resolver = binary_resolver
         self.session_factory = session_factory
         self.replans = 0
         self._turn_index = 0
         self._history: list[str] = []
-        self._session: CodexAppServerSession | None = None
+        self._session: CodexAppServerSession | ModelAPISession | None = None
+        self._api_stop_check: Callable[[], None] | None = None
         self._session_context_key: str | None = None
         self._session_turns = 0
         self._active_stage_id: str | None = None
@@ -384,7 +392,19 @@ class CodexWindowsAgent:
         else:
             self._escalation_level = 0
 
-    def _get_session(self) -> CodexAppServerSession:
+    def set_stop_check(self, check: Callable[[], None]) -> None:
+        self._api_stop_check = check
+        if isinstance(self._session, ModelAPISession):
+            self._session.stop_check = check
+
+    def _get_session(self) -> CodexAppServerSession | ModelAPISession:
+        if self._session is None and self.api_config is not None:
+            self._session = ModelAPISession(
+                self.api_config,
+                model=validate_api_model(self.model),
+                reasoning_effort=self.reasoning_effort,
+                stop_check=self._api_stop_check,
+            )
         if self._session is None:
             executable = self.binary_resolver(self.codex_bin)
             self._session = self.session_factory(
@@ -396,7 +416,7 @@ class CodexWindowsAgent:
             )
         return self._session
 
-    def _prepare_session(self) -> tuple[CodexAppServerSession, str, bool]:
+    def _prepare_session(self) -> tuple[CodexAppServerSession | ModelAPISession, str, bool]:
         context_key = self._active_stage_id or "bootstrap"
         reset_reason = "none"
         fresh_context = self._session is None

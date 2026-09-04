@@ -53,7 +53,14 @@
             </div>
             <div class="task-meta" id="task-meta">正在读取可用 Trace 经验…</div>
 
-            <div class="agent-settings">
+            <label class="field-label" for="model-provider">执行模型来源</label>
+            <div class="select-wrap">
+              <select id="model-provider">
+                <option value="codex" selected>Codex · 订阅登录</option>
+                <option value="api">模型 API · OpenAI 兼容接口</option>
+              </select>
+            </div>
+            <div class="agent-settings" id="codex-model-settings">
               <div>
                 <label class="field-label" for="model">执行 Agent 模型</label>
                 <div class="select-wrap">
@@ -75,6 +82,57 @@
                     <option value="max">Max · 最强</option>
                   </select>
                 </div>
+              </div>
+            </div>
+            <div id="api-model-settings" class="hidden">
+              <label class="field-label" for="api-base-url">API Base URL</label>
+              <input class="text-input" id="api-base-url" type="url"
+                value="https://api.openai.com/v1" autocomplete="off" spellcheck="false">
+              <div class="agent-settings">
+                <div>
+                  <label class="field-label" for="api-model">模型 ID</label>
+                  <input class="text-input" id="api-model" type="text" maxlength="200"
+                    placeholder="填写服务商提供的视觉模型 ID" autocomplete="off" spellcheck="false">
+                </div>
+                <div>
+                  <label class="field-label" for="api-reasoning-effort">API 思考强度</label>
+                  <div class="select-wrap">
+                    <select id="api-reasoning-effort">
+                      <option value="default">服务商默认 · 不传参数</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <label class="field-label" for="api-key">API Key</label>
+              <input class="text-input" id="api-key" type="password"
+                placeholder="输入密钥；可点击下方按钮加密保存"
+                autocomplete="off" spellcheck="false">
+              <div class="agent-settings">
+                <div>
+                  <label class="field-label" for="api-response-format">JSON 输出格式</label>
+                  <div class="select-wrap">
+                    <select id="api-response-format">
+                      <option value="json_schema">严格 JSON Schema</option>
+                      <option value="json_object">JSON Object · 兼容模式</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label class="field-label" for="api-timeout">每次请求超时（秒）</label>
+                  <input class="text-input" id="api-timeout" type="number"
+                    min="1" max="600" value="120">
+                </div>
+              </div>
+              <div class="agent-settings">
+                <button id="api-save-settings" class="mini-button primary" type="button">保存 API 配置</button>
+                <button id="api-clear-settings" class="mini-button danger" type="button">清除已保存配置</button>
+              </div>
+              <p id="api-settings-status" class="agent-settings-help" role="status" aria-live="polite"></p>
+              <div class="agent-settings-help">
+                模型必须支持图片输入。当前截图与相关经验将发给上述服务商，API 单独计费。
+                点击保存后，密钥由 Windows 当前账户加密保存在本机，不写入日志、任务包或浏览器存储。
+                不支持 JSON Schema 时可选兼容模式，动作仍经本地校验。
+                API 模式关闭自动模型升级；教师编译与经验修订仍使用 Codex。
               </div>
             </div>
             <div class="agent-settings-help">只影响每次任务的规划与执行；不会改变已经编译的经验。</div>

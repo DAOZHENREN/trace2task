@@ -18,6 +18,7 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
 )
+from trace2task.model_api import API_REASONING_EFFORTS, ModelAPIConfig, validate_api_model
 from trace2task.recording import TraceWriter, make_run_dir
 from trace2task.windows_agent import (
     WINDOWS_DECISION_TIMEOUT_SECONDS,
@@ -425,6 +426,7 @@ class WindowsAgentResult:
     verification_outcome: str = "not_run"
     verified: bool = False
     verification_receipt_path: str | None = None
+    provider: str = "codex"
 
 
 class WindowsAgentRunFailed(RuntimeError):
@@ -459,9 +461,17 @@ def run_windows_agent(
     adaptive_reasoning: bool = True,
     focus: bool = False,
     status_callback: Callable[[str], None] = print,
+    api_config: ModelAPIConfig | None = None,
 ) -> WindowsAgentResult:
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
+    provider = "api" if api_config is not None else "codex"
+    if api_config is not None:
+        api_config = api_config.with_credentials()
+        model = validate_api_model(model)
+        if reasoning_effort not in API_REASONING_EFFORTS:
+            raise ValueError("Unsupported API reasoning effort")
+        adaptive_reasoning = False
     contract = load_windows_task(task_path)
     if instruction is not None:
         contract = contract.with_instruction(instruction)
@@ -490,6 +500,7 @@ def run_windows_agent(
             plan_horizon=plan_horizon,
             background=background,
             adaptive_reasoning=adaptive_reasoning,
+            api_config=api_config,
         )
     )
 
@@ -500,6 +511,8 @@ def run_windows_agent(
             if not window.is_visible or window.is_minimized:
                 raise RuntimeError("Windows Agent target must be visible and unminimized")
             status_callback(
+                f"Requesting an API multimodal plan (timeout {api_config.timeout_seconds:g}s)..."
+                if api_config is not None else
                 "Requesting a multimodal plan. Network interruptions are retried "
                 f"automatically for up to {WINDOWS_DECISION_TIMEOUT_SECONDS:g} seconds..."
             )
@@ -546,6 +559,7 @@ def run_windows_agent(
             )
             return WindowsAgentResult(
                 mode="windows_agent_dry_run",
+                provider=provider,
                 task_id=contract.task.task_id,
                 execute=False,
                 task_complete=plan.task_complete,
@@ -580,6 +594,8 @@ def run_windows_agent(
             agent.close()
 
     active_emergency = emergency_stop or Win32EmergencyStop()
+    if api_config is not None and isinstance(agent, CodexWindowsAgent):
+        agent.set_stop_check(active_emergency.raise_if_requested)
     run_started = time.perf_counter()
     writer: TraceWriter | None = None
     executed_actions = 0
@@ -711,7 +727,7 @@ def run_windows_agent(
             make_run_dir(output_root, "windows-agent"),
             task_id=contract.task.task_id,
             seed=0,
-            source="codex_windows_agent",
+            source=f"{provider}_windows_agent",
         )
         writer.record(
             "start",
@@ -724,6 +740,7 @@ def run_windows_agent(
                 "emergency_hotkey": "f9",
                 "input_mode": "background" if background else "foreground",
                 "model": model,
+                "provider": provider,
                 "reasoning_effort": reasoning_effort,
                 "adaptive_reasoning": adaptive_reasoning,
                 "plan_horizon": plan_horizon,
@@ -777,7 +794,11 @@ def run_windows_agent(
                 total_capture_ms += plan_capture_ms
             status_callback(
                 f"[plan {agent.replans + 1}] Requesting a multimodal decision; "
-                "Codex network reconnects are allowed to finish..."
+                + (
+                    f"API timeout {api_config.timeout_seconds:g}s..."
+                    if api_config is not None
+                    else "Codex network reconnects are allowed to finish..."
+                )
             )
             planning_started = time.perf_counter()
             plan = agent.plan(surface)
@@ -1197,6 +1218,7 @@ def run_windows_agent(
             writer = None
             result = WindowsAgentResult(
                 mode="windows_agent",
+                provider=provider,
                 task_id=contract.task.task_id,
                 execute=True,
                 task_complete=False,
@@ -1241,6 +1263,7 @@ def run_windows_agent(
         performance, stage_timings = performance_snapshot()
         return WindowsAgentResult(
             mode="windows_agent",
+            provider=provider,
             task_id=contract.task.task_id,
             execute=True,
             task_complete=False,
@@ -1330,6 +1353,7 @@ def run_windows_agent(
     )
     return WindowsAgentResult(
         mode="windows_agent",
+        provider=provider,
         task_id=contract.task.task_id,
         execute=True,
         task_complete=task_complete,

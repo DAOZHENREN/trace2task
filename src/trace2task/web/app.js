@@ -3,6 +3,18 @@ const elements = {
   taskpack: document.querySelector("#taskpack"),
   taskMeta: document.querySelector("#task-meta"),
   model: document.querySelector("#model"),
+  modelProvider: document.querySelector("#model-provider"),
+  codexModelSettings: document.querySelector("#codex-model-settings"),
+  apiModelSettings: document.querySelector("#api-model-settings"),
+  apiBaseUrl: document.querySelector("#api-base-url"),
+  apiModel: document.querySelector("#api-model"),
+  apiKey: document.querySelector("#api-key"),
+  apiReasoningEffort: document.querySelector("#api-reasoning-effort"),
+  apiResponseFormat: document.querySelector("#api-response-format"),
+  apiTimeout: document.querySelector("#api-timeout"),
+  apiSaveSettings: document.querySelector("#api-save-settings"),
+  apiClearSettings: document.querySelector("#api-clear-settings"),
+  apiSettingsStatus: document.querySelector("#api-settings-status"),
   reasoningEffort: document.querySelector("#reasoning-effort"),
   inputMode: document.querySelector("#input-mode"),
   inputModeHelp: document.querySelector("#input-mode-help"),
@@ -89,6 +101,9 @@ const modelLabels = {
 };
 
 const effortLabels = {
+  default: "服务商默认",
+  none: "None · 不推理",
+  minimal: "Minimal · 最少",
   low: "Low · 快速",
   medium: "Medium · 平衡",
   high: "High · 深入",
@@ -344,8 +359,119 @@ function populateTaskpacks(records) {
   renderLibrary();
 }
 
+let modelApiAvailable = false;
+let apiSettingsAvailable = false;
+let apiSettingsInitialized = false;
+let savedAPISettings = null;
+
+function apiFormEndpoint() {
+  const base = elements.apiBaseUrl.value.trim().replace(/\/+$/, "");
+  return base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+}
+
+function renderAPISettingsStatus() {
+  const savedBase = savedAPISettings?.base_url?.replace(/\/+$/, "") || "";
+  const savedEndpoint = savedBase.endsWith("/chat/completions")
+    ? savedBase : `${savedBase}/chat/completions`;
+  const reusableKey = savedAPISettings?.has_saved_key && savedEndpoint === apiFormEndpoint();
+  elements.apiKey.placeholder = reusableKey
+    ? "已安全保存；留空复用，输入新 Key 可替换"
+    : "输入密钥；留空则读取服务端 TRACE2TASK_API_KEY";
+  elements.apiSettingsStatus.textContent = !apiSettingsAvailable
+    ? "后台尚未支持保存配置，请重启网页后台后刷新。"
+    : savedAPISettings?.error || (savedAPISettings?.has_saved_key && !reusableKey
+      ? "API 地址已变化，旧密钥不会用于新地址；请重新输入密钥。"
+      : reusableKey
+        ? "API 配置和密钥已保存；刷新或重启后可直接复用，密钥不会回显。"
+        : savedAPISettings?.saved
+          ? "API 配置已保存；未保存密钥，可使用服务器环境变量。"
+          : "尚未保存 API 配置。填写后点击保存，下次不必重新输入。");
+  if (apiSettingsAvailable && !savedAPISettings?.secure_key_storage) {
+    elements.apiSettingsStatus.textContent += " 此系统暂不支持密钥加密保存，请留空并使用环境变量。";
+  }
+}
+
+async function saveAPISettings() {
+  if (isBusy()) return;
+  if (!apiSettingsAvailable) return showError("请重启网页后台后刷新，以启用 API 配置保存。");
+  clearError();
+  setBusy(true);
+  try {
+    savedAPISettings = await request("/api/model-settings/save", {
+      method: "POST",
+      body: JSON.stringify({
+        base_url: elements.apiBaseUrl.value.trim(),
+        model: elements.apiModel.value.trim(),
+        reasoning_effort: elements.apiReasoningEffort.value,
+        api_key: elements.apiKey.value,
+        response_format: elements.apiResponseFormat.value,
+        timeout_seconds: Number(elements.apiTimeout.value),
+      }),
+    });
+    elements.apiKey.value = "";
+    renderAPISettingsStatus();
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearAPISettings() {
+  if (isBusy() || !apiSettingsAvailable) return;
+  if (!window.confirm("清除本机保存的 API 配置和加密密钥？不会删除任务、经验或环境变量。")) return;
+  clearError();
+  setBusy(true);
+  try {
+    savedAPISettings = await request("/api/model-settings/clear", {
+      method: "POST", body: "{}",
+    });
+    elements.apiKey.value = "";
+    renderAPISettingsStatus();
+    elements.apiSettingsStatus.textContent = "已清除保存的配置和密钥。当前表单未保存，环境变量不受影响。";
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function usesModelApi() {
+  return elements.modelProvider.value === "api";
+}
+
+function syncProviderFields() {
+  elements.codexModelSettings.classList.toggle("hidden", usesModelApi());
+  elements.apiModelSettings.classList.toggle("hidden", !usesModelApi());
+  elements.adaptiveReasoning.disabled = isBusy() || usesModelApi();
+}
+
 function populateAgentOptions(options) {
   if (!options) return;
+  modelApiAvailable = Boolean(options.api_defaults);
+  const previousApiEffort = elements.apiReasoningEffort.value || "default";
+  elements.apiReasoningEffort.replaceChildren();
+  (options.api_defaults?.reasoning_efforts || ["default"]).forEach((effort) => {
+    const option = document.createElement("option");
+    option.value = effort;
+    option.textContent = effort === "default"
+      ? "服务商默认 · 不传参数" : effortLabels[effort] || effort;
+    elements.apiReasoningEffort.append(option);
+  });
+  elements.apiReasoningEffort.value = previousApiEffort;
+  apiSettingsAvailable = Boolean(options.api_defaults?.saved_settings);
+  savedAPISettings = options.api_defaults?.saved_settings || null;
+  if (!apiSettingsInitialized && savedAPISettings?.saved) {
+    elements.apiBaseUrl.value = savedAPISettings.base_url;
+    elements.apiModel.value = savedAPISettings.model;
+    elements.apiReasoningEffort.value = savedAPISettings.reasoning_effort;
+    elements.apiResponseFormat.value = savedAPISettings.response_format;
+    elements.apiTimeout.value = savedAPISettings.timeout_seconds;
+    elements.modelProvider.value = "api";
+  }
+  apiSettingsInitialized = true;
+  renderAPISettingsStatus();
+  syncProviderFields();
   if (!elements.waaRoot.value.trim() && options.waa_defaults?.root) {
     elements.waaRoot.value = options.waa_defaults.root;
   }
@@ -1831,9 +1957,14 @@ function setBusy(busy) {
   elements.executeButton.disabled = busy || (task ? !canExecuteTask(task) : !canAutoExecute());
   elements.taskpack.disabled = busy;
   elements.model.disabled = busy;
+  [
+    elements.modelProvider, elements.apiBaseUrl, elements.apiModel, elements.apiKey,
+    elements.apiReasoningEffort, elements.apiResponseFormat, elements.apiTimeout,
+    elements.apiSaveSettings, elements.apiClearSettings,
+  ].forEach((element) => { element.disabled = busy; });
   elements.reasoningEffort.disabled = busy;
   elements.inputMode.disabled = busy;
-  elements.adaptiveReasoning.disabled = busy;
+  elements.adaptiveReasoning.disabled = busy || usesModelApi();
   elements.instruction.disabled = busy;
   elements.viewTabs.forEach((button) => { button.disabled = busy; });
   elements.recordSource.disabled = busy;
@@ -1876,7 +2007,9 @@ function renderJob(job) {
         ? "经验修订"
         : job.mode === "execute" ? "执行" : "预演";
   elements.jobTask.textContent = job.task_id;
-  elements.jobModel.textContent = modelLabels[job.model] || job.model || "—";
+  elements.jobModel.textContent = job.provider === "api"
+    ? `API · ${job.model || "—"}`
+    : modelLabels[job.model] || job.model || "—";
   elements.jobEffort.textContent = effortLabels[job.reasoning_effort] || job.reasoning_effort || "—";
   elements.jobInstruction.textContent = job.instruction;
   elements.jobLog.replaceChildren();
@@ -2360,11 +2493,27 @@ async function startJob(mode) {
   if (dictationSession) return showError("请先结束语音输入并等待转写完成");
   const task = selectedTask();
   const instruction = elements.instruction.value.trim();
-  const model = elements.model.value;
-  const reasoningEffort = elements.reasoningEffort.value;
+  const provider = elements.modelProvider.value;
+  if (usesModelApi() && !modelApiAvailable) {
+    return showError("页面已更新，但后台仍是旧版本。请停止并重启本地 trace2task web，再刷新页面后使用模型 API。");
+  }
+  const model = usesModelApi() ? elements.apiModel.value.trim() : elements.model.value;
+  const reasoningEffort = usesModelApi()
+    ? elements.apiReasoningEffort.value : elements.reasoningEffort.value;
   const inputMode = elements.inputMode.value;
-  const adaptiveReasoning = elements.adaptiveReasoning.checked;
+  const adaptiveReasoning = !usesModelApi() && elements.adaptiveReasoning.checked;
   if (!instruction) return showError("请输入一条任务指令");
+  if (!model) return showError("请输入 API 视觉模型 ID");
+  const apiOptions = usesModelApi() ? {
+    base_url: elements.apiBaseUrl.value.trim(),
+    api_key: elements.apiKey.value,
+    response_format: elements.apiResponseFormat.value,
+    timeout_seconds: Number(elements.apiTimeout.value),
+  } : undefined;
+  if (apiOptions && (!apiOptions.base_url || !Number.isFinite(apiOptions.timeout_seconds)
+      || apiOptions.timeout_seconds < 1 || apiOptions.timeout_seconds > 600)) {
+    return showError("请填写 API 地址，并将超时设为 1 到 600 秒");
+  }
   if (mode === "execute") {
     let executionTask = task;
     let routeSummary = "手动选择经验";
@@ -2394,6 +2543,8 @@ async function startJob(mode) {
         instruction,
         mode,
         model,
+        provider,
+        api: apiOptions,
         reasoning_effort: reasoningEffort,
         input_mode: inputMode,
         adaptive_reasoning: adaptiveReasoning,
@@ -2460,6 +2611,10 @@ elements.instruction.addEventListener("input", () => {
   elements.charCount.textContent = `${elements.instruction.value.length} / 2000`;
 });
 elements.planButton.addEventListener("click", () => startJob("plan"));
+elements.modelProvider.addEventListener("change", syncProviderFields);
+elements.apiBaseUrl.addEventListener("input", renderAPISettingsStatus);
+elements.apiSaveSettings.addEventListener("click", saveAPISettings);
+elements.apiClearSettings.addEventListener("click", clearAPISettings);
 elements.executeButton.addEventListener("click", () => startJob("execute"));
 elements.stopButton.addEventListener("click", stopJob);
 elements.taskDetailBack.addEventListener("click", () => {

@@ -190,7 +190,7 @@ Narrated demonstration audio follows the separate, explicit Trace archive flow.
 - Python 3.11 or newer.
 - [`uv`](https://docs.astral.sh/uv/).
 - A local Codex installation signed in with a ChatGPT subscription for model-backed compilation and
-  execution. An OpenAI API key is not required for this adapter.
+  feedback revision. Execution can use Codex (the default, no API key required) or a vision model API.
 - A microphone only if narration or voice dictation is needed.
 
 Whisper Turbo is downloaded on first use into `.cache/faster-whisper/` and then reused. The model is
@@ -218,6 +218,39 @@ codex login
 
 Trace2Task also discovers the versioned `codex.exe` bundled with the ChatGPT/Codex Windows desktop
 app when the normal terminal `PATH` entry is unavailable.
+
+## Execute through a model API
+
+The Windows execution Agent supports **OpenAI-compatible Chat Completions APIs**. Trace evidence,
+compiled states, human feedback, multi-action planning, action validation, effect verification,
+and run logs use the existing pipeline. Compiler/Revision Agents and WAA commands still use Codex.
+
+In **Execute task**, select **Model API** as the execution model source:
+
+- **Base URL**: the provider's API root, normally ending in `/v1`; `/chat/completions` is appended unless already present.
+- **Model ID**: any provider model ID. The provider must support image input and JSON output; Codex subscription aliases are not API model IDs.
+- **API Key**: enter in the password field, or set `TRACE2TASK_API_KEY` before starting the console. Only the official `api.openai.com` endpoint additionally falls back to `OPENAI_API_KEY`. Keys are not written to task packs, run logs, or browser storage.
+- **Reasoning**: start with **Provider default** (omit the parameter); explicit effort requires support by the chosen API/model.
+- **Output format**: prefer `json_schema`; select `json_object` if the provider lacks strict structured outputs. Local action validation still applies.
+
+Try **Plan only** first. Screenshots and experience are sent to the selected provider, with API billing separate from ChatGPT subscriptions. API mode never silently changes models. Invalid, refused, or truncated plans are rejected; transport failures are not automatically retried. During execution, stop/F9 discards late responses but cannot guarantee cancellation of requests already processing at the provider. Remote endpoints require HTTPS; HTTP is permitted only for loopback services.
+
+Click **Save API configuration** to remember the URL, model, effort, output format, timeout and key across reloads and restarts. On Windows the key is encrypted with current-user [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata) in `%LOCALAPPDATA%\Trace2Task\model-api.json`, outside the repository. The page only shows whether a key is saved. Leave the field blank to reuse it for the same endpoint; changing endpoints requires re-entering the key. **Clear saved configuration** removes this profile, not tasks or environment variables. Non-Windows hosts can save preferences without a key and use environment variables; there is no plaintext-key fallback. DPAPI does not protect against malicious processes already running as your Windows account.
+
+For HTTP 400, read the sanitized provider detail and reported `format` / `reasoning` settings. Try `json_object` and provider-default reasoning when the endpoint lacks strict-schema or reasoning-parameter support. A model name alone does not establish protocol or vision support. Error details are bounded and credentials, URLs, and image data are redacted; raw HTTP bodies are not saved.
+
+CLI example (replace URL, model and task path; the key is read without adding it to shell history):
+
+~~~powershell
+$env:TRACE2TASK_API_KEY = [System.Net.NetworkCredential]::new("", (Read-Host "Model API Key" -AsSecureString)).Password
+uv run trace2task windows agent --task "path\to\task.yaml" --provider api --api-base-url "https://your-provider.example/v1" --model "your-vision-model" --reasoning-effort default
+~~~
+
+Add `--execute` when ready. Optional flags: `--api-key-env CUSTOM_KEY_VARIABLE`, `--api-response-format json_object`, `--api-timeout 180`.
+
+After code updates, stop the old console with **Ctrl+C** and restart it; refreshing the page does not reload Python. If port 8765 is used by a server tunnel, run `uv run trace2task web --port 8766` and open [the local console](http://127.0.0.1:8766/).
+
+Protocol references: [image input](https://developers.openai.com/api/docs/guides/images-vision) and [structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs).
 
 ## Recommended web-console flow
 
@@ -628,7 +661,7 @@ capture.
   make it unavailable.
 - Trace2Task does not attempt to bypass anti-cheat or software that intentionally rejects synthetic
   input.
-- Screenshots used for model planning are sent through the signed-in Codex service. Do not run tasks
+- Screenshots used for model planning are sent through Codex or the selected model API. Do not run tasks
   on content you do not want that model to process.
 - `reviewed_reference_frame` is model-assisted and is deliberately reported as unverified. A
   `pixel_reference` match is independent of the model but still proves pixels, not a backend business

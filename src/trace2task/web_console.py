@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import yaml
 
 from trace2task import __version__
+from trace2task.api_settings import APISettingsStore
 from trace2task.codex_app_server import (
     CODEX_MODELS,
     CODEX_REASONING_EFFORTS,
@@ -37,6 +38,12 @@ from trace2task.codex_app_server import (
 )
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.experience import route_experience
+from trace2task.model_api import (
+    API_REASONING_EFFORTS,
+    DEFAULT_API_BASE_URL,
+    ModelAPIConfig,
+    validate_api_model,
+)
 from trace2task.narration import (
     MAX_NARRATION_AUDIO_BYTES,
     NARRATION_AUDIO_EXTENSIONS,
@@ -352,6 +359,7 @@ class ConsoleJob:
     mode: str
     model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT
+    provider: str = "codex"
     selection_mode: str = "manual"
     selection_confidence: float | None = None
     selection_reason: str | None = None
@@ -377,6 +385,7 @@ class ConsoleJob:
             "mode": self.mode,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "provider": self.provider,
             "selection_mode": self.selection_mode,
             "selection_confidence": self.selection_confidence,
             "selection_reason": self.selection_reason,
@@ -463,8 +472,10 @@ class WebConsoleController:
         *,
         runner: Runner = run_windows_agent,
         narration_transcriber: TurboTranscriber | None = None,
+        api_settings_store: APISettingsStore | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
+        self.api_settings = api_settings_store or APISettingsStore()
         self.task_root = (self.project_root / "taskpacks").resolve()
         self.candidate_root = (self.project_root / "runs" / "candidates").resolve()
         self._cleanup_pending_deletions()
@@ -918,18 +929,38 @@ class WebConsoleController:
         reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
         background: bool = False,
         adaptive_reasoning: bool = True,
+        provider: str = "codex",
+        api_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
         if not normalized_instruction:
             raise ValueError("请输入一条任务指令")
         if len(normalized_instruction) > 2_000:
             raise ValueError("任务指令不能超过 2000 个字符")
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        if provider not in {"codex", "api"}:
+            raise ValueError("执行模型来源必须是 codex 或 api")
         if not isinstance(background, bool) or not isinstance(adaptive_reasoning, bool):
             raise TypeError("输入模式和自适应推理设置必须是布尔值")
+        api_config = None
+        if provider == "api":
+            if not isinstance(api_options, dict):
+                raise ValueError("请配置模型 API 连接")
+            api_config = self.api_settings.with_saved_key(ModelAPIConfig(
+                base_url=api_options.get("base_url", DEFAULT_API_BASE_URL),
+                api_key=api_options.get("api_key", ""),
+                response_format=api_options.get("response_format", "json_schema"),
+                timeout_seconds=api_options.get("timeout_seconds", 120),
+            )).with_credentials()
+            model = validate_api_model(model)
+            adaptive_reasoning = False
+        if provider == "codex" and model not in CODEX_MODELS:
+            raise ValueError(
+                f"当前是 Codex 模式，不支持的模型：{model}。"
+                "自定义 API 模型请先将“执行模型来源”切换为“模型 API”。"
+            )
+        allowed_efforts = API_REASONING_EFFORTS if provider == "api" else CODEX_REASONING_EFFORTS
+        if reasoning_effort not in allowed_efforts:
+            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         if isinstance(task_path, str) and task_path.strip():
             resolved_task = self._resolve_task_path(task_path)
             selection_mode = "manual"
@@ -961,6 +992,7 @@ class WebConsoleController:
                 mode="execute" if execute else "plan",
                 model=model,
                 reasoning_effort=reasoning_effort,
+                provider=provider,
                 selection_mode=selection_mode,
                 selection_confidence=selection_confidence,
                 selection_reason=selection_reason,
@@ -976,7 +1008,7 @@ class WebConsoleController:
             self._active_job_id = job.job_id
         thread = threading.Thread(
             target=self._run_job,
-            args=(job, resolved_task, execute),
+            args=(job, resolved_task, execute, api_config),
             name=f"trace2task-web-{job.job_id[:8]}",
             daemon=True,
         )
@@ -3140,7 +3172,10 @@ class WebConsoleController:
                 log=f"任务结构修订失败：{type(error).__name__}: {error}",
             )
 
-    def _run_job(self, job: ConsoleJob, task_path: Path, execute: bool) -> None:
+    def _run_job(
+        self, job: ConsoleJob, task_path: Path, execute: bool,
+        api_config: ModelAPIConfig | None = None,
+    ) -> None:
         self._update(job, status="running", log="任务已启动。")
         try:
             kwargs: dict[str, Any] = {
@@ -3154,6 +3189,8 @@ class WebConsoleController:
                 "focus": not execute and not job.background,
                 "status_callback": lambda message: self._update(job, log=message),
             }
+            if api_config is not None:
+                kwargs["api_config"] = api_config
             if execute and self.runner is run_windows_agent:
                 kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
             run_failure: Exception | None = None
@@ -3253,6 +3290,7 @@ class WebConsoleController:
             "execution_trace": trace_path.relative_to(self.project_root).as_posix(),
             "model": job.model,
             "reasoning_effort": job.reasoning_effort,
+            "provider": job.provider,
             "input_mode": "background" if job.background else "foreground",
             "adaptive_reasoning": job.adaptive_reasoning,
             "outcome": outcome,
@@ -3351,6 +3389,11 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     "candidates": self.controller.list_candidates(),
                     "active_job": self.controller.active_job(),
                     "agent_options": {
+                        "api_defaults": {
+                            "base_url": DEFAULT_API_BASE_URL,
+                            "reasoning_efforts": list(API_REASONING_EFFORTS),
+                            "saved_settings": self.controller.api_settings.public_settings(),
+                        },
                         "models": list(CODEX_MODELS),
                         "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
                         "defaults": {
@@ -3450,7 +3493,25 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     else MAX_REQUEST_BYTES
                 )
             )
+            if parsed.path in {"/api/model-settings/save", "/api/model-settings/clear"}:
+                self._require_api_same_origin()
+                if parsed.path.endswith("/clear"):
+                    self._json(self.controller.api_settings.clear())
+                else:
+                    config = ModelAPIConfig(
+                        base_url=payload.get("base_url", DEFAULT_API_BASE_URL),
+                        api_key=payload.get("api_key", ""),
+                        response_format=payload.get("response_format", "json_schema"),
+                        timeout_seconds=payload.get("timeout_seconds", 120),
+                    )
+                    self._json(self.controller.api_settings.save(
+                        config, model=payload.get("model", ""),
+                        reasoning_effort=payload.get("reasoning_effort", "default"),
+                    ))
+                return
             if parsed.path == "/api/jobs":
+                if payload.get("provider") == "api":
+                    self._require_api_same_origin()
                 result = self.controller.start_job(
                     task_path=payload.get("task_path", ""),
                     instruction=payload.get("instruction", ""),
@@ -3461,6 +3522,8 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     ),
                     background=payload.get("input_mode") == "background",
                     adaptive_reasoning=payload.get("adaptive_reasoning", True),
+                    provider=payload.get("provider", "codex"),
+                    api_options=payload.get("api"),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
@@ -3647,6 +3710,18 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 HTTPStatus.CONFLICT,
                 f"本地文件操作失败：{type(error).__name__}: {error}",
             )
+
+    def _require_api_same_origin(self) -> None:
+        # Prevent cross-origin form posts/DNS rebinding from using server credentials.
+        port = self.server.server_address[1]
+        host = self.headers.get("Host", "")
+        if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+            raise ValueError("模型 API 请求必须通过本机控制台访问")
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != f"http://{host}":
+            raise ValueError("不允许跨站提交模型 API 请求")
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError("模型 API 请求必须使用 application/json")
 
     def _read_json(self, *, max_bytes: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length", "0")
