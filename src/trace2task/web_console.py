@@ -365,6 +365,7 @@ class ConsoleJob:
     selection_reason: str | None = None
     kind: str = "agent"
     narrated: bool = False
+    defer_compilation: bool = False
     background: bool = False
     adaptive_reasoning: bool = True
     status: str = "queued"
@@ -391,6 +392,7 @@ class ConsoleJob:
             "selection_reason": self.selection_reason,
             "kind": self.kind,
             "narrated": self.narrated,
+            "defer_compilation": self.defer_compilation,
             "input_mode": "background" if self.background else "foreground",
             "adaptive_reasoning": self.adaptive_reasoning,
             "status": self.status,
@@ -1021,6 +1023,7 @@ class WebConsoleController:
         handle: int,
         task_id: str,
         narrated: bool = False,
+        defer_compilation: bool = False,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
     ) -> dict[str, Any]:
@@ -1037,6 +1040,8 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
+        if not isinstance(defer_compilation, bool):
+            raise TypeError("稍后编译开关必须是布尔值")
         windows = self.list_windows()
         selected = next((window for window in windows if window["handle"] == handle), None)
         if selected is None:
@@ -1052,6 +1057,7 @@ class WebConsoleController:
                 mode="record",
                 kind="recording",
                 narrated=narrated,
+                defer_compilation=defer_compilation,
                 model=model,
                 reasoning_effort=reasoning_effort,
             )
@@ -1073,6 +1079,7 @@ class WebConsoleController:
         example_path: object,
         task_id: str,
         narrated: bool = True,
+        defer_compilation: bool = False,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
         distro: str = DEFAULT_WAA_DISTRO,
@@ -1091,6 +1098,8 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
+        if not isinstance(defer_compilation, bool):
+            raise TypeError("稍后编译开关必须是布尔值")
         if not isinstance(waa_root, (str, Path)):
             raise TypeError("WAA 根目录必须是路径")
         root = Path(waa_root).expanduser().resolve()
@@ -1142,6 +1151,7 @@ class WebConsoleController:
                 mode="record",
                 kind="waa_recording",
                 narrated=narrated,
+                defer_compilation=defer_compilation,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 result={
@@ -1388,7 +1398,11 @@ class WebConsoleController:
                     if mime_type is None and isinstance(pending.get("mime_type"), str):
                         mime_type = pending["mime_type"]
             job.status = "queued"
-            job.logs.append("讲解已提交，正在归档并准备 Compiler Agent。")
+            job.logs.append(
+                "讲解已提交，正在归档录制。"
+                if job.defer_compilation
+                else "讲解已提交，正在归档并准备 Compiler Agent。"
+            )
             job.updated_at = _now()
 
         try:
@@ -1416,6 +1430,9 @@ class WebConsoleController:
             "audio_start_trace_elapsed_ms": audio_start_trace_elapsed_ms,
         }
         self._update(job, result=payload)
+        if job.defer_compilation:
+            self._finish_deferred_recording(job, payload)
+            return job.snapshot()
         thread = threading.Thread(
             target=self._run_recording_compilation,
             args=(job, trace_path, payload),
@@ -2690,10 +2707,17 @@ class WebConsoleController:
                         status="awaiting_narration",
                         result=payload,
                         log=(
-                            "示范录制成功。请回到网页检查讲解转写；确认后才会启动 "
-                            "Compiler Agent。"
+                            "示范录制成功。请回到网页检查讲解转写；"
+                            + (
+                                "确认后将保存录制，稍后可手动编译。"
+                                if job.defer_compilation
+                                else "确认后才会启动 Compiler Agent。"
+                            )
                         ),
                     )
+                    return
+                if job.defer_compilation:
+                    self._finish_deferred_recording(job, payload)
                     return
                 self._update(
                     job,
@@ -2919,6 +2943,9 @@ class WebConsoleController:
                         log="WAA 示范成功；正在停止麦克风并准备 Turbo 转写。",
                     )
                     return
+                if job.defer_compilation:
+                    self._finish_deferred_recording(job, payload)
+                    return
                 self._update(
                     job,
                     result=payload,
@@ -2945,6 +2972,22 @@ class WebConsoleController:
             installed_reset_spec.unlink(missing_ok=True)
             if process is not None and process.poll() is None:
                 process.terminate()
+
+    def _finish_deferred_recording(
+        self,
+        job: ConsoleJob,
+        payload: dict[str, Any],
+    ) -> None:
+        payload["compilation"] = {"status": "deferred"}
+        self._update(
+            job,
+            status="completed",
+            result=payload,
+            log=(
+                "录制已完整保存，本次未启动 Compiler Agent；"
+                "可在“本地经验”的原始录制列表中稍后编译。"
+            ),
+        )
 
     def _run_recording_compilation(
         self,
@@ -3383,6 +3426,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "voice_dictation": True,
                         "waa_narrated_recording": True,
                         "waa_task_catalog": True,
+                        "deferred_recording_compilation": True,
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
@@ -3537,6 +3581,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     handle=payload.get("handle"),
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", False),
+                    defer_compilation=payload.get("defer_compilation", False),
                     model=payload.get("model", DEFAULT_COMPILER_MODEL),
                     reasoning_effort=payload.get(
                         "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
@@ -3550,6 +3595,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     example_path=payload.get("example_path", ""),
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", True),
+                    defer_compilation=payload.get("defer_compilation", False),
                     model=payload.get("model", DEFAULT_COMPILER_MODEL),
                     reasoning_effort=payload.get(
                         "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT

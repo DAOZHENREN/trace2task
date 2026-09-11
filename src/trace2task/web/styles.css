@@ -304,6 +304,7 @@ select:focus, textarea:focus {
 .toggle-option strong { font-size: 10px; }
 .toggle-option small { color: var(--muted); font-size: 8px; line-height: 1.35; }
 .narration-toggle { margin-top: 16px; }
+.deferred-compilation-toggle { margin-top: 10px; }
 
 .instruction-label { margin-top: 24px; }
 

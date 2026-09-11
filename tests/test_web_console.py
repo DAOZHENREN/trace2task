@@ -1009,6 +1009,100 @@ def test_narrated_recording_waits_for_review_then_archives_and_compiles(
         controller.submit_recording_narration(job.job_id, transcript="重复提交")
 
 
+@pytest.mark.parametrize("kind", ["recording", "waa_recording"])
+def test_narrated_recording_can_be_saved_for_later_compilation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, run_name="deferred-narration")
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+    job = ConsoleJob(
+        job_id="deferred-narration-job",
+        task_path="",
+        task_id="稍后编译的讲解示范",
+        instruction="录制带讲解的示范",
+        mode="record",
+        kind=kind,
+        narrated=True,
+        defer_compilation=True,
+        status="awaiting_narration",
+        result={"trace_path": str(trace_path), "success": True},
+    )
+    controller._jobs[job.job_id] = job
+    controller._active_job_id = job.job_id
+    compiled = threading.Event()
+    monkeypatch.setattr(
+        controller,
+        "_run_recording_compilation",
+        lambda *args: compiled.set(),
+    )
+
+    submitted = controller.submit_recording_narration(
+        job.job_id,
+        transcript="先打开菜单，再保存结果。",
+        segments=[{"start_ms": 0, "end_ms": 900, "text": "先打开菜单"}],
+        transcription_engine="faster_whisper:turbo",
+    )
+
+    assert submitted["status"] == "completed"
+    assert submitted["defer_compilation"] is True
+    assert submitted["result"]["compilation"] == {"status": "deferred"}
+    assert not compiled.is_set()
+    narration = json.loads(
+        (trace_path.parent / "narration.json").read_text(encoding="utf-8")
+    )
+    assert narration["transcript"] == "先打开菜单，再保存结果。"
+    assert "稍后编译" in submitted["logs"][-1]
+
+
+def test_non_narrated_recording_can_be_saved_without_starting_compiler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace_path = _write_windows_recording(tmp_path, run_name="deferred-trace")
+
+    @dataclass
+    class FakeRecordingResult:
+        trace_path: str
+        success: bool = True
+
+    monkeypatch.setattr(web_console, "Win32Backend", lambda: object())
+    monkeypatch.setattr(web_console, "GdiWindowCapture", lambda: object())
+    monkeypatch.setattr(web_console, "ConsoleRecordingMonitor", lambda event: object())
+    monkeypatch.setattr(
+        web_console,
+        "record_window_trace",
+        lambda *args, **kwargs: FakeRecordingResult(str(trace_path)),
+    )
+    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
+    monkeypatch.setattr(
+        controller,
+        "_run_recording_compilation",
+        lambda *args: pytest.fail("deferred recording unexpectedly started compilation"),
+    )
+    job = ConsoleJob(
+        job_id="deferred-trace-job",
+        task_path="",
+        task_id="稍后编译的纯 Trace",
+        instruction="录制纯 Trace 示范",
+        mode="record",
+        kind="recording",
+        defer_compilation=True,
+    )
+
+    controller._run_recording(
+        job,
+        42,
+        {"process_name": "notepad.exe", "title": "Notepad"},
+    )
+
+    assert job.status == "completed"
+    assert job.result is not None
+    assert job.result["compilation"] == {"status": "deferred"}
+    assert "稍后编译" in job.logs[-1]
+
+
 def test_narrated_recording_can_be_discarded_while_waiting_for_review(
     tmp_path: Path,
 ) -> None:
@@ -2508,6 +2602,9 @@ def test_web_server_serves_console_state_and_job_api(
     assert "/api/recordings/narration" in javascript
     assert "/api/recordings/transcribe" in javascript
     assert "/api/waa/recordings" in javascript
+    assert 'id="record-defer-compilation"' in html
+    assert "defer_compilation: deferCompilation" in javascript
+    assert "elements.recordDeferCompilation.disabled = busy" in javascript
     assert "/api/waa/recordings/go" in javascript
     assert "/api/waa/tasks" in javascript
     assert "/api/transcribe" in javascript
@@ -2538,6 +2635,7 @@ def test_web_server_serves_console_state_and_job_api(
         "voice_dictation": True,
         "waa_narrated_recording": True,
         "waa_task_catalog": True,
+        "deferred_recording_compilation": True,
         }
     assert waa_tasks["tasks"] == [
         {"id": "waa-task", "example_path": "example.json"}
