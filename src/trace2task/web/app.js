@@ -52,6 +52,7 @@ const elements = {
   recordModel: document.querySelector("#record-model"),
   recordReasoningEffort: document.querySelector("#record-reasoning-effort"),
   recordNarration: document.querySelector("#record-narration"),
+  recordDeferCompilation: document.querySelector("#record-defer-compilation"),
   narrationReview: document.querySelector("#narration-review"),
   narrationTranscript: document.querySelector("#narration-transcript"),
   narrationStatus: document.querySelector("#narration-status"),
@@ -1975,6 +1976,7 @@ function setBusy(busy) {
   elements.recordModel.disabled = busy;
   elements.recordReasoningEffort.disabled = busy;
   elements.recordNarration.disabled = busy;
+  elements.recordDeferCompilation.disabled = busy;
   elements.compilerModel.disabled = busy;
   elements.compilerReasoningEffort.disabled = busy;
   elements.refreshWindows.disabled = busy;
@@ -2012,6 +2014,9 @@ function renderJob(job) {
     : modelLabels[job.model] || job.model || "—";
   elements.jobEffort.textContent = effortLabels[job.reasoning_effort] || job.reasoning_effort || "—";
   elements.jobInstruction.textContent = job.instruction;
+  elements.narrationSubmit.textContent = job.defer_compilation
+    ? "保存讲解和录制，稍后编译"
+    : "确认讲解并开始编译";
   elements.jobLog.replaceChildren();
   (job.logs || []).forEach((line) => {
     const item = document.createElement("div");
@@ -2146,7 +2151,8 @@ async function refreshState() {
     && state.capabilities?.graph_native_guidance === true
     && state.capabilities?.independent_guidance_delete === true
     && state.capabilities?.waa_narrated_recording === true
-    && state.capabilities?.waa_task_catalog === true;
+    && state.capabilities?.waa_task_catalog === true
+    && state.capabilities?.deferred_recording_compilation === true;
   elements.version.textContent = backendSupportsV14
     ? `v${state.version}`
     : `v${state.version} · 需要重启`;
@@ -2208,6 +2214,7 @@ async function startRecording() {
   if (waa && !elements.waaRoot.value.trim()) return showRecordError("请输入 WAA 根目录");
   if (waa && !selectedWaaTask()) return showRecordError("请选择一个 WAA 标准任务");
   const narrated = elements.recordNarration.checked;
+  const deferCompilation = elements.recordDeferCompilation.checked;
   setBusy(true);
   try {
     if (!waa && narrated) await startNarrationCapture();
@@ -2218,12 +2225,14 @@ async function startRecording() {
         example_path: elements.waaExample.value.trim(),
         task_id: taskId,
         narrated,
+        defer_compilation: deferCompilation,
         model: elements.recordModel.value,
         reasoning_effort: elements.recordReasoningEffort.value,
       } : {
         handle: windowInfo.handle,
         task_id: taskId,
         narrated,
+        defer_compilation: deferCompilation,
         model: elements.recordModel.value,
         reasoning_effort: elements.recordReasoningEffort.value,
       }),

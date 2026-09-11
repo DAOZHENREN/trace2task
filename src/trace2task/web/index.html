@@ -256,7 +256,7 @@
                 </div>
               </div>
             </div>
-            <div class="agent-settings-help">录制结束后，Compiler Agent 会自动理解阶段与动作意图。</div>
+            <div class="agent-settings-help">默认录制结束后自动编译；也可以仅保存录制，稍后手动编译。</div>
 
             <label class="toggle-option narration-toggle" for="record-narration">
               <input id="record-narration" type="checkbox" checked>
@@ -266,10 +266,18 @@
               </span>
             </label>
 
+            <label class="toggle-option deferred-compilation-toggle" for="record-defer-compilation">
+              <input id="record-defer-compilation" type="checkbox">
+              <span>
+                <strong>仅保存录制，稍后编译</strong>
+                <small>保存原始 Trace 和已确认的人工讲解；之后可在“本地经验”中逐条编译</small>
+              </span>
+            </label>
+
             <div class="record-flow">
               <div><span>1</span><p>点击开始；WAA 模式会先等待虚拟机 READY</p></div>
               <div><span>2</span><p>正常示范，同时说清意图、诀窍和完成条件</p></div>
-              <div><span>3</span><p>按 F8 成功；检查讲解后生成语义经验，F9 取消</p></div>
+              <div><span>3</span><p>按 F8 成功；检查讲解后立即编译或仅保存，F9 取消</p></div>
             </div>
 
             <div class="form-error hidden" id="record-error" role="alert"></div>
