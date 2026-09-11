@@ -1,0 +1,23 @@
+name: Offline report regression tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: src
+      SDL_VIDEODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: >-
+          python -m pip install --only-binary=:all:
+          'pytest>=8.3,<9' 'pygame>=2.6,<3' 'numpy>=2,<3' 'pyyaml>=6,<7'
+      - run: python -m pytest tests/test_waa_results.py
