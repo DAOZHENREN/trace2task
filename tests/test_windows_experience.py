@@ -1,19 +1,105 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pygame
+import pytest
 import yaml
 
 from trace2task.compiler import confirm_taskpack
 from trace2task.windows_experience import (
+    _narration_evidence_context,
+    _prompt,
     compile_windows_semantic_experience,
     probe_codex_compiler_connection,
 )
 from trace2task.windows_task import load_windows_task
+
+
+def test_canonical_narration_visible_with_conflicting_timed_segments_without_mutation():
+    narration = {"transcript": "Profit in D1; formula in D2; Ctrl+S",
+                 "transcription_engine": "faster_whisper:turbo",
+                 "segments": [{"start_ms": 1.23456, "end_ms": 1500, "text": "perfect in second; control C"}]}
+    before = json.dumps(narration)
+    timeline = [{"start_elapsed_ms": 0, "end_elapsed_ms": 2000}]
+    context = _narration_evidence_context(narration, timeline)
+    canonical = context["canonical_transcript"]
+    assert canonical["text"] == narration["transcript"]
+    assert canonical["text_sha256"] == hashlib.sha256(narration["transcript"].encode()).hexdigest()
+    assert "aligned_action_range" not in canonical
+    assert canonical["alignment"] == "task_level_no_word_or_segment_timestamps"
+    assert context["raw_segments"] == narration["segments"]
+    assert context["segments"][0]["text"] == "perfect in second；control C"
+    assert context["canonical_vs_segments"] == "differs_after_whitespace_normalization"
+    assert json.dumps(narration) == before
+    prompt = _prompt(task_id="test", task_instruction="generic", timeline=timeline,
+                     evidence_map="frame", boundary_hints=[], narration=narration)
+    assert narration["transcript"] in prompt
+    assert narration["segments"][0]["text"] in prompt
+    assert "Do not assign canonical corrections to raw segment timestamps" in prompt
+    assert "claim that a human edited or verified" in prompt
+
+
+@pytest.mark.parametrize("segments,comparison", [([], "unavailable"),
+    ([{"start_ms": 0, "end_ms": 1, "text": "Profit   D2"}], "matches_after_whitespace_normalization"),
+    ([{"text": "different but unaligned"}], "differs_after_whitespace_normalization")])
+def test_canonical_text_survives_no_timeline_or_unusable_segments(segments, comparison):
+    context = _narration_evidence_context({"transcript": "Profit D2", "segments": segments}, [])
+    assert context["canonical_transcript"]["text"] == "Profit D2"
+    assert context["raw_segments"] == segments
+    assert context["canonical_vs_segments"] == comparison
+    assert context["segments"] == []
+
+
+def test_missing_narration_does_not_invent_text_or_source_provenance():
+    context = _narration_evidence_context(None, [])
+    assert context["source_kind"] == "unavailable"
+    assert context["canonical_transcript"]["text"] == ""
+    assert context["source_manifest"] is None
+    assert context["raw_segments"] == []
+
+
+def test_compile_captures_exact_raw_narration_fields_and_source_hash(tmp_path):
+    task_path = _write_taskpack(tmp_path)
+    narration_path = task_path.parent / "reference/narration.json"
+    raw = {"transcript": "  Profit in D1.\nD2 = B2-C2; Ctrl+S.  ", "transcription_engine": "faster_whisper:turbo",
+           "segments": [{"start_ms": 0.123456, "end_ms": 800, "text": "perfect; second; control C", "confidence": 0.3}]}
+    narration_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    original = narration_path.read_bytes()
+    calls = []
+    def session_factory(executable, **kwargs):
+        return FakeSession(executable, responses=iter([_semantic_response()]), calls=calls, **kwargs)
+    compile_windows_semantic_experience(task_path, binary_resolver=lambda requested: requested,
+                                       session_factory=session_factory)
+    prompt = calls[0]["prompt"]
+    assert json.dumps(raw["transcript"], ensure_ascii=False) in prompt
+    assert '"start_ms":0.123456' in prompt
+    assert '"confidence":0.3' in prompt
+    assert hashlib.sha256(original).hexdigest() in prompt
+    assert '"path":"reference/narration.json"' in prompt
+    assert narration_path.read_bytes() == original
+
+
+def test_compile_rejects_narration_changed_during_loading(tmp_path, monkeypatch):
+    import trace2task.windows_experience as experience
+
+    task_path = _write_taskpack(tmp_path)
+    narration_path = task_path.parent / "reference/narration.json"
+    narration_path.write_text(json.dumps({"transcript": "Original", "segments": []}))
+    original_load = experience.load_narration
+
+    def changing_load(path):
+        result = original_load(path)
+        path.write_text(json.dumps({"transcript": "Changed", "segments": []}))
+        return result
+
+    monkeypatch.setattr(experience, "load_narration", changing_load)
+    with pytest.raises(RuntimeError, match="Narration source changed"):
+        compile_windows_semantic_experience(task_path)
 
 
 def _write_taskpack(tmp_path: Path) -> Path:
@@ -359,7 +445,8 @@ def test_compiler_agent_adds_replaceable_grounded_semantic_layer(tmp_path: Path)
     assert "Multi-action batching, plan horizon" in calls[0]["prompt"]
     assert "do not encode them" in calls[0]["prompt"]
     assert "先打开入口" in calls[0]["prompt"]
-    assert "等待切换，再完成确认并回到起点" not in calls[0]["prompt"]
+    assert "等待切换，再完成确认并回到起点" in calls[0]["prompt"]
+    assert '"canonical_vs_segments":"differs_after_whitespace_normalization"' in calls[0]["prompt"]
     assert '"start_ms":0.0' in calls[0]["prompt"]
     assert '"aligned_action_range":[0,2]' in calls[0]["prompt"]
     assert calls[0]["schema"]["properties"]["stages"]["items"]["additionalProperties"] is False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -1785,6 +1786,55 @@ def _aligned_narration_context(
     return aligned
 
 
+def _narration_evidence_context(
+    narration: Mapping[str, Any] | None,
+    timeline: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Keep the canonical text distinct from unchanged timed speech evidence.
+
+    Text inequality is not proof of a human edit, ASR error, or semantic conflict.
+    No canonical word is assigned the timestamps of a different segment text.
+    """
+    source = narration or {}
+    canonical = source.get("_raw_transcript", source.get("transcript"))
+    canonical = canonical if isinstance(canonical, str) else ""
+    raw_segments = source.get("_raw_segments", source.get("segments", []))
+    raw_segments = raw_segments if isinstance(raw_segments, list) else []
+    segment_texts = [item["text"] for item in raw_segments
+                     if isinstance(item, dict) and isinstance(item.get("text"), str)]
+    comparison = "unavailable"
+    if canonical.strip() and segment_texts:
+        comparison = (
+            "matches_after_whitespace_normalization"
+            if " ".join(canonical.split()) == " ".join(" ".join(segment_texts).split())
+            else "differs_after_whitespace_normalization"
+        )
+    segment_bytes = json.dumps(raw_segments, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")).encode("utf-8")
+    return {
+        "source_kind": (
+            "task_instruction" if source.get("transcription_engine") == "waa_task_instruction"
+            else "human_narration" if narration is not None else "unavailable"
+        ),
+        "transcription_engine": source.get("transcription_engine", "unknown") if narration is not None else "unavailable",
+        "source_manifest": source.get("_source_manifest"),
+        "canonical_transcript": {
+            "text": canonical,
+            "source_field": "transcript",
+            "text_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "alignment": "task_level_no_word_or_segment_timestamps",
+            "authority": "advisory_text_not_human_review_attestation",
+        },
+        "raw_segments": raw_segments,
+        "raw_segments_json_sha256": hashlib.sha256(segment_bytes).hexdigest(),
+        "segment_serialization": "UTF-8 JSON, sorted keys, compact separators, ensure_ascii=false",
+        "canonical_vs_segments": comparison,
+        "comparison_scope": "Text comparison only; cause, authorship and semantic correctness are not established.",
+        "segments": _aligned_narration_context(narration, timeline),
+        "alignment_scope": "Existing normalized-segment heuristic alignment only; raw timestamps are audio-relative. Canonical wording is not realigned.",
+    }
+
+
 def _prompt(
     *,
     task_id: str,
@@ -1794,16 +1844,8 @@ def _prompt(
     boundary_hints: Sequence[Mapping[str, Any]],
     narration: Mapping[str, Any] | None,
 ) -> str:
-    aligned_narration = _aligned_narration_context(narration, timeline)
     narration_context = json.dumps(
-        {
-            "transcription_engine": (
-                narration.get("transcription_engine", "unknown")
-                if narration is not None
-                else "unavailable"
-            ),
-            "segments": aligned_narration,
-        },
+        _narration_evidence_context(narration, timeline),
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -1816,6 +1858,13 @@ def _prompt(
         f"Current generic task instruction: {task_instruction}\n"
         f"Evidence contact-sheet map:\n{evidence_map}\n\n"
         "Optional human narration is advisory evidence. Its timestamped segments have been aligned "
+        "heuristically, not as word-level proof. Always read canonical_transcript as a distinct "
+        "task-level advisory text channel even when timed segments exist. Raw segments retain "
+        "their original wording; canonical and segment text may disagree. Do not silently discard "
+        "either channel or claim that a human edited or verified the canonical text. Do not assign "
+        "canonical corrections to raw segment timestamps. Report unresolved disagreement in "
+        "narration_claims, checking both against the Trace and task requirements. "
+        "The normalized segment view maps heuristically "
         "to action ranges, but casual phrases such as '随便', '都用掉', repetition, and speech-recognition "
         "errors are not universal strategy. Extract every useful statement into narration_claims. "
         "Classify a one-off convenient choice as example_only, use verdict=advisory when pixels do not "
@@ -1990,11 +2039,18 @@ def compile_windows_semantic_experience(
     task_instruction = _string(task_data.get("instruction"), "task.instruction")
     timeline, all_frames, boundary_hints = _prepare_timeline(source_path.parent)
     evidence_frames = _sample_frames(all_frames)
-    narration = (
-        load_narration(source_path.parent / "reference" / "narration.json")
-        if use_narration
-        else None
-    )
+    narration_path = source_path.parent / "reference" / "narration.json"
+    narration_bytes = narration_path.read_bytes() if use_narration and narration_path.is_file() else None
+    narration = load_narration(narration_path) if use_narration else None
+    if narration is not None:
+        if narration_bytes is None or narration_path.read_bytes() != narration_bytes:
+            raise RuntimeError("Narration source changed while preparing compiler evidence")
+        raw_narration = json.loads(narration_bytes)
+        narration.update(
+            _raw_transcript=raw_narration.get("transcript"),
+            _raw_segments=raw_narration.get("segments", []),
+            _source_manifest={"path": "reference/narration.json", "sha256": hashlib.sha256(narration_bytes).hexdigest()},
+        )
     narration_kind = (
         "none"
         if narration is None
