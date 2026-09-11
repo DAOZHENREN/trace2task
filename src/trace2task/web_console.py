@@ -1695,63 +1695,27 @@ class WebConsoleController:
         source_trace: Path,
         fresh_taskpack: bool,
     ) -> dict[str, Any]:
-        task_root = task_path.parent.resolve()
-        marker_path = task_root / ".automatic-compiler-snapshot.json"
-        if marker_path.is_file():
-            existing = json.loads(marker_path.read_text(encoding="utf-8"))
-            snapshot_task = Path(str(existing.get("task_path") or ""))
-            if snapshot_task.is_file():
-                return existing
+        from trace2task.compiler_snapshot import freeze_snapshot, tree_digest, validate_snapshot
 
-        safe_variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", variant).strip("-") or "compiled"
-        snapshot_id = (
-            datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-            + f"-{uuid.uuid4().hex[:8]}-{safe_variant}"
+        marker_path = task_path.parent / ".automatic-compiler-snapshot.json"
+        if marker_path.is_file() and not fresh_taskpack:
+            existing = json.loads(marker_path.read_text(encoding="utf-8"))
+            verified = validate_snapshot(Path(str(existing.get("task_path") or "")))
+            source_hash = hashlib.sha256(source_trace.read_bytes()).hexdigest()
+            tree_hash = tree_digest(task_path.parent, exclude_marker=True)[0]
+            if (existing != verified or existing.get("source_tree_sha256") != tree_hash
+                    or existing.get("source_trace_sha256") != source_hash
+                    or existing.get("variant") != variant or existing.get("model") != model
+                    or existing.get("reasoning_effort") != reasoning_effort):
+                raise RuntimeError("Stale or unverifiable Compiler snapshot marker; freeze a fresh version")
+            return existing
+        payload = freeze_snapshot(
+            task_path, output_root=self.project_root / "evaluations" / "compiler-snapshots",
+            source_trace=source_trace, variant=variant, model=model,
+            reasoning_effort=reasoning_effort, fresh_taskpack=fresh_taskpack,
         )
-        snapshot_root = (
-            self.project_root / "evaluations" / "compiler-snapshots" / snapshot_id
-        ).resolve()
-        snapshot_task_root = snapshot_root / "taskpack"
-        try:
-            shutil.copytree(task_root, snapshot_task_root)
-            snapshot_task = snapshot_task_root / task_path.name
-            tree_sha256, file_count, size_bytes = _taskpack_tree_digest(snapshot_task_root)
-            payload = {
-                "schema_version": "0.1",
-                "snapshot_id": snapshot_id,
-                "kind": "automatic_compiler_output",
-                "created_at": _now(),
-                "variant": variant,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "fresh_taskpack": fresh_taskpack,
-                "source_task_path": str(task_path.resolve()),
-                "source_trace": str(source_trace.resolve()),
-                "source_trace_sha256": hashlib.sha256(source_trace.read_bytes()).hexdigest(),
-                "task_path": str(snapshot_task),
-                "taskpack_root": str(snapshot_task_root),
-                "tree_sha256": tree_sha256,
-                "file_count": file_count,
-                "size_bytes": size_bytes,
-                "review_policy": (
-                    "Unreviewed automatic Compiler output. WAA experiments may run this draft "
-                    "only with the explicit --allow-automatic-compiler-draft flag."
-                ),
-            }
-            snapshot_root.mkdir(parents=True, exist_ok=True)
-            (snapshot_root / "snapshot.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            marker_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            return payload
-        except Exception:
-            if snapshot_root.exists():
-                shutil.rmtree(snapshot_root)
-            raise
+        marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return payload
 
     def _compile_trace_bundle(
         self,
