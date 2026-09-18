@@ -58,6 +58,7 @@
               <select id="model-provider">
                 <option value="codex" selected>Codex · 订阅登录</option>
                 <option value="api">模型 API · OpenAI 兼容接口</option>
+                <option value="local">本地模型 · 本机 GPU</option>
               </select>
             </div>
             <div class="agent-settings" id="codex-model-settings">
@@ -83,6 +84,16 @@
                   </select>
                 </div>
               </div>
+            </div>
+            <div id="local-model-settings" class="hidden">
+              <label class="field-label" for="local-model">本地执行模型</label>
+              <div class="select-wrap">
+                <select id="local-model">
+                  <option value="qwen3-vl-8b-instruct">Qwen3-VL-8B-Instruct · Q4_K_M</option>
+                </select>
+              </div>
+              <p class="field-help">连接本机 http://127.0.0.1:8081，使用本地 GPU，无需云 API Key。请先启动本地模型服务；选择此项不会自动下载或启动模型，也不会覆盖云 API 配置。</p>
+              <p class="field-help">推荐启动配置：16K 上下文、Q8 KV 缓存、严格 JSON 输出。实际容量由本地服务启动参数决定；首次建议点击“只生成计划”，长经验仍可能超限。</p>
             </div>
             <div id="api-model-settings" class="hidden">
               <label class="field-label" for="api-base-url">API Base URL</label>

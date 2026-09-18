@@ -4,6 +4,8 @@ const elements = {
   taskMeta: document.querySelector("#task-meta"),
   model: document.querySelector("#model"),
   modelProvider: document.querySelector("#model-provider"),
+  localModelSettings: document.querySelector("#local-model-settings"),
+  localModel: document.querySelector("#local-model"),
   codexModelSettings: document.querySelector("#codex-model-settings"),
   apiModelSettings: document.querySelector("#api-model-settings"),
   apiBaseUrl: document.querySelector("#api-base-url"),
@@ -439,12 +441,13 @@ async function clearAPISettings() {
 }
 
 function usesModelApi() {
-  return elements.modelProvider.value === "api";
+  return ["api", "local"].includes(elements.modelProvider.value);
 }
 
 function syncProviderFields() {
   elements.codexModelSettings.classList.toggle("hidden", usesModelApi());
-  elements.apiModelSettings.classList.toggle("hidden", !usesModelApi());
+  elements.apiModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "api");
+  elements.localModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "local");
   elements.adaptiveReasoning.disabled = isBusy() || usesModelApi();
 }
 
@@ -1962,7 +1965,7 @@ function setBusy(busy) {
   elements.taskpack.disabled = busy;
   elements.model.disabled = busy;
   [
-    elements.modelProvider, elements.apiBaseUrl, elements.apiModel, elements.apiKey,
+    elements.modelProvider, elements.localModel, elements.apiBaseUrl, elements.apiModel, elements.apiKey,
     elements.apiReasoningEffort, elements.apiResponseFormat, elements.apiTimeout,
     elements.apiSaveSettings, elements.apiClearSettings,
   ].forEach((element) => { element.disabled = busy; });
@@ -2509,18 +2512,25 @@ async function startJob(mode) {
     return showError("不使用经验时，请先手动选择任务以确定目标窗口和允许的操作。");
   }
   const instruction = elements.instruction.value.trim();
-  const provider = elements.modelProvider.value;
+  const local = elements.modelProvider.value === "local";
+  const provider = usesModelApi() ? "api" : "codex";
   if (usesModelApi() && !modelApiAvailable) {
     return showError("页面已更新，但后台仍是旧版本。请停止并重启本地 trace2task web，再刷新页面后使用模型 API。");
   }
-  const model = usesModelApi() ? elements.apiModel.value.trim() : elements.model.value;
-  const reasoningEffort = usesModelApi()
+  const model = local ? elements.localModel.value
+    : usesModelApi() ? elements.apiModel.value.trim() : elements.model.value;
+  const reasoningEffort = local ? "default" : usesModelApi()
     ? elements.apiReasoningEffort.value : elements.reasoningEffort.value;
   const inputMode = elements.inputMode.value;
   const adaptiveReasoning = !usesModelApi() && elements.adaptiveReasoning.checked;
   if (!instruction) return showError("请输入一条任务指令");
   if (!model) return showError("请输入 API 视觉模型 ID");
-  const apiOptions = usesModelApi() ? {
+  const apiOptions = local ? {
+    base_url: "http://127.0.0.1:8081/v1",
+    api_key: "local-only",
+    response_format: "json_schema",
+    timeout_seconds: 120,
+  } : usesModelApi() ? {
     base_url: elements.apiBaseUrl.value.trim(),
     api_key: elements.apiKey.value,
     response_format: elements.apiResponseFormat.value,
