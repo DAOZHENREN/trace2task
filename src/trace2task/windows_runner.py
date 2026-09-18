@@ -462,9 +462,12 @@ def run_windows_agent(
     focus: bool = False,
     status_callback: Callable[[str], None] = print,
     api_config: ModelAPIConfig | None = None,
+    use_experience: bool = True,
 ) -> WindowsAgentResult:
     """Plan from a target window; inject input only with --execute and a confirmed pack."""
 
+    if not isinstance(use_experience, bool):
+        raise TypeError("use_experience must be a boolean")
     provider = "api" if api_config is not None else "codex"
     if api_config is not None:
         api_config = api_config.with_credentials()
@@ -501,6 +504,7 @@ def run_windows_agent(
             background=background,
             adaptive_reasoning=adaptive_reasoning,
             api_config=api_config,
+            experience_mode="feedback" if use_experience else "baseline",
         )
     )
 
@@ -743,6 +747,7 @@ def run_windows_agent(
                 "provider": provider,
                 "reasoning_effort": reasoning_effort,
                 "adaptive_reasoning": adaptive_reasoning,
+                "use_experience": use_experience,
                 "plan_horizon": plan_horizon,
                 "max_batch_recoveries": max_batch_recoveries,
                 "completion_policy": {

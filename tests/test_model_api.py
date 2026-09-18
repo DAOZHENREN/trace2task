@@ -127,6 +127,47 @@ def test_multimodal_request_schema_history_and_reset(tmp_path: Path) -> None:
         _turn(session)
 
 
+@pytest.mark.parametrize("mode", ["default", "enabled", "disabled"])
+def test_thinking_mode_request(mode: str) -> None:
+    calls = []
+    session = ModelAPISession(
+        ModelAPIConfig(api_key=KEY, thinking_mode=mode), model="generic-vision-model",
+        reasoning_effort="low",
+        requester=lambda config, payload: calls.append(payload) or _completion(),
+    )
+    _turn(session)
+    if mode == "default":
+        assert "thinking" not in calls[0]
+    else:
+        assert calls[0]["thinking"] == {"type": mode}
+    if mode == "disabled":
+        assert "reasoning_effort" not in calls[0]
+    else:
+        assert calls[0]["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize("effort,expected", [
+    ("default", {}),
+    ("none", {"thinking": {"type": "disabled"}}),
+    ("low", {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}),
+    ("medium", {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}),
+    ("max", {"thinking": {"type": "enabled"}, "reasoning_effort": "max"}),
+])
+def test_deepseek_unified_effort(effort, expected) -> None:
+    calls = []
+    session = ModelAPISession(
+        ModelAPIConfig(api_key=KEY), model="deepseek-flash", reasoning_effort=effort,
+        requester=lambda config, payload: calls.append(payload) or _completion(),
+    )
+    _turn(session)
+    assert {k: v for k, v in calls[0].items() if k in ("thinking", "reasoning_effort")} == expected
+
+
+def test_invalid_thinking_mode() -> None:
+    with pytest.raises(ValueError):
+        ModelAPIConfig(thinking_mode="invalid")
+
+
 def test_json_object_mode_omits_strict_schema() -> None:
     calls = []
     session = ModelAPISession(

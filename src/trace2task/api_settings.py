@@ -78,6 +78,7 @@ class APISettingsStore:
                 raise ValueError
             config = ModelAPIConfig(
                 base_url=value["base_url"],
+                thinking_mode=value.get("thinking_mode", "default"),
                 response_format=value["response_format"],
                 timeout_seconds=value["timeout_seconds"],
             )
@@ -89,6 +90,7 @@ class APISettingsStore:
                 protected and value.get("key_storage") != "windows_dpapi_v1"
             ):
                 raise ValueError
+            value["thinking_mode"] = config.thinking_mode
             value["base_url"] = config.base_url
             return value
         except (KeyError, TypeError, ValueError):
@@ -109,7 +111,7 @@ class APISettingsStore:
             return {
                 **result, "saved": True, "has_saved_key": bool(stored.get("protected_key")),
                 **{key: stored[key] for key in (
-                    "base_url", "model", "reasoning_effort", "response_format", "timeout_seconds",
+                    "base_url", "model", "reasoning_effort", "response_format", "timeout_seconds", "thinking_mode",
                 )},
             }
 
@@ -134,6 +136,7 @@ class APISettingsStore:
             payload = {
                 "version": 1, "base_url": config.base_url, "model": model,
                 "reasoning_effort": reasoning_effort, "response_format": config.response_format,
+                "thinking_mode": config.thinking_mode,
                 "timeout_seconds": config.timeout_seconds,
                 "key_storage": "windows_dpapi_v1" if protected else None,
                 "protected_key": protected,

@@ -367,6 +367,7 @@ class ConsoleJob:
     narrated: bool = False
     background: bool = False
     adaptive_reasoning: bool = True
+    use_experience: bool = True
     status: str = "queued"
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -393,6 +394,7 @@ class ConsoleJob:
             "narrated": self.narrated,
             "input_mode": "background" if self.background else "foreground",
             "adaptive_reasoning": self.adaptive_reasoning,
+            "use_experience": self.use_experience,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -930,9 +932,14 @@ class WebConsoleController:
         background: bool = False,
         adaptive_reasoning: bool = True,
         provider: str = "codex",
+        use_experience: bool = True,
         api_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
+        if not isinstance(use_experience, bool):
+            raise TypeError("使用经验必须是布尔值")
+        if not use_experience and not (isinstance(task_path, str) and task_path.strip()):
+            raise ValueError("不使用经验时，请手动选择任务以确定目标窗口和允许的操作")
         if not normalized_instruction:
             raise ValueError("请输入一条任务指令")
         if len(normalized_instruction) > 2_000:
@@ -948,6 +955,7 @@ class WebConsoleController:
             api_config = self.api_settings.with_saved_key(ModelAPIConfig(
                 base_url=api_options.get("base_url", DEFAULT_API_BASE_URL),
                 api_key=api_options.get("api_key", ""),
+                thinking_mode=api_options.get("thinking_mode", "default"),
                 response_format=api_options.get("response_format", "json_schema"),
                 timeout_seconds=api_options.get("timeout_seconds", 120),
             )).with_credentials()
@@ -998,6 +1006,7 @@ class WebConsoleController:
                 selection_reason=selection_reason,
                 background=background,
                 adaptive_reasoning=adaptive_reasoning,
+                use_experience=use_experience,
             )
             if selection_mode == "auto":
                 job.logs.append(
@@ -3186,6 +3195,7 @@ class WebConsoleController:
                 "output_root": self.project_root / "runs",
                 "background": job.background,
                 "adaptive_reasoning": job.adaptive_reasoning,
+                "use_experience": job.use_experience,
                 "focus": not execute and not job.background,
                 "status_callback": lambda message: self._update(job, log=message),
             }
@@ -3293,6 +3303,7 @@ class WebConsoleController:
             "provider": job.provider,
             "input_mode": "background" if job.background else "foreground",
             "adaptive_reasoning": job.adaptive_reasoning,
+            "use_experience": job.use_experience,
             "outcome": outcome,
             "selection": {
                 "mode": job.selection_mode,
@@ -3501,6 +3512,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     config = ModelAPIConfig(
                         base_url=payload.get("base_url", DEFAULT_API_BASE_URL),
                         api_key=payload.get("api_key", ""),
+                        thinking_mode=payload.get("thinking_mode", "default"),
                         response_format=payload.get("response_format", "json_schema"),
                         timeout_seconds=payload.get("timeout_seconds", 120),
                     )
@@ -3522,6 +3534,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     ),
                     background=payload.get("input_mode") == "background",
                     adaptive_reasoning=payload.get("adaptive_reasoning", True),
+                    use_experience=payload.get("use_experience", True),
                     provider=payload.get("provider", "codex"),
                     api_options=payload.get("api"),
                 )

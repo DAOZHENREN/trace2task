@@ -1451,6 +1451,33 @@ def test_model_api_runner_respects_execution_gate_and_records_provider(
         assert backend.events == []
 
 
+def test_runner_without_experience_withholds_demonstration_and_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trace2task import windows_runner
+
+    contracts = []
+
+    class InspectAgent(CodexWindowsAgent):
+        def plan(self, surface):
+            contracts.append(self)
+            assert self.experience_mode == "baseline"
+            assert self._reference_paths(fresh_context=True) == ()
+            assert self._stage_ids() == ["unknown"]
+            assert "withheld" in self._semantic_context(())
+            return _plan(complete=True)
+
+    monkeypatch.setattr(windows_runner, "CodexWindowsAgent", InspectAgent)
+    result = run_windows_agent(
+        _write_taskpack(tmp_path, semantic=True, guidance=True),
+        instruction="Follow only this instruction.",
+        backend=FakeBackend(), capture=FakeCapture(), use_experience=False,
+    )
+    assert result.task_complete
+    assert len(contracts) == 1
+    assert contracts[0].contract.instruction == "Follow only this instruction."
+
+
 def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) -> None:
     task_path = _write_taskpack(tmp_path)
     backend = FakeBackend()

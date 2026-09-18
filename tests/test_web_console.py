@@ -307,6 +307,26 @@ class FakeCompilation:
     review_status: str = "draft"
 
 
+def test_web_can_disable_experience_and_requires_explicit_target(tmp_path: Path) -> None:
+    task = _write_windows_task(tmp_path)
+    calls = []
+    controller = WebConsoleController(
+        tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
+    )
+    with pytest.raises(ValueError, match="手动选择"):
+        controller.start_job(
+            task_path="", instruction="Test.", execute=False, use_experience=False,
+        )
+    job = controller.start_job(
+        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
+        execute=False, use_experience=False,
+    )
+    completed = controller.wait(job["job_id"])
+    assert completed["status"] == "completed"
+    assert completed["use_experience"] is False
+    assert calls[0]["use_experience"] is False
+
+
 def test_api_job_accepts_custom_model_and_keeps_key_out_of_snapshots(tmp_path: Path) -> None:
     task = _write_windows_task(tmp_path)
     calls = []

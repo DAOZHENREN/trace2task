@@ -52,6 +52,18 @@ def test_profile_persists_without_exposing_key(protected_store: APISettingsStore
     assert list(protected_store.path.parent.glob("*.tmp")) == []
 
 
+def test_thinking_mode_persistence_and_legacy(protected_store: APISettingsStore) -> None:
+    protected_store.save(
+        ModelAPIConfig(base_url=URL, api_key=KEY, thinking_mode="disabled"),
+        model="deepseek-flash", reasoning_effort="low",
+    )
+    assert APISettingsStore(protected_store.path).public_settings()["thinking_mode"] == "disabled"
+    stored = json.loads(protected_store.path.read_text(encoding="utf-8"))
+    del stored["thinking_mode"]
+    protected_store.path.write_text(json.dumps(stored), encoding="utf-8")
+    assert protected_store.public_settings()["thinking_mode"] == "default"
+
+
 def test_blank_key_retains_secret_for_same_endpoint(protected_store: APISettingsStore) -> None:
     _save(protected_store)
     protected_store.save(

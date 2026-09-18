@@ -20,7 +20,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from trace2task.codex_app_server import CodexTurnMetrics
 
 DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
-API_REASONING_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh")
+API_REASONING_EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh", "max")
 API_RESPONSE_FORMATS = ("json_schema", "json_object")
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
@@ -40,6 +40,7 @@ class ModelAPIConfig:
     base_url: str = DEFAULT_API_BASE_URL
     api_key: str = field(default="", repr=False)
     api_key_env: str = "TRACE2TASK_API_KEY"
+    thinking_mode: str = "default"
     response_format: str = "json_schema"
     timeout_seconds: float = 120
 
@@ -75,6 +76,8 @@ class ModelAPIConfig:
             r"[A-Za-z_][A-Za-z0-9_]*", self.api_key_env
         ):
             raise ValueError("API Key 环境变量名称无效")
+        if self.thinking_mode not in ("default", "enabled", "disabled"):
+            raise ValueError("API 思考模式必须是 default、enabled 或 disabled")
         if self.response_format not in API_RESPONSE_FORMATS:
             raise ValueError("API 输出格式必须是 json_schema 或 json_object")
         if (
@@ -272,7 +275,19 @@ class ModelAPISession:
                 "strict": True,
                 "schema": output_schema,
             }
-        if effort != "default":
+        if "deepseek" in active_model.lower() and self.config.thinking_mode == "default":
+            if effort == "none":
+                payload["thinking"] = {"type": "disabled"}
+            elif effort != "default":
+                payload["thinking"] = {"type": "enabled"}
+                payload["reasoning_effort"] = {
+                    "minimal": "low", "medium": "high", "xhigh": "high",
+                }.get(effort, effort)
+        elif self.config.thinking_mode != "default":
+            payload["thinking"] = {"type": self.config.thinking_mode}
+            if effort != "default" and self.config.thinking_mode != "disabled":
+                payload["reasoning_effort"] = effort
+        elif effort != "default":
             payload["reasoning_effort"] = effort
         reused = bool(self._history)
         result = self._request_interruptibly(payload)

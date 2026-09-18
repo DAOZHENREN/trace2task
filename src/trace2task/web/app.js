@@ -20,6 +20,7 @@ const elements = {
   inputModeHelp: document.querySelector("#input-mode-help"),
   adaptiveReasoning: document.querySelector("#adaptive-reasoning"),
   instruction: document.querySelector("#instruction"),
+  useExperience: document.querySelector("#use-experience"),
   charCount: document.querySelector("#char-count"),
   warning: document.querySelector("#capability-warning"),
   error: document.querySelector("#form-error"),
@@ -455,7 +456,7 @@ function populateAgentOptions(options) {
     const option = document.createElement("option");
     option.value = effort;
     option.textContent = effort === "default"
-      ? "服务商默认 · 不传参数" : effortLabels[effort] || effort;
+      ? "服务商默认 · 不传参数" : effort === "none" ? "关闭思考" : effortLabels[effort] || effort;
     elements.apiReasoningEffort.append(option);
   });
   elements.apiReasoningEffort.value = previousApiEffort;
@@ -464,7 +465,9 @@ function populateAgentOptions(options) {
   if (!apiSettingsInitialized && savedAPISettings?.saved) {
     elements.apiBaseUrl.value = savedAPISettings.base_url;
     elements.apiModel.value = savedAPISettings.model;
-    elements.apiReasoningEffort.value = savedAPISettings.reasoning_effort;
+    elements.apiReasoningEffort.value = savedAPISettings.thinking_mode === "disabled"
+      ? "none" : savedAPISettings.thinking_mode === "enabled" && savedAPISettings.reasoning_effort === "default"
+        ? "high" : savedAPISettings.reasoning_effort;
     elements.apiResponseFormat.value = savedAPISettings.response_format;
     elements.apiTimeout.value = savedAPISettings.timeout_seconds;
     elements.modelProvider.value = "api";
@@ -1966,6 +1969,7 @@ function setBusy(busy) {
   elements.inputMode.disabled = busy;
   elements.adaptiveReasoning.disabled = busy || usesModelApi();
   elements.instruction.disabled = busy;
+  elements.useExperience.disabled = busy;
   elements.viewTabs.forEach((button) => { button.disabled = busy; });
   elements.recordSource.disabled = busy;
   elements.waaRoot.disabled = busy;
@@ -2492,6 +2496,9 @@ async function startJob(mode) {
   clearError();
   if (dictationSession) return showError("请先结束语音输入并等待转写完成");
   const task = selectedTask();
+  if (!elements.useExperience.checked && !task) {
+    return showError("不使用经验时，请先手动选择任务以确定目标窗口和允许的操作。");
+  }
   const instruction = elements.instruction.value.trim();
   const provider = elements.modelProvider.value;
   if (usesModelApi() && !modelApiAvailable) {
@@ -2548,6 +2555,7 @@ async function startJob(mode) {
         reasoning_effort: reasoningEffort,
         input_mode: inputMode,
         adaptive_reasoning: adaptiveReasoning,
+        use_experience: elements.useExperience.checked,
       }),
     });
     renderJob(job);

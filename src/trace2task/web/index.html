@@ -103,6 +103,7 @@
                   </div>
                 </div>
               </div>
+              <p class="field-help">思考强度统一控制开关。DeepSeek 模型自动适配：默认开启 high；关闭思考发送关闭开关；medium / xhigh 等同 high。其他模型按服务商支持情况选择。</p>
               <label class="field-label" for="api-key">API Key</label>
               <input class="text-input" id="api-key" type="password"
                 placeholder="输入密钥；可点击下方按钮加密保存"
@@ -160,6 +161,10 @@
             </div>
 
             <label class="field-label instruction-label" for="instruction">本次指令</label>
+            <label class="toggle-option" for="use-experience">
+              <input id="use-experience" type="checkbox" checked>
+              <span><strong>使用经验</strong><small>关闭后仅根据本次指令和当前截图规划，不读取示范、编译阶段或人工反馈。仍需选择任务以确定目标窗口、允许操作和结果验证。</small></span>
+            </label>
             <textarea
               id="instruction"
               maxlength="2000"
