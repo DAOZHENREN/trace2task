@@ -115,6 +115,19 @@ def _rewrite_bundle(
     )
 
 
+def test_desktop_recording_scope_survives_compilation(tmp_path):
+    from trace2task.windows_task import load_windows_task
+
+    trace, events, metadata = _write_windows_trace(tmp_path)
+    metadata["execution_scope"] = "desktop"
+    _rewrite_bundle(trace, events, metadata)
+    result = compile_trace(trace, tmp_path / "packs")
+    task = load_windows_task(Path(result.task_path))
+    assert task.execution_scope == "desktop"
+    assert task.selector.process_name == "trace2task.desktop"
+    assert task.with_instruction("new instruction").execution_scope == "desktop"
+
+
 def test_windows_compiler_infers_parameterized_actions_and_review_bundle(
     tmp_path: Path,
 ) -> None:

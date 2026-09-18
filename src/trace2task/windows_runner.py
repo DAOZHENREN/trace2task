@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +19,7 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
 )
+from trace2task.execution_runtime import ExecutionRuntime, capture_with_timing
 from trace2task.model_api import API_REASONING_EFFORTS, ModelAPIConfig, validate_api_model
 from trace2task.recording import TraceWriter, make_run_dir
 from trace2task.windows_agent import (
@@ -219,9 +221,7 @@ def _capture_with_timing(
     capture: WindowFrameCapture,
     window: WindowInfo,
 ) -> tuple[pygame.Surface, float]:
-    started = time.perf_counter()
-    surface = capture.capture(window)
-    return surface, (time.perf_counter() - started) * 1000
+    return capture_with_timing(capture, window)
 
 
 def _wait_for_visual_stability(
@@ -476,6 +476,8 @@ def run_windows_agent(
             raise ValueError("Unsupported API reasoning effort")
         adaptive_reasoning = False
     contract = load_windows_task(task_path)
+    if contract.execution_scope == "desktop":
+        raise ValueError("桌面经验必须选择桌面执行范围，不能用于单窗口坐标执行")
     if instruction is not None:
         contract = contract.with_instruction(instruction)
     if execute and contract.task.requires_confirmation:
@@ -510,6 +512,8 @@ def run_windows_agent(
 
     if not execute:
         try:
+            if emergency_stop is not None:
+                emergency_stop.start()
             dry_run_started = time.perf_counter()
             window = session.focus(timeout_seconds=10) if focus else session.resolve()
             if not window.is_visible or window.is_minimized:
@@ -522,7 +526,8 @@ def run_windows_agent(
             )
             surface, capture_ms = _capture_with_timing(active_capture, window)
             planning_started = time.perf_counter()
-            plan = agent.plan(surface)
+            plan = ExecutionRuntime(stop=emergency_stop, status_callback=status_callback,
+                                    max_actions=action_limit).plan(partial(agent.plan, surface))
             planning_ms = (time.perf_counter() - planning_started) * 1000
             performance = {
                 "total_elapsed_ms": round((time.perf_counter() - dry_run_started) * 1000, 3),
@@ -596,8 +601,12 @@ def run_windows_agent(
             )
         finally:
             agent.close()
+            if emergency_stop is not None:
+                emergency_stop.close()
 
     active_emergency = emergency_stop or Win32EmergencyStop()
+    runtime = ExecutionRuntime(stop=active_emergency, status_callback=status_callback,
+                               max_actions=action_limit)
     if api_config is not None and isinstance(agent, CodexWindowsAgent):
         agent.set_stop_check(active_emergency.raise_if_requested)
     run_started = time.perf_counter()
@@ -806,9 +815,11 @@ def run_windows_agent(
                 )
             )
             planning_started = time.perf_counter()
-            plan = agent.plan(surface)
-            planning_ms = (time.perf_counter() - planning_started) * 1000
-            total_planning_ms += planning_ms
+            try:
+                plan = runtime.plan(partial(agent.plan, surface))
+            finally:
+                planning_ms = (time.perf_counter() - planning_started) * 1000
+                total_planning_ms += planning_ms
             plan_timing = plan.timing
             total_frame_encode_ms += plan_timing.frame_encode_ms
             total_prompt_build_ms += plan_timing.prompt_build_ms
@@ -939,7 +950,7 @@ def run_windows_agent(
                     pending_visual_action = action
                     pending_visual_baseline = surface.copy()
                 try:
-                    motor_result = executor.execute(action)
+                    motor_result = runtime.execute(executor, action)
                 except EmergencyStopRequested:
                     raise
                 except WindowSafetyError:
@@ -996,10 +1007,6 @@ def run_windows_agent(
                     active_stage["action_ms"] = (
                         float(active_stage["action_ms"]) + motor_result.elapsed_ms
                     )
-                status_callback(
-                    f"[action {executed_actions}/{action_limit}] {action.skill} completed "
-                    f"in {motor_result.elapsed_ms:.0f}ms."
-                )
                 visual_checkpoint: VisualCheckpointResult | None = None
                 local_wait_checkpoint: VisualCheckpointResult | None = None
                 if action.skill == "wait":

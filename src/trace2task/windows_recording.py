@@ -335,6 +335,7 @@ class WindowRecorder:
         sleeper: Callable[[float], None] = time.sleep,
         status_callback: Callable[[str], None] = print,
         capability_profile: str | None = None,
+        execution_scope: str = "window",
     ) -> None:
         if poll_hz <= 0:
             raise ValueError("poll_hz must be positive")
@@ -351,6 +352,7 @@ class WindowRecorder:
         if capability_profile not in {None, "messaging", "text_entry"}:
             raise ValueError(f"Unsupported recording capability profile: {capability_profile}")
         self.capability_profile = capability_profile
+        self.execution_scope = execution_scope
 
     def record(self, *, task_id: str, output_root: Path) -> WindowRecordResult:
         if not task_id.strip():
@@ -382,7 +384,8 @@ class WindowRecorder:
                 self.capture.capture(initial_window),
                 details={
                     "window": asdict(initial_window),
-                    "capture": "target_client_area",
+                    "capture": "primary_desktop" if self.execution_scope == "desktop" else "target_client_area",
+                    "execution_scope": self.execution_scope,
                     "coordinate_space": "physical_pixels",
                 },
             )
@@ -391,6 +394,7 @@ class WindowRecorder:
                 f"or {cancel_label} to cancel."
             )
             previous_geometry = self._geometry(initial_window)
+            previous_handle = initial_window.handle
             sampling_started = previous.sampled_at if previous is not None else None
             while True:
                 if self.clock() - started >= self.max_seconds:
@@ -439,7 +443,9 @@ class WindowRecorder:
                     continue
 
                 geometry = self._geometry(window)
-                if geometry != previous_geometry:
+                if geometry != previous_geometry or (
+                    self.execution_scope == "desktop" and window.handle != previous_handle
+                ):
                     writer.record(
                         "window_changed",
                         self.capture.capture(window),
@@ -450,6 +456,7 @@ class WindowRecorder:
                         },
                     )
                     previous_geometry = geometry
+                    previous_handle = window.handle
 
                 if previous is not None:
                     raw_events = self._input_transitions(
@@ -484,7 +491,8 @@ class WindowRecorder:
                 "stop_reason": stop_reason,
                 "window_selector": asdict(self.session.selector),
                 "initial_window": asdict(initial_window),
-                "capture_method": "target_client_area",
+                "capture_method": "primary_desktop" if self.execution_scope == "desktop" else "target_client_area",
+                "execution_scope": self.execution_scope,
                 "input_sampling": (
                     "background_transition_buffer_v1"
                     if isinstance(self.monitor, BufferedInputMonitor)
@@ -620,8 +628,12 @@ def record_window_trace(
     monitor: InputMonitor,
     status_callback: Callable[[str], None] = print,
     capability_profile: str | None = None,
+    execution_scope: str = "window",
 ) -> WindowRecordResult:
-    session = WindowSession(selector, backend)
+    if execution_scope not in {"window", "desktop"}:
+        raise ValueError("Unsupported recording scope")
+    session = (DesktopRecordingSession(backend, capture) if execution_scope == "desktop"
+               else WindowSession(selector, backend))
     buffered_monitor = BufferedInputMonitor(monitor, poll_hz=poll_hz)
     return WindowRecorder(
         session,
@@ -631,4 +643,32 @@ def record_window_trace(
         max_seconds=max_seconds,
         status_callback=status_callback,
         capability_profile=capability_profile,
+        execution_scope=execution_scope,
     ).record(task_id=task_id, output_root=output_root)
+
+
+class DesktopRecordingSession(WindowSession):
+    """Record primary-screen input across foreground windows without stealing focus."""
+
+    def __init__(self, backend, capture):
+        self.backend = backend
+        self.capture = capture
+        self.selector = WindowSelector(process_name="trace2task.desktop")
+
+    def resolve(self):
+        from dataclasses import replace
+
+        from trace2task.windows_control import physical_dpi_context
+
+        handle = self.backend.foreground_handle()
+        actual = self.backend.get_window(handle)
+        if actual is None:
+            raise WindowLookupError("Desktop foreground unavailable")
+        with physical_dpi_context(self.capture.user32):
+            width = self.capture.user32.GetSystemMetrics(0)
+            height = self.capture.user32.GetSystemMetrics(1)
+        return replace(actual, client_left=0, client_top=0, client_width=width,
+                       client_height=height, is_foreground=True)
+
+    def focus(self, **kwargs):
+        return self.resolve()

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pygame
@@ -16,6 +19,7 @@ from trace2task.windows_recording import (
     VK_F8,
     VK_F9,
     BufferedInputMonitor,
+    DesktopRecordingSession,
     InputSnapshot,
     Win32InputMonitor,
     WindowRecorder,
@@ -147,6 +151,39 @@ class SequenceMonitor:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_desktop_recording_keeps_events_across_window_switch(tmp_path, monkeypatch):
+    from trace2task import windows_control
+
+    monkeypatch.setattr(windows_control, "physical_dpi_context", lambda _: nullcontext())
+    backend = FakeBackend(window())
+    backend.foreground = 7
+    capture = FakeCapture()
+    capture.user32 = SimpleNamespace(GetSystemMetrics=lambda index: (800, 600)[index])
+
+    def switch():
+        backend.target = replace(window(8), title="Second app", process_name="second.exe")
+        backend.foreground = 8
+
+    monitor = SequenceMonitor([
+        InputSnapshot(frozenset(), frozenset(), (400, 300)),
+        InputSnapshot(frozenset(), frozenset({"left"}), (400, 300)),
+        InputSnapshot(frozenset(), frozenset(), (400, 300)),
+        InputSnapshot(frozenset(), frozenset(), (400, 300), success_requested=True),
+    ], on_poll={2: switch})
+    result = WindowRecorder(DesktopRecordingSession(backend, capture), capture, monitor,
+                            sleeper=lambda _: None, execution_scope="desktop").record(
+                                task_id="cross-app", output_root=tmp_path)
+    assert result.success and result.focus_losses == 0
+    assert result.input_events == 2
+    assert backend.events == []  # Recording never focuses applications or injects input.
+    records = [json.loads(line) for line in Path(result.trace_path).read_text("utf-8").splitlines()]
+    inputs = [record for record in records if record["type"] == "windows_input"]
+    assert inputs[0]["details"]["raw_input"]["normalized_position"] == [0.5, 0.5]
+    assert inputs[1]["details"]["window"]["process_name"] == "second.exe"
+    metadata = json.loads(Path(result.trace_path).with_name("metadata.json").read_text("utf-8"))
+    assert metadata["execution_scope"] == "desktop"
 
 
 def test_win32_monitor_falls_back_to_physical_f8_f9_edges() -> None:

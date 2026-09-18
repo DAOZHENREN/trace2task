@@ -47,7 +47,14 @@
               <span class="step">01</span>
             </div>
 
-            <label class="field-label" for="taskpack">经验选择</label>
+            <label class="field-label" for="execution-scope">执行范围</label>
+            <div class="select-wrap">
+              <select id="execution-scope">
+                <option value="window">单窗口</option>
+                <option value="desktop">整个桌面 · 主显示器</option>
+              </select>
+            </div>
+            <label class="field-label" for="taskpack">目标任务 / 经验</label>
             <div class="select-wrap">
               <select id="taskpack" aria-describedby="task-meta"></select>
             </div>
@@ -174,7 +181,7 @@
             <label class="field-label instruction-label" for="instruction">本次指令</label>
             <label class="toggle-option" for="use-experience">
               <input id="use-experience" type="checkbox" checked>
-              <span><strong>使用经验</strong><small>关闭后仅根据本次指令和当前截图规划，不读取示范、编译阶段或人工反馈。仍需选择任务以确定目标窗口、允许操作和结果验证。</small></span>
+              <span><strong>使用经验</strong><small id="experience-help">关闭后仅根据本次指令和当前截图规划，不读取示范、编译阶段或人工反馈。单窗口仍需选择任务以确定目标窗口、允许操作和结果验证；桌面暂仅支持无经验 Baseline。</small></span>
             </label>
             <textarea
               id="instruction"
@@ -223,6 +230,7 @@
             <div class="select-wrap">
               <select id="record-source">
                 <option value="local">本机窗口</option>
+                <option value="desktop">本机桌面 · 主显示器跨程序录制</option>
                 <option value="waa">Windows Agent Arena 虚拟机</option>
               </select>
             </div>

@@ -27,6 +27,7 @@ class WindowsTaskContract:
     semantic_experience: SemanticExperience | None = None
     human_guidance: HumanGuidance | None = None
     runtime_instruction: str | None = None
+    execution_scope: str = "window"
 
     @property
     def instruction(self) -> str:
@@ -47,6 +48,7 @@ class WindowsTaskContract:
             semantic_experience=self.semantic_experience,
             human_guidance=self.human_guidance,
             runtime_instruction=normalized,
+            execution_scope=self.execution_scope,
         )
 
 
@@ -81,6 +83,9 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
 
     root = _mapping(yaml.safe_load(source_path.read_text(encoding="utf-8")), "root")
     environment = _mapping(root.get("environment"), "environment")
+    execution_scope = environment.get("execution_scope", "window")
+    if execution_scope not in {"window", "desktop"}:
+        raise ValueError("Unsupported task execution scope")
     target = _mapping(environment.get("target"), "environment.target")
     title = target.get("title_contains")
     process = target.get("process_name")
@@ -212,4 +217,5 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
         effect_verifier=effect_verifier,
         semantic_experience=semantic_experience,
         human_guidance=human_guidance,
+        execution_scope=execution_scope,
     )

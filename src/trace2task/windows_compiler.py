@@ -754,18 +754,21 @@ def compile_windows_trace(
     task_data: dict[str, Any] = {
         "schema_version": "0.3",
         "id": task_id,
-        "instruction": WINDOWS_INSTRUCTION,
+        "instruction": ("Follow the demonstrated cross-application workflow on the primary desktop. "
+                        "Identify applications and controls from current screenshots, never replay coordinates."
+                        if metadata.get("execution_scope") == "desktop" else WINDOWS_INSTRUCTION),
         "environment": {
             "adapter": WINDOWS_ADAPTER,
+            "execution_scope": metadata.get("execution_scope", "window"),
             "target": {
-                "process_name": process_name,
-                "title_contains": title,
+                "process_name": "trace2task.desktop" if metadata.get("execution_scope") == "desktop" else process_name,
+                "title_contains": "Primary desktop" if metadata.get("execution_scope") == "desktop" else title,
                 "recorded_handle": initial_window.get("handle"),
             },
             "reset": {"type": "external", "requires_user_setup": True},
         },
         "observation": {
-            "type": "target_client_rgb",
+            "type": "primary_desktop_rgb" if metadata.get("execution_scope") == "desktop" else "target_client_rgb",
             "width": width,
             "height": height,
             "coordinate_space": "physical_pixels",

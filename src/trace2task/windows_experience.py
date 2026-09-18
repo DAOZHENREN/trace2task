@@ -2081,6 +2081,13 @@ def compile_windows_semantic_experience(
             boundary_hints=boundary_hints,
             narration=narration,
         )
+        if environment.get("execution_scope") == "desktop":
+            prompt += (
+                "\nThis is a PRIMARY-DESKTOP cross-application recording, not a single window. "
+                "Identify the relevant application/window in each state's preconditions and visual "
+                "anchors. Include application-switch transitions when evidenced. Coordinates are "
+                "desktop-relative evidence, never reusable execution instructions.\n"
+            )
         executable = binary_resolver(codex_bin)
         session = session_factory(
             executable,

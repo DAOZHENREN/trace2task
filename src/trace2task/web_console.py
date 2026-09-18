@@ -369,6 +369,7 @@ class ConsoleJob:
     background: bool = False
     adaptive_reasoning: bool = True
     use_experience: bool = True
+    execution_scope: str = "window"
     status: str = "queued"
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -389,6 +390,7 @@ class ConsoleJob:
             "reasoning_effort": self.reasoning_effort,
             "provider": self.provider,
             "selection_mode": self.selection_mode,
+            "execution_scope": self.execution_scope,
             "selection_confidence": self.selection_confidence,
             "selection_reason": self.selection_reason,
             "kind": self.kind,
@@ -543,6 +545,7 @@ class WebConsoleController:
                             self.project_root
                         ).as_posix(),
                         "task_id": contract.task.task_id,
+                        "execution_scope": contract.execution_scope,
                         "instruction": contract.task.instruction,
                         "review_status": contract.task.review_status,
                         "confirmed": not contract.task.requires_confirmation,
@@ -715,7 +718,8 @@ class WebConsoleController:
         return [record for _, record in records]
 
     def route_instruction(self, instruction: str) -> dict[str, Any]:
-        taskpacks = self.list_taskpacks()
+        taskpacks = [task for task in self.list_taskpacks()
+                     if task.get("execution_scope", "window") == "window"]
         match = route_experience(instruction, taskpacks)
         selected = next(task for task in taskpacks if task["path"] == match.task_path)
         return {**match.to_payload(), "task": selected}
@@ -828,6 +832,7 @@ class WebConsoleController:
                         "success": bool(metadata.get("success")),
                         "stop_reason": metadata.get("stop_reason"),
                         "input_events": metadata.get("input_event_count", 0),
+                        "execution_scope": metadata.get("execution_scope", "window"),
                         "narrated": narration_path.is_file(),
                         "narration_chars": narration_chars,
                         "process_name": (metadata.get("initial_window") or {}).get(
@@ -935,12 +940,17 @@ class WebConsoleController:
         adaptive_reasoning: bool = True,
         provider: str = "codex",
         use_experience: bool = True,
+        execution_scope: str = "window",
         api_options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
         if not isinstance(use_experience, bool):
             raise TypeError("使用经验必须是布尔值")
-        if not use_experience and not (isinstance(task_path, str) and task_path.strip()):
+        if execution_scope not in {"window", "desktop"}:
+            raise ValueError("不支持的执行范围")
+        if execution_scope == "desktop" and background:
+            raise ValueError("桌面 Baseline 仅支持前台执行")
+        if execution_scope == "window" and not use_experience and not (isinstance(task_path, str) and task_path.strip()):
             raise ValueError("不使用经验时，请手动选择任务以确定目标窗口和允许的操作")
         if not normalized_instruction:
             raise ValueError("请输入一条任务指令")
@@ -971,33 +981,46 @@ class WebConsoleController:
         allowed_efforts = API_REASONING_EFFORTS if provider == "api" else CODEX_REASONING_EFFORTS
         if reasoning_effort not in allowed_efforts:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
-        if isinstance(task_path, str) and task_path.strip():
+        if execution_scope == "desktop" and not use_experience:
+            resolved_task = None
+            task_id = "桌面 · 无经验 Baseline"
+            adaptive_reasoning = False
+            selection_mode, selection_confidence, selection_reason = "desktop", None, "不读取经验"
+        elif isinstance(task_path, str) and task_path.strip():
             resolved_task = self._resolve_task_path(task_path)
             selection_mode = "manual"
             selection_confidence = None
             selection_reason = "用户手动选择 Trace 经验"
         else:
+            if execution_scope == "desktop":
+                raise ValueError("桌面使用经验时，请手动选择已编译经验")
             routed = self.route_instruction(normalized_instruction)
             resolved_task = self._resolve_task_path(routed["task_path"])
             selection_mode = "auto"
             selection_confidence = float(routed["confidence"])
             selection_reason = str(routed["reason"])
-        contract = load_windows_task(resolved_task)
-        if execute and contract.task.requires_confirmation:
-            raise ValueError("这个示范任务仍是草稿，确认任务包后才能执行")
-        if (
-            execute
-            and contract.selector.process_name
-            and contract.selector.process_name.casefold() in {"weixin.exe", "wechat.exe"}
-            and "type_text" not in contract.task.actions
-        ):
-            raise ValueError("这份微信示范缺少文本输入能力，目前只能生成计划")
+        if resolved_task is not None:
+            contract = load_windows_task(resolved_task)
+            task_id = contract.task.task_id
+            if execution_scope == "window" and contract.execution_scope == "desktop":
+                raise ValueError("桌面经验请使用桌面执行范围")
+            if execution_scope == "desktop" and contract.semantic_experience is None:
+                raise ValueError("请先对所选经验进行语义编译")
+            if execute and contract.task.requires_confirmation:
+                raise ValueError("这个示范任务仍是草稿，确认任务包后才能执行")
+            if (
+                execution_scope == "window" and execute
+                and contract.selector.process_name
+                and contract.selector.process_name.casefold() in {"weixin.exe", "wechat.exe"}
+                and "type_text" not in contract.task.actions
+            ):
+                raise ValueError("这份微信示范缺少文本输入能力，目前只能生成计划")
         with self._lock:
             self._require_idle()
             job = ConsoleJob(
                 job_id=uuid.uuid4().hex,
-                task_path=resolved_task.relative_to(self.project_root).as_posix(),
-                task_id=contract.task.task_id,
+                task_path=resolved_task.relative_to(self.project_root).as_posix() if resolved_task else "",
+                task_id=task_id,
                 instruction=normalized_instruction,
                 mode="execute" if execute else "plan",
                 model=model,
@@ -1009,6 +1032,7 @@ class WebConsoleController:
                 background=background,
                 adaptive_reasoning=adaptive_reasoning,
                 use_experience=use_experience,
+                execution_scope=execution_scope,
             )
             if selection_mode == "auto":
                 job.logs.append(
@@ -1035,6 +1059,7 @@ class WebConsoleController:
         defer_compilation: bool = False,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+        execution_scope: str = "window",
     ) -> dict[str, Any]:
         normalized_task_id = " ".join(task_id.split())
         if not normalized_task_id:
@@ -1051,8 +1076,12 @@ class WebConsoleController:
             raise TypeError("讲解录制开关必须是布尔值")
         if not isinstance(defer_compilation, bool):
             raise TypeError("稍后编译开关必须是布尔值")
-        windows = self.list_windows()
+        if execution_scope not in {"window", "desktop"}:
+            raise ValueError("不支持的录制范围")
+        windows = self.list_windows() if execution_scope == "window" else []
         selected = next((window for window in windows if window["handle"] == handle), None)
+        if execution_scope == "desktop":
+            selected = {"process_name": "trace2task.desktop", "title": "主显示器（跨程序）"}
         if selected is None:
             raise ValueError("所选窗口已经不存在，请刷新窗口列表")
         with self._lock:
@@ -1065,6 +1094,7 @@ class WebConsoleController:
                 instruction=f"录制 {selected['process_name']} - {selected['title']}",
                 mode="record",
                 kind="recording",
+                execution_scope=execution_scope,
                 narrated=narrated,
                 defer_compilation=defer_compilation,
                 model=model,
@@ -2661,15 +2691,22 @@ class WebConsoleController:
             else None
         )
         try:
+            desktop = job.execution_scope == "desktop"
+            if desktop:
+                self._update(job, log="即将录制整个主屏，请关闭敏感窗口。3 秒后开始；F8 完成，F9 取消。")
+                if job.stop_event.wait(3):
+                    self._update(job, status="stopped", log="桌面录制已取消。")
+                    return
             result = record_window_trace(
-                WindowSelector(handle=handle),
+                WindowSelector(process_name="trace2task.desktop") if desktop else WindowSelector(handle=handle),
                 task_id=job.task_id,
                 output_root=self.project_root / "runs",
                 backend=Win32Backend(),
-                capture=GdiWindowCapture(),
+                capture=GdiWindowCapture(desktop=True) if desktop else GdiWindowCapture(),
                 monitor=ConsoleRecordingMonitor(job.stop_event),
                 status_callback=lambda message: self._update(job, log=message),
                 capability_profile=capability_profile,
+                execution_scope=job.execution_scope,
             )
             payload = asdict(result)
             if result.success:
@@ -3189,10 +3226,14 @@ class WebConsoleController:
             )
 
     def _run_job(
-        self, job: ConsoleJob, task_path: Path, execute: bool,
+        self, job: ConsoleJob, task_path: Path | None, execute: bool,
         api_config: ModelAPIConfig | None = None,
     ) -> None:
-        self._update(job, status="running", log="任务已启动。")
+        desktop = job.execution_scope == "desktop"
+        self._update(job, status="running", log=(
+            f"任务已启动 · {'桌面' if desktop else '单窗口'} · "
+            f"{'使用经验' if job.use_experience else '无经验 Baseline'}。"
+        ))
         try:
             kwargs: dict[str, Any] = {
                 "instruction": job.instruction,
@@ -3200,26 +3241,34 @@ class WebConsoleController:
                 "model": job.model,
                 "reasoning_effort": job.reasoning_effort,
                 "output_root": self.project_root / "runs",
-                "background": job.background,
-                "adaptive_reasoning": job.adaptive_reasoning,
-                "use_experience": job.use_experience,
-                "focus": not execute and not job.background,
                 "status_callback": lambda message: self._update(job, log=message),
             }
+            if not desktop:
+                kwargs.update(background=job.background, adaptive_reasoning=job.adaptive_reasoning,
+                              use_experience=job.use_experience,
+                              focus=not execute and not job.background)
             if api_config is not None:
                 kwargs["api_config"] = api_config
-            if execute and self.runner is run_windows_agent:
+            if desktop or self.runner is run_windows_agent:
                 kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
             run_failure: Exception | None = None
             try:
-                result = self.runner(task_path, **kwargs)
+                if desktop:
+                    from trace2task.desktop_runner import run_desktop_baseline
+
+                    result = run_desktop_baseline(task_path=task_path,
+                                                  use_experience=job.use_experience, **kwargs)
+                else:
+                    result = self.runner(task_path, **kwargs)
             except WindowsAgentRunFailed as error:
                 result = error.result
                 run_failure = error.cause
             payload = _jsonable(result)
             if not isinstance(payload, dict):
                 payload = {"value": payload}
-            if execute:
+            payload["execution_scope"] = job.execution_scope
+            payload["use_experience"] = job.use_experience
+            if execute and not desktop:
                 try:
                     candidate = self._save_candidate(job, payload)
                 except Exception as error:  # noqa: BLE001 - preserve the completed job result
@@ -3250,7 +3299,12 @@ class WebConsoleController:
                 )
                 return
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
-            self._update(job, status=final_status, result=payload, log="任务运行结束。")
+            if payload.get("stop_reason") == "error" or (
+                desktop and payload.get("stop_reason") == "action_limit"
+            ):
+                final_status = "failed"
+            self._update(job, status=final_status, result=payload, error=payload.get("error"),
+                         log="任务运行结束。" + ("模型完成声明未经独立验证。" if desktop else ""))
         except Exception as error:  # noqa: BLE001 - job failures must become UI state
             self._update(
                 job,
@@ -3543,6 +3597,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     background=payload.get("input_mode") == "background",
                     adaptive_reasoning=payload.get("adaptive_reasoning", True),
                     use_experience=payload.get("use_experience", True),
+                    execution_scope=payload.get("execution_scope", "window"),
                     provider=payload.get("provider", "codex"),
                     api_options=payload.get("api"),
                 )
@@ -3556,6 +3611,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/recordings":
                 result = self.controller.start_recording(
                     handle=payload.get("handle"),
+                    execution_scope=payload.get("execution_scope", "window"),
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", False),
                     defer_compilation=payload.get("defer_compilation", False),

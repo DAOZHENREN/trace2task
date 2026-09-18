@@ -1,4 +1,6 @@
 const elements = {
+  executionScope: document.querySelector("#execution-scope"),
+  experienceHelp: document.querySelector("#experience-help"),
   version: document.querySelector("#version"),
   taskpack: document.querySelector("#taskpack"),
   taskMeta: document.querySelector("#task-meta"),
@@ -286,10 +288,10 @@ async function refreshWaaTasks({ force = false } = {}) {
 
 function renderRecordingSource() {
   const waa = usesWaaRecording();
-  elements.localRecordingFields.classList.toggle("hidden", waa);
+  elements.localRecordingFields.classList.toggle("hidden", waa || elements.recordSource.value === "desktop");
   elements.waaRecordingFields.classList.toggle("hidden", !waa);
   elements.recordButton.disabled = isBusy()
-    || (!waa && !selectedWindow())
+    || (!waa && elements.recordSource.value !== "desktop" && !selectedWindow())
     || (waa && !selectedWaaTask());
 }
 
@@ -307,7 +309,7 @@ function switchView(view) {
 }
 
 function canExecuteTask(task) {
-  if (!task || !task.confirmed) return false;
+  if (!task || !task.confirmed || task.execution_scope === "desktop") return false;
   const isWechat = /Weixin|WeChat/i.test(task.process_name || "");
   return !isWechat || !task.missing_message_capabilities.includes("type_text");
 }
@@ -317,6 +319,19 @@ function canAutoExecute() {
 }
 
 function renderTaskMeta() {
+  elements.experienceHelp.textContent = elements.executionScope.value === "desktop"
+    ? "开启后手动选择语义经验，使用任务状态图和人工规则指导桌面规划，不复用录制坐标。关闭即 Baseline。"
+    : "关闭后不读取示范、编译阶段或人工反馈；仍需选择任务以确定目标窗口、允许操作和结果验证。";
+  if (elements.executionScope.value === "desktop") {
+    const task = selectedTask();
+    elements.taskMeta.textContent = elements.useExperience.checked
+      ? (task ? `经验：${task.task_id} · 来源：${task.execution_scope === "desktop" ? "桌面" : "单窗口（仅对应应用内参考）"}` : "请手动选择已语义编译的经验。")
+      : "Baseline：只发送指令、主屏截图和最近操作，不读取任何经验。";
+    elements.warning.textContent = "会控制主显示器上的多个程序并占用鼠标键盘。请先关闭敏感内容；F9 或停止按钮中止。模型自报完成不等于独立验证成功。";
+    elements.warning.classList.remove("hidden");
+    elements.executeButton.disabled = isBusy() || (elements.useExperience.checked && (!task?.confirmed || !task?.semantic_experience));
+    return;
+  }
   const task = selectedTask();
   if (!task) {
     elements.taskMeta.textContent = taskpacks.length
@@ -338,6 +353,10 @@ function renderTaskMeta() {
 }
 
 function renderInputModeHelp() {
+  if (elements.executionScope.value === "desktop") {
+    elements.inputModeHelp.textContent = "桌面范围只支持主显示器前台操作，可跨窗口；运行期间请勿使用鼠标键盘。";
+    return;
+  }
   elements.inputModeHelp.textContent = elements.inputMode.value === "background"
     ? "后台执行不会抢占焦点，但目标必须保持可见且不能最小化；部分游戏、模拟器和 GPU 窗口不兼容。"
     : "前台执行会聚焦目标窗口；适用于游戏、模拟器和不接受后台消息的应用。";
@@ -354,7 +373,7 @@ function populateTaskpacks(records) {
   records.forEach((task) => {
     const option = document.createElement("option");
     option.value = task.path;
-    option.textContent = `${task.task_id} · ${task.process_name || "Windows"}${task.confirmed ? "" : "（草稿）"}`;
+    option.textContent = `${task.task_id} · ${task.execution_scope === "desktop" ? "桌面经验" : task.process_name || "Windows"}${task.confirmed ? "" : "（草稿）"}`;
     elements.taskpack.append(option);
   });
   const previousTask = records.find((task) => task.path === previous);
@@ -448,7 +467,7 @@ function syncProviderFields() {
   elements.codexModelSettings.classList.toggle("hidden", usesModelApi());
   elements.apiModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "api");
   elements.localModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "local");
-  elements.adaptiveReasoning.disabled = isBusy() || usesModelApi();
+  elements.adaptiveReasoning.disabled = isBusy() || usesModelApi() || elements.executionScope.value === "desktop";
 }
 
 function populateAgentOptions(options) {
@@ -1389,7 +1408,7 @@ function renderLibrary() {
     item.className = "library-item";
     const title = document.createElement("div");
     title.className = "library-title";
-    title.textContent = recording.task_id || "未命名录制";
+    title.textContent = `${recording.task_id || "未命名录制"}${recording.execution_scope === "desktop" ? " · 桌面录制" : ""}`;
     const subtitle = document.createElement("div");
     subtitle.className = "library-subtitle";
     subtitle.textContent = `${formatTimestamp(recording.created_at)} · ${recording.process_name || "Windows"} · ${recording.input_events} 个输入事件`;
@@ -1959,10 +1978,14 @@ function isBusy() {
 }
 
 function setBusy(busy) {
-  elements.planButton.disabled = busy || !taskpacks.length;
+  const desktop = elements.executionScope.value === "desktop";
+  elements.executionScope.disabled = busy;
+  elements.planButton.disabled = busy || (!desktop && !taskpacks.length);
   const task = selectedTask();
-  elements.executeButton.disabled = busy || (task ? !canExecuteTask(task) : !canAutoExecute());
-  elements.taskpack.disabled = busy;
+  elements.executeButton.disabled = busy || (desktop
+    ? elements.useExperience.checked && (!task?.confirmed || !task?.semantic_experience)
+    : task ? !canExecuteTask(task) || task.execution_scope === "desktop" : !canAutoExecute());
+  elements.taskpack.disabled = busy || (desktop && !elements.useExperience.checked);
   elements.model.disabled = busy;
   [
     elements.modelProvider, elements.localModel, elements.apiBaseUrl, elements.apiModel, elements.apiKey,
@@ -1970,8 +1993,8 @@ function setBusy(busy) {
     elements.apiSaveSettings, elements.apiClearSettings,
   ].forEach((element) => { element.disabled = busy; });
   elements.reasoningEffort.disabled = busy;
-  elements.inputMode.disabled = busy;
-  elements.adaptiveReasoning.disabled = busy || usesModelApi();
+  elements.inputMode.disabled = busy || desktop;
+  elements.adaptiveReasoning.disabled = busy || desktop || usesModelApi();
   elements.instruction.disabled = busy;
   elements.useExperience.disabled = busy;
   elements.viewTabs.forEach((button) => { button.disabled = busy; });
@@ -1988,7 +2011,7 @@ function setBusy(busy) {
   elements.compilerReasoningEffort.disabled = busy;
   elements.refreshWindows.disabled = busy;
   elements.recordButton.disabled = busy
-    || (!usesWaaRecording() && !selectedWindow())
+    || (!usesWaaRecording() && elements.recordSource.value !== "desktop" && !selectedWindow())
     || (usesWaaRecording() && !selectedWaaTask());
   elements.refreshLibrary.disabled = busy;
   document.querySelectorAll(".mini-button").forEach((button) => {
@@ -2014,7 +2037,7 @@ function renderJob(job) {
       ? "编译"
       : job.kind === "revision"
         ? "经验修订"
-        : job.mode === "execute" ? "执行" : "预演";
+        : `${job.mode === "execute" ? "执行" : "预演"} · ${job.execution_scope === "desktop" ? "桌面" : "单窗口"}`;
   elements.jobTask.textContent = job.task_id;
   elements.jobModel.textContent = job.provider === "api"
     ? `API · ${job.model || "—"}`
@@ -2039,7 +2062,7 @@ function renderJob(job) {
   );
   elements.stopButton.classList.toggle(
     "hidden",
-    !busy || !["execute", "record"].includes(job.mode),
+    !busy || job.kind !== "agent" && !["execute", "record"].includes(job.mode),
   );
   elements.recordStopButton.classList.toggle(
     "hidden",
@@ -2201,7 +2224,7 @@ function renderWindowMeta() {
   const windowInfo = selectedWindow();
   if (!windowInfo) {
     elements.windowMeta.textContent = "没有找到可录制的可见窗口。";
-    elements.recordButton.disabled = !usesWaaRecording() || !selectedWaaTask();
+    elements.recordButton.disabled = elements.recordSource.value === "desktop" ? isBusy() : !usesWaaRecording() || !selectedWaaTask();
     return;
   }
   elements.windowMeta.textContent = `${windowInfo.client_width} × ${windowInfo.client_height} · ${windowInfo.is_foreground ? "当前前台" : "录制时自动切换到前台"}`;
@@ -2216,7 +2239,9 @@ async function startRecording() {
   const waa = usesWaaRecording();
   const windowInfo = selectedWindow();
   const taskId = elements.recordName.value.trim();
-  if (!waa && !windowInfo) return showRecordError("请选择一个本地目标窗口");
+  const desktop = elements.recordSource.value === "desktop";
+  if (!waa && !desktop && !windowInfo) return showRecordError("请选择一个本地目标窗口");
+  if (desktop && !window.confirm("将录制整个主显示器的画面和键鼠操作（可跨程序）。请关闭敏感窗口。F8 完成，F9 取消。继续？")) return;
   if (!taskId) return showRecordError("请输入经验名称");
   if (waa && !elements.waaRoot.value.trim()) return showRecordError("请输入 WAA 根目录");
   if (waa && !selectedWaaTask()) return showRecordError("请选择一个 WAA 标准任务");
@@ -2236,7 +2261,8 @@ async function startRecording() {
         model: elements.recordModel.value,
         reasoning_effort: elements.recordReasoningEffort.value,
       } : {
-        handle: windowInfo.handle,
+        handle: desktop ? 0 : windowInfo.handle,
+        execution_scope: desktop ? "desktop" : "window",
         task_id: taskId,
         narrated,
         defer_compilation: deferCompilation,
@@ -2507,8 +2533,12 @@ async function deleteLocalAsset(endpoint, payload) {
 async function startJob(mode) {
   clearError();
   if (dictationSession) return showError("请先结束语音输入并等待转写完成");
-  const task = selectedTask();
-  if (!elements.useExperience.checked && !task) {
+  const desktop = elements.executionScope.value === "desktop";
+  const task = desktop && !elements.useExperience.checked ? null : selectedTask();
+  if (desktop && elements.useExperience.checked && (!task || !task.semantic_experience)) {
+    return showError("请手动选择已语义编译的经验，或关闭“使用经验”运行 Baseline。");
+  }
+  if (!desktop && !elements.useExperience.checked && !task) {
     return showError("不使用经验时，请先手动选择任务以确定目标窗口和允许的操作。");
   }
   const instruction = elements.instruction.value.trim();
@@ -2521,8 +2551,8 @@ async function startJob(mode) {
     : usesModelApi() ? elements.apiModel.value.trim() : elements.model.value;
   const reasoningEffort = local ? "default" : usesModelApi()
     ? elements.apiReasoningEffort.value : elements.reasoningEffort.value;
-  const inputMode = elements.inputMode.value;
-  const adaptiveReasoning = !usesModelApi() && elements.adaptiveReasoning.checked;
+  const inputMode = desktop ? "foreground" : elements.inputMode.value;
+  const adaptiveReasoning = !desktop && !usesModelApi() && elements.adaptiveReasoning.checked;
   if (!instruction) return showError("请输入一条任务指令");
   if (!model) return showError("请输入 API 视觉模型 ID");
   const apiOptions = local ? {
@@ -2540,7 +2570,10 @@ async function startJob(mode) {
       || apiOptions.timeout_seconds < 1 || apiOptions.timeout_seconds > 600)) {
     return showError("请填写 API 地址，并将超时设为 1 到 600 秒");
   }
-  if (mode === "execute") {
+  if (desktop && mode === "execute" && !window.confirm(
+    `将控制整个主显示器（可跨程序），${elements.useExperience.checked ? `使用经验：${task.task_id}` : "不使用任何经验"}。主屏可见内容会发送给 ${model}。\n\n${instruction}\n\n请先关闭敏感内容，运行时不要操作鼠标键盘。F9 停止。确认继续？`
+  )) return;
+  if (!desktop && mode === "execute") {
     let executionTask = task;
     let routeSummary = "手动选择经验";
     if (!executionTask) {
@@ -2575,6 +2608,7 @@ async function startJob(mode) {
         input_mode: inputMode,
         adaptive_reasoning: adaptiveReasoning,
         use_experience: elements.useExperience.checked,
+        execution_scope: desktop ? "desktop" : "window",
       }),
     });
     renderJob(job);
@@ -2633,6 +2667,31 @@ async function initialize() {
 }
 
 elements.taskpack.addEventListener("change", renderTaskMeta);
+elements.useExperience.addEventListener("change", () => {
+  setBusy(isBusy());
+  renderTaskMeta();
+});
+let windowScopeOptions = null;
+elements.executionScope.addEventListener("change", () => {
+  if (elements.executionScope.value === "desktop") {
+    windowScopeOptions = {
+      useExperience: elements.useExperience.checked,
+      inputMode: elements.inputMode.value,
+      adaptiveReasoning: elements.adaptiveReasoning.checked,
+    };
+    elements.useExperience.checked = false;
+    elements.inputMode.value = "foreground";
+    elements.adaptiveReasoning.checked = false;
+  } else if (windowScopeOptions) {
+    elements.useExperience.checked = windowScopeOptions.useExperience;
+    elements.inputMode.value = windowScopeOptions.inputMode;
+    elements.adaptiveReasoning.checked = windowScopeOptions.adaptiveReasoning;
+    windowScopeOptions = null;
+  }
+  setBusy(isBusy());
+  renderInputModeHelp();
+  renderTaskMeta();
+});
 elements.inputMode.addEventListener("change", renderInputModeHelp);
 elements.instruction.addEventListener("input", () => {
   elements.charCount.textContent = `${elements.instruction.value.length} / 2000`;

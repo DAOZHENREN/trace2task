@@ -62,7 +62,8 @@ class WindowFrameCapture(Protocol):
 class GdiWindowCapture:
     """Capture pixels rendered by one selected window's client area."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, desktop: bool = False) -> None:
+        self.desktop = desktop
         if os.name != "nt":
             raise RuntimeError("The Windows capture adapter is available only on Windows")
         self.user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -133,14 +134,14 @@ class GdiWindowCapture:
 
         previous_object = self.gdi32.SelectObject(memory_dc, bitmap)
         try:
-            copied = self.user32.PrintWindow(
+            copied = False if self.desktop else self.user32.PrintWindow(
                 wintypes.HWND(window.handle),
                 memory_dc,
                 PW_CLIENTONLY | PW_RENDERFULLCONTENT,
             )
             if not copied:
                 foreground = int(self.user32.GetForegroundWindow() or 0)
-                if foreground != window.handle:
+                if not self.desktop and foreground != window.handle:
                     raise RuntimeError(
                         "The target cannot render off-screen capture and is not foreground; "
                         "no screen pixels were captured"

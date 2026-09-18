@@ -24,6 +24,97 @@ from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_
 from trace2task.windows_runner import WindowsAgentRunFailed
 
 
+def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypatch):
+    controller = WebConsoleController(tmp_path)
+    calls = []
+    monkeypatch.setattr(controller, "route_instruction", lambda *args: pytest.fail("must not route"))
+    monkeypatch.setattr(controller, "_run_job", lambda *args: calls.append(args))
+    job = controller.start_job(task_path="nonexistent/task.yaml", instruction="打开记事本",
+                               execute=False, execution_scope="desktop", use_experience=False)
+    deadline = time.monotonic() + 2
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls
+    assert job["use_experience"] is False
+    assert job["task_path"] == ""
+    assert job["selection_mode"] == "desktop"
+    assert job["execution_scope"] == "desktop"
+
+
+def test_desktop_rejects_background(tmp_path):
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match="仅支持前台"):
+        controller.start_job(task_path="", instruction="test", execute=True,
+                             execution_scope="desktop", background=True)
+
+
+def test_desktop_experience_uses_shared_worker_and_manual_task(tmp_path, monkeypatch):
+    from trace2task import desktop_runner
+
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    calls = []
+    def runner(**kwargs):
+        calls.append(kwargs)
+        return {"stop_reason": "plan_only", "task_complete": False}
+    monkeypatch.setattr(desktop_runner, "run_desktop_baseline", runner)
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(task_path=str(task), instruction="do it", execute=False,
+                               execution_scope="desktop", use_experience=True)
+    assert controller.wait(job["job_id"])["status"] == "completed"
+    assert calls[0]["task_path"] == task
+    assert calls[0]["use_experience"] is True
+
+
+def test_desktop_recording_does_not_require_window_selection(tmp_path, monkeypatch):
+    controller = WebConsoleController(tmp_path)
+    calls = []
+    monkeypatch.setattr(controller, "list_windows", lambda: pytest.fail("no single-window binding"))
+    monkeypatch.setattr(controller, "_run_recording", lambda *args: calls.append(args))
+    job = controller.start_recording(handle=0, task_id="cross app", execution_scope="desktop")
+    deadline = time.monotonic() + 2
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls
+    assert job["execution_scope"] == "desktop"
+
+
+def test_desktop_task_rejected_by_window_entry(tmp_path):
+    task = _write_windows_task(tmp_path, semantic=True)
+    data = yaml.safe_load(task.read_text("utf-8"))
+    data["environment"]["execution_scope"] = "desktop"
+    task.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="桌面执行范围"):
+        WebConsoleController(tmp_path).start_job(task_path=str(task), instruction="test", execute=True)
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("model_reported_complete", "completed"), ("error", "failed"),
+    ("emergency_stop", "stopped"), ("action_limit", "failed"),
+])
+def test_shared_web_worker_handles_desktop_results(tmp_path, monkeypatch, reason, expected):
+    from trace2task import desktop_runner
+
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        return {"mode": "desktop_baseline", "stop_reason": reason,
+                "task_complete": reason == "model_reported_complete", "verified": False,
+                "performance": {"model_roundtrip_ms": 123}}
+
+    monkeypatch.setattr(desktop_runner, "run_desktop_baseline", runner)
+    controller = WebConsoleController(tmp_path)
+    monkeypatch.setattr(controller, "_save_candidate", lambda *args: pytest.fail("no experience"))
+    job = controller.start_job(task_path="", instruction="test", execute=True,
+                               execution_scope="desktop", use_experience=False)
+    result = controller.wait(job["job_id"])
+    assert result["status"] == expected
+    assert result["result"]["execution_scope"] == "desktop"
+    assert result["result"]["use_experience"] is False
+    assert result["result"]["performance"]["model_roundtrip_ms"] == 123
+    assert calls[0]["emergency_stop"].stop_event is controller._jobs[job["job_id"]].stop_event
+
+
 @pytest.fixture(autouse=True)
 def _stub_compiler_connectivity_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -951,6 +1042,7 @@ def test_web_controller_lists_recordings_and_upgrades_then_confirms_taskpack(
             "success": True,
             "stop_reason": "success_key",
             "input_events": 7,
+            "execution_scope": "window",
             "narrated": False,
             "narration_chars": 0,
             "process_name": "Weixin.exe",

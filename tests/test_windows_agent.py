@@ -1608,7 +1608,7 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
         for status in statuses
     )
     assert any("Received in" in status for status in statuses)
-    assert any("click completed" in status for status in statuses)
+    assert any("click 完成" in status and "ms" in status for status in statuses)
 
 
 def test_pixel_reference_verifier_owns_the_final_success_decision(tmp_path: Path) -> None:

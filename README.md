@@ -8,6 +8,8 @@
 
 Local GPU execution: [Qwen3-VL-8B setup and web model selector](docs/local-model.md).
 
+Desktop execution: [recording, experience guidance and Baseline](docs/desktop-baseline.md) — primary-screen, cross-window control with optional reviewed semantic guidance.
+
 Trace2Task records how a person completes a task and turns that evidence into a versioned experience
 for a multimodal desktop Agent. The Agent does not blindly replay the original clicks or coordinates.
 It observes the current screen, retrieves the relevant parts of the reviewed experience, plans a
