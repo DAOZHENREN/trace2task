@@ -97,6 +97,7 @@ def test_automatic_compiler_draft_requires_matching_frozen_manifest(
         _validate_automatic_compiler_snapshot(task.resolve())
 
     manifest = {
+        "schema_version": "0.1",
         "kind": "automatic_compiler_output",
         "task_path": str(task.resolve()),
         "tree_sha256": "abc",
@@ -105,7 +106,8 @@ def test_automatic_compiler_draft_requires_matching_frozen_manifest(
         json.dumps(manifest), encoding="utf-8"
     )
 
-    assert _validate_automatic_compiler_snapshot(task.resolve()) == manifest
+    with pytest.raises(RuntimeError, match="root is invalid"):
+        _validate_automatic_compiler_snapshot(task.resolve())
 
 
 def test_client_command_passes_exact_reset_and_result_scope() -> None:

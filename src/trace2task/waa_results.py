@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -134,8 +135,11 @@ def _plan_timings(path: Path) -> tuple[int, float]:
 def _condition_episode_dirs(results_root: Path, condition: str) -> list[Path]:
     roots = sorted(
         path
-        for path in results_root.glob(f"trace2task-{condition}*")
+        for path in results_root.iterdir()
         if path.is_dir()
+        and (match := _REPETITION_PATTERN.fullmatch(path.name)) is not None
+        and match.group("condition") == condition
+        and int(match.group("repetition")) > 0
     )
     episodes: set[Path] = set()
     for root in roots:
@@ -535,16 +539,20 @@ def collect_waa_results(results_root: Path) -> list[WaaEpisodeResult]:
 
 def _condition_summary(episodes: list[WaaEpisodeResult]) -> dict[str, Any]:
     elapsed = [episode.elapsed_seconds for episode in episodes if episode.elapsed_seconds is not None]
+    outcomes_available = bool(episodes) and all(
+        episode.completed and math.isfinite(episode.score) for episode in episodes
+    )
     return {
         "runs": len(episodes),
         "completed_runs": sum(episode.completed for episode in episodes),
+        "outcome_coverage": "complete" if outcomes_available else "incomplete" if episodes else "empty",
         "successes": sum(episode.score >= 1.0 for episode in episodes),
-        "success_rate": mean(episode.score >= 1.0 for episode in episodes) if episodes else 0.0,
-        "mean_score": mean(episode.score for episode in episodes) if episodes else 0.0,
-        "mean_actions": mean(episode.actions for episode in episodes) if episodes else 0.0,
-        "mean_plan_calls": mean(episode.plan_calls for episode in episodes) if episodes else 0.0,
+        "success_rate": mean(episode.score >= 1.0 for episode in episodes) if outcomes_available else None,
+        "mean_score": mean(episode.score for episode in episodes) if outcomes_available else None,
+        "mean_actions": mean(episode.actions for episode in episodes) if episodes else None,
+        "mean_plan_calls": mean(episode.plan_calls for episode in episodes) if episodes else None,
         "mean_model_roundtrip_seconds": (
-            mean(episode.model_roundtrip_seconds for episode in episodes) if episodes else 0.0
+            mean(episode.model_roundtrip_seconds for episode in episodes) if episodes else None
         ),
         "mean_elapsed_seconds": mean(elapsed) if elapsed else None,
     }
@@ -564,9 +572,10 @@ def write_waa_report(results_root: Path, output_root: Path) -> dict[str, Any]:
     for condition, summary in conditions.items():
         summary["success_rate_delta_vs_baseline"] = (
             summary["success_rate"] - baseline["success_rate"]
+            if summary["success_rate"] is not None and baseline["success_rate"] is not None else None
         )
     payload = {
-        "schema_version": "0.1",
+        "schema_version": "0.2",
         "results_root": str(results_root.expanduser().resolve()),
         "conditions": conditions,
         "episodes": [asdict(episode) for episode in episodes],
@@ -582,18 +591,23 @@ def write_waa_report(results_root: Path, output_root: Path) -> dict[str, Any]:
     lines = [
         "# Windows Agent Arena experience ablation",
         "",
+        "n/a means no observed samples/comparator or incomplete outcome coverage, not a zero success rate. Deltas are descriptive, not paired causal estimates.",
+        "Missing/invalid results leave outcome rates unavailable; action/timing means describe observed episodes only. Setup failures without episodes are tracked separately in the execution ledger.",
+        "",
         "| condition | runs | success rate | mean actions | mean plans | model seconds | elapsed seconds | delta vs baseline |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for condition in WINDOWS_EXPERIENCE_MODES:
         summary = conditions[condition]
-        elapsed_value = summary["mean_elapsed_seconds"]
-        elapsed_text = "n/a" if elapsed_value is None else f"{elapsed_value:.1f}"
+        def display(key: str, spec: str = ".1f", values: dict[str, Any] = summary) -> str:
+            value = values[key]
+            return "n/a" if value is None else format(value, spec)
+
         lines.append(
-            f"| {condition} | {summary['runs']} | {summary['success_rate']:.1%} | "
-            f"{summary['mean_actions']:.1f} | {summary['mean_plan_calls']:.1f} | "
-            f"{summary['mean_model_roundtrip_seconds']:.1f} | {elapsed_text} | "
-            f"{summary['success_rate_delta_vs_baseline']:+.1%} |"
+            f"| {condition} | {summary['runs']} | {display('success_rate', '.1%')} | "
+            f"{display('mean_actions')} | {display('mean_plan_calls')} | "
+            f"{display('mean_model_roundtrip_seconds')} | {display('mean_elapsed_seconds')} | "
+            f"{display('success_rate_delta_vs_baseline', '+.1%')} |"
         )
     markdown_path = output / "waa-ablation-report.md"
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

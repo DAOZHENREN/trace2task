@@ -365,6 +365,7 @@ class ConsoleJob:
     selection_reason: str | None = None
     kind: str = "agent"
     narrated: bool = False
+    defer_compilation: bool = False
     background: bool = False
     adaptive_reasoning: bool = True
     use_experience: bool = True
@@ -392,6 +393,7 @@ class ConsoleJob:
             "selection_reason": self.selection_reason,
             "kind": self.kind,
             "narrated": self.narrated,
+            "defer_compilation": self.defer_compilation,
             "input_mode": "background" if self.background else "foreground",
             "adaptive_reasoning": self.adaptive_reasoning,
             "use_experience": self.use_experience,
@@ -1030,6 +1032,7 @@ class WebConsoleController:
         handle: int,
         task_id: str,
         narrated: bool = False,
+        defer_compilation: bool = False,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
     ) -> dict[str, Any]:
@@ -1046,6 +1049,8 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
+        if not isinstance(defer_compilation, bool):
+            raise TypeError("稍后编译开关必须是布尔值")
         windows = self.list_windows()
         selected = next((window for window in windows if window["handle"] == handle), None)
         if selected is None:
@@ -1061,6 +1066,7 @@ class WebConsoleController:
                 mode="record",
                 kind="recording",
                 narrated=narrated,
+                defer_compilation=defer_compilation,
                 model=model,
                 reasoning_effort=reasoning_effort,
             )
@@ -1082,6 +1088,7 @@ class WebConsoleController:
         example_path: object,
         task_id: str,
         narrated: bool = True,
+        defer_compilation: bool = False,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
         distro: str = DEFAULT_WAA_DISTRO,
@@ -1100,6 +1107,8 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
+        if not isinstance(defer_compilation, bool):
+            raise TypeError("稍后编译开关必须是布尔值")
         if not isinstance(waa_root, (str, Path)):
             raise TypeError("WAA 根目录必须是路径")
         root = Path(waa_root).expanduser().resolve()
@@ -1151,6 +1160,7 @@ class WebConsoleController:
                 mode="record",
                 kind="waa_recording",
                 narrated=narrated,
+                defer_compilation=defer_compilation,
                 model=model,
                 reasoning_effort=reasoning_effort,
                 result={
@@ -1397,7 +1407,11 @@ class WebConsoleController:
                     if mime_type is None and isinstance(pending.get("mime_type"), str):
                         mime_type = pending["mime_type"]
             job.status = "queued"
-            job.logs.append("讲解已提交，正在归档并准备 Compiler Agent。")
+            job.logs.append(
+                "讲解已提交，正在归档录制。"
+                if job.defer_compilation
+                else "讲解已提交，正在归档并准备 Compiler Agent。"
+            )
             job.updated_at = _now()
 
         try:
@@ -1425,6 +1439,9 @@ class WebConsoleController:
             "audio_start_trace_elapsed_ms": audio_start_trace_elapsed_ms,
         }
         self._update(job, result=payload)
+        if job.defer_compilation:
+            self._finish_deferred_recording(job, payload)
+            return job.snapshot()
         thread = threading.Thread(
             target=self._run_recording_compilation,
             args=(job, trace_path, payload),
@@ -1687,63 +1704,27 @@ class WebConsoleController:
         source_trace: Path,
         fresh_taskpack: bool,
     ) -> dict[str, Any]:
-        task_root = task_path.parent.resolve()
-        marker_path = task_root / ".automatic-compiler-snapshot.json"
-        if marker_path.is_file():
-            existing = json.loads(marker_path.read_text(encoding="utf-8"))
-            snapshot_task = Path(str(existing.get("task_path") or ""))
-            if snapshot_task.is_file():
-                return existing
+        from trace2task.compiler_snapshot import freeze_snapshot, tree_digest, validate_snapshot
 
-        safe_variant = re.sub(r"[^A-Za-z0-9_.-]+", "-", variant).strip("-") or "compiled"
-        snapshot_id = (
-            datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-            + f"-{uuid.uuid4().hex[:8]}-{safe_variant}"
+        marker_path = task_path.parent / ".automatic-compiler-snapshot.json"
+        if marker_path.is_file() and not fresh_taskpack:
+            existing = json.loads(marker_path.read_text(encoding="utf-8"))
+            verified = validate_snapshot(Path(str(existing.get("task_path") or "")))
+            source_hash = hashlib.sha256(source_trace.read_bytes()).hexdigest()
+            tree_hash = tree_digest(task_path.parent, exclude_marker=True)[0]
+            if (existing != verified or existing.get("source_tree_sha256") != tree_hash
+                    or existing.get("source_trace_sha256") != source_hash
+                    or existing.get("variant") != variant or existing.get("model") != model
+                    or existing.get("reasoning_effort") != reasoning_effort):
+                raise RuntimeError("Stale or unverifiable Compiler snapshot marker; freeze a fresh version")
+            return existing
+        payload = freeze_snapshot(
+            task_path, output_root=self.project_root / "evaluations" / "compiler-snapshots",
+            source_trace=source_trace, variant=variant, model=model,
+            reasoning_effort=reasoning_effort, fresh_taskpack=fresh_taskpack,
         )
-        snapshot_root = (
-            self.project_root / "evaluations" / "compiler-snapshots" / snapshot_id
-        ).resolve()
-        snapshot_task_root = snapshot_root / "taskpack"
-        try:
-            shutil.copytree(task_root, snapshot_task_root)
-            snapshot_task = snapshot_task_root / task_path.name
-            tree_sha256, file_count, size_bytes = _taskpack_tree_digest(snapshot_task_root)
-            payload = {
-                "schema_version": "0.1",
-                "snapshot_id": snapshot_id,
-                "kind": "automatic_compiler_output",
-                "created_at": _now(),
-                "variant": variant,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "fresh_taskpack": fresh_taskpack,
-                "source_task_path": str(task_path.resolve()),
-                "source_trace": str(source_trace.resolve()),
-                "source_trace_sha256": hashlib.sha256(source_trace.read_bytes()).hexdigest(),
-                "task_path": str(snapshot_task),
-                "taskpack_root": str(snapshot_task_root),
-                "tree_sha256": tree_sha256,
-                "file_count": file_count,
-                "size_bytes": size_bytes,
-                "review_policy": (
-                    "Unreviewed automatic Compiler output. WAA experiments may run this draft "
-                    "only with the explicit --allow-automatic-compiler-draft flag."
-                ),
-            }
-            snapshot_root.mkdir(parents=True, exist_ok=True)
-            (snapshot_root / "snapshot.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            marker_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            return payload
-        except Exception:
-            if snapshot_root.exists():
-                shutil.rmtree(snapshot_root)
-            raise
+        marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return payload
 
     def _compile_trace_bundle(
         self,
@@ -2699,10 +2680,17 @@ class WebConsoleController:
                         status="awaiting_narration",
                         result=payload,
                         log=(
-                            "示范录制成功。请回到网页检查讲解转写；确认后才会启动 "
-                            "Compiler Agent。"
+                            "示范录制成功。请回到网页检查讲解转写；"
+                            + (
+                                "确认后将保存录制，稍后可手动编译。"
+                                if job.defer_compilation
+                                else "确认后才会启动 Compiler Agent。"
+                            )
                         ),
                     )
+                    return
+                if job.defer_compilation:
+                    self._finish_deferred_recording(job, payload)
                     return
                 self._update(
                     job,
@@ -2928,6 +2916,9 @@ class WebConsoleController:
                         log="WAA 示范成功；正在停止麦克风并准备 Turbo 转写。",
                     )
                     return
+                if job.defer_compilation:
+                    self._finish_deferred_recording(job, payload)
+                    return
                 self._update(
                     job,
                     result=payload,
@@ -2954,6 +2945,22 @@ class WebConsoleController:
             installed_reset_spec.unlink(missing_ok=True)
             if process is not None and process.poll() is None:
                 process.terminate()
+
+    def _finish_deferred_recording(
+        self,
+        job: ConsoleJob,
+        payload: dict[str, Any],
+    ) -> None:
+        payload["compilation"] = {"status": "deferred"}
+        self._update(
+            job,
+            status="completed",
+            result=payload,
+            log=(
+                "录制已完整保存，本次未启动 Compiler Agent；"
+                "可在“本地经验”的原始录制列表中稍后编译。"
+            ),
+        )
 
     def _run_recording_compilation(
         self,
@@ -3394,6 +3401,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "voice_dictation": True,
                         "waa_narrated_recording": True,
                         "waa_task_catalog": True,
+                        "deferred_recording_compilation": True,
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
@@ -3550,6 +3558,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     handle=payload.get("handle"),
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", False),
+                    defer_compilation=payload.get("defer_compilation", False),
                     model=payload.get("model", DEFAULT_COMPILER_MODEL),
                     reasoning_effort=payload.get(
                         "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
@@ -3563,6 +3572,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     example_path=payload.get("example_path", ""),
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", True),
+                    defer_compilation=payload.get("defer_compilation", False),
                     model=payload.get("model", DEFAULT_COMPILER_MODEL),
                     reasoning_effort=payload.get(
                         "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT

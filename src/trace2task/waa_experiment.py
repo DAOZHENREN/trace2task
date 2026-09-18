@@ -101,18 +101,9 @@ def _validate_conditions(
 
 
 def _validate_automatic_compiler_snapshot(task_path: Path) -> dict[str, Any]:
-    manifest_path = task_path.parent.parent / "snapshot.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(
-            "--allow-automatic-compiler-draft requires a frozen Compiler snapshot"
-        )
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.get("kind") != "automatic_compiler_output":
-        raise RuntimeError("Compiler snapshot manifest is invalid")
-    recorded_task = payload.get("task_path")
-    if not isinstance(recorded_task, str) or Path(recorded_task).resolve() != task_path:
-        raise RuntimeError("Compiler snapshot manifest does not match --task")
-    return payload
+    from trace2task.compiler_snapshot import validate_snapshot
+
+    return validate_snapshot(task_path)
 
 
 def _source_trace_path(contract: WindowsTaskContract) -> Path:
