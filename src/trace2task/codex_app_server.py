@@ -271,7 +271,7 @@ class CodexAppServerSession:
                     }
                 }
             )
-            self._transport.send({"method": "initialized", "params": {}})
+            self._send({"method": "initialized", "params": {}})
             self._initialized = True
         params: dict[str, Any] = {
             "cwd": str(self.cwd),
@@ -446,7 +446,8 @@ class CodexAppServerSession:
     ) -> dict[str, Any]:
         self._request_id += 1
         request_id = self._request_id
-        self._transport.send({"method": method, "id": request_id, "params": params})
+        wire_request = {"method": method, "id": request_id, "params": params}
+        self._send(wire_request)
         if deadline is None:
             deadline = time.monotonic() + self.timeout_seconds
         deferred: list[dict[str, Any]] = []
@@ -469,6 +470,12 @@ class CodexAppServerSession:
         finally:
             self._pending_messages.extend(deferred)
 
+    def _send(self, message: dict[str, Any]) -> None:
+        audit = getattr(self, "audit", None)
+        if audit is not None:
+            audit.record("codex_request", payload=message)
+        self._transport.send(message)
+
     def _receive(
         self,
         deadline: float,
@@ -484,7 +491,11 @@ class CodexAppServerSession:
                 f"{self.timeout_seconds:g} seconds"
             )
         try:
-            return self._transport.receive(remaining)
+            message = self._transport.receive(remaining)
+            audit = getattr(self, "audit", None)
+            if audit is not None:
+                audit.record("codex_response", payload=message)
+            return message
         except TimeoutError as error:
             raise _CodexReceiveTimeout(
                 "Codex did not complete its model response or network reconnect within "
@@ -494,7 +505,7 @@ class CodexAppServerSession:
     def _handle_server_request(self, message: dict[str, Any]) -> bool:
         if "method" not in message or "id" not in message:
             return False
-        self._transport.send(
+        self._send(
             {
                 "id": message["id"],
                 "error": {

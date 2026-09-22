@@ -134,6 +134,7 @@ class CodexWindowsAgent:
         self._active_stage_id: str | None = None
         self._escalation_level = 0
         self.session_resets = 0
+        self.audit = None
 
     def plan(self, surface: pygame.Surface) -> WindowsAgentPlan:
         total_started = time.perf_counter()
@@ -414,6 +415,8 @@ class CodexWindowsAgent:
                 cwd=Path.cwd(),
                 timeout_seconds=self.timeout_seconds,
             )
+        if self.audit is not None:
+            self._session.audit = self.audit
         return self._session
 
     def _prepare_session(self) -> tuple[CodexAppServerSession | ModelAPISession, str, bool]:

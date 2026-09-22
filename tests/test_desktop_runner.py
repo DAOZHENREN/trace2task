@@ -81,6 +81,124 @@ CLICK = {"skill": "click", "args": {"x": 0.5, "y": 0.5, "button": "left"}}
 TEXT = {"skill": "type_text", "args": {"text": "hello"}}
 
 
+@pytest.mark.parametrize("orchestration", ["legacy", "langgraph"])
+def test_no_progress_blocks_before_input_and_stops(tmp_path, orchestration):
+    backend = Backend()
+    backend.handle = 2
+    make_plan = managed_plan if orchestration == "langgraph" else plan
+    model = Model([make_plan(CLICK)] * 6)
+    result = run(tmp_path, model, backend, orchestration=orchestration)
+    assert result["stop_reason"] == "no_progress"
+    assert result["actions"] == 3
+    assert len(backend.inputs) == 9
+    assert "Repeated click blocked BEFORE execution" in model.prompts[-1]["prompt"]
+    events = [json.loads(line) for line in Path(result["trace_path"]).read_text().splitlines()]
+    assert sum(e["type"] == "no_progress_blocked" for e in events) == 3
+
+
+def test_guard_ignores_small_animation_but_allows_changed_scene():
+    from trace2task.actions import ActionCall
+    from trace2task.desktop_runner import NoProgressGuard
+    guard = NoProgressGuard()
+    frame = pygame.Surface((100, 80))
+    frame.fill("black")
+    guard.observe(frame, 1)
+    action = ActionCall.from_payload(CLICK)
+    for _ in range(3):
+        guard.delivered(action)
+    pygame.draw.rect(frame, "white", (0, 0, 3, 3))
+    guard.observe(frame, 1)
+    assert guard.repeated(action)
+    nearby = ActionCall.from_payload({"skill": "click", "args": {"x": 0.505, "y": 0.5, "button": "left"}})
+    assert guard.repeated(nearby)
+    frame.fill("white")
+    guard.observe(frame, 1)
+    assert not guard.repeated(action)
+
+
+def test_no_progress_allows_alternative_without_replaying_blocked_batch(tmp_path):
+    backend = Backend()
+    backend.handle = 2
+    model = Model([plan(CLICK)] * 3 + [plan(CLICK, TEXT), plan(TEXT), plan(complete=True)])
+    result = run(tmp_path, model, backend)
+    assert result["task_complete"]
+    assert result["actions"] == 4
+    assert backend.inputs.count("hello") == 1
+
+
+def test_web_execution_submits_orchestration_not_recording():
+    script = (Path(__file__).parents[1] / "src/trace2task/web/app.js").read_text(encoding="utf-8")
+    normal_payload = script.index('task_path: task?.path || "",')
+    normal_job = script.rfind('const job = await request("/api/jobs", {', 0, normal_payload)
+    assert normal_job >= 0
+    execution = script[normal_job : script.index("renderJob(job)", normal_job)]
+    assert 'orchestration: desktop ? elements.desktopOrchestration.value' in execution
+    assert 'resume_from: desktop && elements.desktopOrchestration.value' in execution
+    recording = script.split("async function startRecording()", 1)[1].split("async function upgradeTask", 1)[0]
+    assert "orchestration:" not in recording
+
+
+def managed_plan(*actions, complete=False):
+    return {**plan(*actions, complete=complete), "progress": {
+        "current_subgoal": "check submitted search",
+        "remaining_subgoals": ["play requested song"],
+        "observed_evidence": ["search field visible"],
+        "pending_checks": ["search results loaded"],
+    }}
+
+
+def test_langgraph_records_progress_and_resumes_with_new_observation(tmp_path):
+    first = run(tmp_path, Model([managed_plan(TEXT)]), Backend(),
+                orchestration="langgraph", max_actions=1)
+    assert first["actions"] == 1
+    root = Path(first["trace_path"]).parent
+    assert (root / "checkpoints.sqlite").is_file()
+    assert first["task_state"]["pending_action"] is None
+    assert first["task_state"]["last_outcome"]["effect"] == "unverified_until_next_observation"
+    model = Model([managed_plan(complete=True)])
+    backend = Backend()
+    second = run(tmp_path, model, backend, orchestration="langgraph", resume_from=root)
+    assert second["task_complete"] is True
+    assert backend.inputs == []  # Never replay the first run's text input.
+    assert "search results loaded" in model.prompts[0]["prompt"]
+    assert "hello" in model.prompts[0]["prompt"]
+    assert str(root) not in str(model.prompts[0]["image_path"])
+    assert "progress" in model.prompts[0]["output_schema"]["required"]
+
+
+def test_langgraph_rejects_invalid_progress_before_input(tmp_path):
+    value = managed_plan(TEXT)
+    value["progress"] = {"invented": "bad"}
+    backend = Backend()
+    result = run(tmp_path, Model([value]), backend, orchestration="langgraph")
+    assert result["stop_reason"] == "error"
+    assert backend.inputs == []
+
+
+def test_langgraph_rejects_uncertain_resume_without_replay(tmp_path):
+    from trace2task.actions import ActionCall
+    from trace2task.desktop_workflow import DesktopWorkflow
+    root = tmp_path / "previous"
+    root.mkdir()
+    workflow = DesktopWorkflow(root, "test desktop", None)
+    workflow.before_action(ActionCall.from_payload(TEXT))
+    workflow.close()
+    backend = Backend()
+    result = run(tmp_path, Model([]), backend, orchestration="langgraph", resume_from=root)
+    assert "不能自动恢复" in result["error"]
+    assert backend.inputs == []
+
+
+def test_langgraph_resume_rejects_changed_task(tmp_path):
+    from trace2task.desktop_workflow import DesktopWorkflow
+    root = tmp_path / "previous"
+    root.mkdir()
+    workflow = DesktopWorkflow(root, "different instruction", None)
+    workflow.close()
+    result = run(tmp_path, Model([]), Backend(), orchestration="langgraph", resume_from=root)
+    assert "原任务指令" in result["error"]
+
+
 def run(tmp_path, model, backend, **kwargs):
     return run_desktop_baseline(
         instruction="test desktop",

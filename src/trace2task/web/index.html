@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="trace2task-csrf" content="__TRACE2TASK_CSRF_TOKEN__">
     <title>Trace2Task 控制台</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
@@ -54,11 +55,22 @@
                 <option value="desktop">整个桌面 · 主显示器</option>
               </select>
             </div>
+            <div id="desktop-workflow-settings" hidden>
+              <label class="field-label" for="desktop-orchestration">桌面任务管理</label>
+              <div class="select-wrap"><select id="desktop-orchestration">
+                <option value="legacy">原版 · 截图与最近动作（对照）</option>
+                <option value="langgraph">LangGraph · 子目标记忆与检查点（试验）</option>
+              </select></div>
+              <label class="field-label" for="desktop-resume">恢复未完成任务</label>
+              <div class="select-wrap"><select id="desktop-resume"><option value="">开始新任务</option></select></div>
+              <p class="field-help">恢复会重新观察，不回放旧坐标。请保留原指令及同一版本经验；执行结果不确定时需要先人工核对。</p>
+            </div>
             <label class="field-label" for="taskpack">目标任务 / 经验</label>
             <div class="select-wrap">
               <select id="taskpack" aria-describedby="task-meta"></select>
             </div>
             <div class="task-meta" id="task-meta">正在读取可用 Trace 经验…</div>
+            <p class="field-help" id="experience-help"></p>
 
             <label class="field-label" for="model-provider">执行模型来源</label>
             <div class="select-wrap">
@@ -97,10 +109,49 @@
               <div class="select-wrap">
                 <select id="local-model">
                   <option value="qwen3-vl-8b-instruct">Qwen3-VL-8B-Instruct · Q4_K_M</option>
+                  <option value="qwen3-vl-2b">Qwen3-VL-2B-Instruct · BF16 原版</option>
+                  <option value="gui-owl-2b">GUI-Owl-1.5-2B-Instruct · BF16</option>
+                  <option value="mai-ui-2b">MAI-UI-2B · BF16 桌面实验适配</option>
+                  <option value="trained_d">Trace2Task D · 5970 · 结构化动作模型</option>
                 </select>
               </div>
-              <p class="field-help">连接本机 http://127.0.0.1:8081，使用本地 GPU，无需云 API Key。请先启动本地模型服务；选择此项不会自动下载或启动模型，也不会覆盖云 API 配置。</p>
+              <div class="button-row">
+                <button type="button" class="button secondary" id="local-service-start">启动本地模型服务</button>
+                <button type="button" class="button secondary" id="local-service-stop">关闭本地模型服务</button>
+              </div>
+              <p id="local-service-status" role="status" aria-live="polite"></p>
+              <p class="field-help">启动会先清理旧本地模型服务，再加载所选模型。关闭会清理本项目的 Qwen、D 和 GUI 模型残留服务，释放显存；不会删除模型。任务运行期间不可操作。</p>
               <p class="field-help">推荐启动配置：16K 上下文、Q8 KV 缓存、严格 JSON 输出。实际容量由本地服务启动参数决定；首次建议点击“只生成计划”，长经验仍可能超限。</p>
+            </div>
+            <div id="trained-model-settings" class="hidden">
+              <label class="field-label" for="local-executor">执行后端</label>
+              <select id="local-executor">
+                <option value="win32">Win32 · 现有桌面执行</option>
+                <option value="cua">Cua Driver · 实验性后台窗口执行</option>
+              </select>
+              <div id="cua-target-settings" hidden>
+                <p>Qwen 2B 可在本次明确授权的目标之间路由、滚动和拖动。D / GUI-Owl / MAI 仍受各自输出协议限制，不具备自动跨应用规划。独立按下/松开尚不支持。</p>
+                <button id="cua-refresh" type="button">刷新窗口 / 应用</button>
+                <p class="cua-target-help">勾选本次允许操作的窗口或允许启动的应用（最多 12 项）。窗口授权精确到该窗口，不会因为同一进程而授权其他窗口；启动应用后会重新定位窗口。模型只收到选中范围，执行器拒绝越界。</p>
+                <div id="cua-target-list" class="cua-target-list" aria-live="polite">请先刷新窗口 / 应用。</div>
+                <label for="cua-target">初始目标</label>
+                <select id="cua-target" disabled><option value="">请先勾选一个目标</option></select>
+              </div>
+              <p class="field-help">Cua：直接绑定所选窗口或启动所选应用，无需倒计时切换。后台点击、文本、按键和拖动取决于应用支持；不可用时停止，不自动抢焦点。每次动作后重新观察。F9 / 停止需等待当前驱动调用返回（最长约 20 秒）。</p>
+              <p class="field-help">常驻本机模型。主屏任务原文 + 截图 + 最近四步真实执行历史；不注入经验或 LangGraph。连续执行，无需逐批确认，F9 / 程序停止，最多 40 个动作。done 仅为模型停止声明。三个 2B 基线共用 8768 服务，切换时换载；请先停止空闲的 D 或 Qwen 8B 服务以释放显存。MAI 为手机协议的桌面实验适配，不支持的动作会明确停止。</p>
+              <p>连续执行 · 无需逐批确认 · F9 / 停止按钮中止</p>
+              <label class="field-label" for="trained-model-image">可选：使用图片代替主屏截图</label>
+              <input id="trained-model-image" type="file" accept="image/png,image/jpeg,image/webp">
+              <p class="field-help">未选择图片时，点击“只生成计划”后 3 秒截取主屏，请切换到目标画面。首次加载可能需要数十秒。</p>
+              <p id="trained-model-status" role="status"></p>
+              <img id="trained-model-annotation" alt="预测动作位置" style="max-width:100%" hidden>
+              <pre id="trained-model-result" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+              <div id="trained-batch" hidden>
+                <p>本批动作待确认。确认后请在 3 秒内切回截图中的目标窗口。</p>
+                <img id="trained-batch-image" alt="待确认动作" style="max-width:100%">
+                <pre id="trained-batch-actions" style="white-space:pre-wrap"></pre>
+                <button class="button secondary" id="trained-approve" type="button">确认执行本批</button>
+              </div>
             </div>
             <div id="api-model-settings" class="hidden">
               <label class="field-label" for="api-base-url">API Base URL</label>
@@ -151,13 +202,13 @@
                 模型必须支持图片输入。当前截图与相关经验将发给上述服务商，API 单独计费。
                 点击保存后，密钥由 Windows 当前账户加密保存在本机，不写入日志、任务包或浏览器存储。
                 不支持 JSON Schema 时可选兼容模式，动作仍经本地校验。
-                API 模式关闭自动模型升级；教师编译与经验修订仍使用 Codex。
+                教师编译与经验修订仍使用 Codex。
               </div>
             </div>
             <div class="agent-settings-help">只影响每次任务的规划与执行；不会改变已经编译的经验。</div>
 
             <div class="execution-options">
-              <div>
+              <div id="input-mode-field">
                 <label class="field-label" for="input-mode">输入模式</label>
                 <div class="select-wrap">
                   <select id="input-mode">
@@ -166,23 +217,12 @@
                   </select>
                 </div>
               </div>
-              <label class="toggle-option" for="adaptive-reasoning">
-                <input id="adaptive-reasoning" type="checkbox" checked>
-                <span>
-                  <strong>困难步骤自动升级</strong>
-                  <small>低置信度或未知阶段时临时提高模型与思考强度</small>
-                </span>
-              </label>
             </div>
             <div class="agent-settings-help" id="input-mode-help">
               前台执行会聚焦目标窗口；适用于游戏、模拟器和不接受后台消息的应用。
             </div>
 
             <label class="field-label instruction-label" for="instruction">本次指令</label>
-            <label class="toggle-option" for="use-experience">
-              <input id="use-experience" type="checkbox" checked>
-              <span><strong>使用经验</strong><small id="experience-help">关闭后仅根据本次指令和当前截图规划，不读取示范、编译阶段或人工反馈。单窗口仍需选择任务以确定目标窗口、允许操作和结果验证；桌面暂仅支持无经验 Baseline。</small></span>
-            </label>
             <textarea
               id="instruction"
               maxlength="2000"
@@ -402,6 +442,11 @@
               </div>
               <span class="status-pill idle" id="status-pill">空闲</span>
             </div>
+            <div class="field-help">
+              <label><input type="checkbox" id="task-sound" checked> 任务结束提示音</label>
+              <button type="button" id="task-sound-test" class="mini-button">试听</button>
+              <span id="task-sound-status" role="status">完成、失败或停止时响一次；请保持此页面打开。</span>
+            </div>
 
             <div class="empty-state" id="empty-state">
               <div class="pulse-rings" aria-hidden="true"><span></span></div>
@@ -430,6 +475,7 @@
                 <button class="stop-button hidden" id="stop-button" type="button">停止</button>
               </div>
               <div class="instruction-preview" id="job-instruction"></div>
+              <p id="job-latest-progress" class="field-help" role="status"></p>
 
               <div class="log-heading">
                 <span>实时日志</span>

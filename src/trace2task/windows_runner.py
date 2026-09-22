@@ -20,6 +20,7 @@ from trace2task.codex_app_server import (
     DEFAULT_CODEX_REASONING_EFFORT,
 )
 from trace2task.execution_runtime import ExecutionRuntime, capture_with_timing
+from trace2task.io_audit import IOAudit
 from trace2task.model_api import API_REASONING_EFFORTS, ModelAPIConfig, validate_api_model
 from trace2task.recording import TraceWriter, make_run_dir
 from trace2task.windows_agent import (
@@ -742,6 +743,10 @@ def run_windows_agent(
             seed=0,
             source=f"{provider}_windows_agent",
         )
+        audit = IOAudit(writer.run_dir)
+        runtime.audit = audit
+        if isinstance(agent, CodexWindowsAgent):
+            agent.audit = audit
         writer.record(
             "start",
             surface,

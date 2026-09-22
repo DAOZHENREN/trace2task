@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict, is_dataclass
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -32,6 +33,7 @@ class ExecutionRuntime:
         self.executed_actions = 0
         self.plans = 0
         self.last_plan_ms = 0.0
+        self.audit = None
 
     def _check(self):
         if self.stop is not None:
@@ -77,10 +79,22 @@ class ExecutionRuntime:
             )
 
     def execute(self, motor, action):
-        self._check()
-        if self.executed_actions >= self.max_actions:
-            raise RuntimeError("Action budget exhausted; no input sent")
-        result = motor.execute(action)
+        if self.audit is not None:
+            self.audit.record("executor_input", plan=self.plans,
+                              action=action.to_payload())
+        try:
+            self._check()
+            if self.executed_actions >= self.max_actions:
+                raise RuntimeError("Action budget exhausted; no input sent")
+            result = motor.execute(action)
+        except Exception as error:
+            if self.audit is not None:
+                self.audit.record("executor_error", plan=self.plans,
+                                  error_type=type(error).__name__, message=str(error))
+            raise
+        if self.audit is not None:
+            self.audit.record("executor_result", plan=self.plans,
+                              result=asdict(result) if is_dataclass(result) else vars(result))
         self.executed_actions += 1
         self.status_callback(
             f"[action {self.executed_actions}/{self.max_actions}] {action.skill} "

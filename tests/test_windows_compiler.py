@@ -384,8 +384,10 @@ def test_windows_compiler_preserves_stationary_mouse_hold(tmp_path: Path) -> Non
     } in actions
 
 
-def test_windows_compiler_rejects_concurrent_non_modifier_holds(tmp_path: Path) -> None:
+@pytest.mark.parametrize("scope", ["window", "desktop"])
+def test_windows_compiler_rejects_concurrent_non_modifier_holds(tmp_path: Path, scope: str) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
+    metadata["execution_scope"] = scope
     events[6]["elapsed_ms"] = 900
     events[11]["elapsed_ms"] = 700
     events[12]["elapsed_ms"] = 800
@@ -398,3 +400,52 @@ def test_windows_compiler_rejects_concurrent_non_modifier_holds(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="Concurrent non-modifier keys"):
         compile_trace(trace_path, tmp_path / "compiled")
+
+
+@pytest.mark.parametrize("duration", [413, 501])
+def test_desktop_text_rollover_uses_sampled_timestamps(tmp_path: Path, duration: int) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    metadata["execution_scope"] = "desktop"
+    # Reproduce the QQ Music typing overlap; slow screenshots must not extend
+    # the input intervals. Ctrl+C remains a hotkey, not text.
+    inputs = [
+        (100, "down", "ctrl"),
+        (120, "down", "c"),
+        (180, "up", "c"),
+        (200, "up", "ctrl"),
+        (10252, "down", "i"),
+        (10325, "down", "n"),
+        (10252 + duration, "up", "i"),
+        (10252 + duration, "up", "n"),
+        (11500, "down", "enter"),
+        (11560, "up", "enter"),
+    ]
+    new_events = [events[0]]
+    for seq, (sampled, edge, key) in enumerate(inputs, 1):
+        new_events.append(
+            {
+                "seq": seq,
+                "elapsed_ms": seq * 1500,
+                "type": "windows_input",
+                "frame": events[seq]["frame"],
+                "details": {"raw_input": {**_keyboard(edge, key), "sampled_elapsed_ms": sampled}},
+            }
+        )
+    new_events.append({**events[-1], "seq": 11, "elapsed_ms": 20000})
+    metadata["event_count"] = len(new_events)
+    metadata["input_event_count"] = len(inputs)
+    _rewrite_bundle(trace_path, new_events, metadata)
+    if duration > 500:
+        with pytest.raises(ValueError, match="Concurrent non-modifier keys"):
+            compile_trace(trace_path, tmp_path / "compiled")
+        return
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert report["inference"]["capability_profile"] == "text_entry"
+    demonstration = json.loads(
+        (Path(result.task_path).parent / "demonstration.json").read_text(encoding="utf-8")
+    )
+    actions = [item["action"] for item in demonstration["actions"]]
+    assert {"skill": "type_text", "args": {"text": "<runtime-text-1>"}} in actions
+    assert {"skill": "hotkey", "args": {"keys": ["ctrl", "c"]}} in actions
+    assert {"skill": "press_key", "args": {"key": "enter"}} in actions

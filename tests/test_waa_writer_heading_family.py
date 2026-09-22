@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 INTEGRATION_ROOT = Path("integrations/windows_agent_arena")
 
 VARIANTS = {

@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 _REQUESTS = SimpleNamespace(post=None)
 with patch.dict(sys.modules, {"requests": _REQUESTS}):
     RESET_MODULE = runpy.run_path(

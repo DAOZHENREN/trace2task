@@ -1,0 +1,33 @@
+# Inactive template: copy to .github/workflows/ when workflow-write access is available.
+name: Windows offline regression
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # No weights, API keys, GPU, VM or real desktop actions are needed.
+      - run: uv sync --locked --extra dev
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync pytest -ra
+      - run: node --check src/trace2task/web/app.js
+      - run: node --test tests/*.test.cjs

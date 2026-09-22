@@ -1,0 +1,12 @@
+# Windows Python 3.11. Install torch/torchvision from the official cu128 index first.
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers==4.57.1
+tokenizers==0.22.1
+peft==0.17.1
+accelerate==1.10.1
+safetensors==0.8.0
+Pillow==11.3.0
+numpy==2.2.6
+pygame==2.6.1
+PyYAML==6.0.2

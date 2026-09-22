@@ -1,0 +1,8 @@
+# Existing Windows CUDA environment used for validation (Python 3.11.9).
+# Install torch from the official cu128 index, NOT the server's old cu124 build.
+torch==2.7.1+cu128
+transformers==4.57.1
+tokenizers==0.22.1
+accelerate==1.10.1
+safetensors==0.8.0
+Pillow==11.3.0

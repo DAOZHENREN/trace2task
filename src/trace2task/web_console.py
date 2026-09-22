@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -367,9 +368,11 @@ class ConsoleJob:
     narrated: bool = False
     defer_compilation: bool = False
     background: bool = False
-    adaptive_reasoning: bool = True
+    adaptive_reasoning: bool = False
     use_experience: bool = True
     execution_scope: str = "window"
+    orchestration: str = "legacy"
+    resume_from: str = ""
     status: str = "queued"
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
@@ -378,6 +381,11 @@ class ConsoleJob:
     error: str | None = None
     stop_requested: bool = False
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    continuous: bool = False
+    executor_backend: str = "win32"
+    cua_target: dict | None = None
+    approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    pending_batch: dict[str, Any] | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -391,6 +399,8 @@ class ConsoleJob:
             "provider": self.provider,
             "selection_mode": self.selection_mode,
             "execution_scope": self.execution_scope,
+            "orchestration": self.orchestration,
+            "resume_from": self.resume_from,
             "selection_confidence": self.selection_confidence,
             "selection_reason": self.selection_reason,
             "kind": self.kind,
@@ -406,6 +416,9 @@ class ConsoleJob:
             "result": self.result,
             "error": self.error,
             "stop_requested": self.stop_requested,
+            "pending_batch": self.pending_batch,
+            "executor_backend": self.executor_backend,
+            "cua_target": self.cua_target,
         }
 
 
@@ -937,13 +950,37 @@ class WebConsoleController:
         model: str = DEFAULT_CODEX_MODEL,
         reasoning_effort: str = DEFAULT_CODEX_REASONING_EFFORT,
         background: bool = False,
-        adaptive_reasoning: bool = True,
+        adaptive_reasoning: bool = False,
         provider: str = "codex",
         use_experience: bool = True,
         execution_scope: str = "window",
+        orchestration: str = "legacy",
+        resume_from: str = "",
         api_options: dict[str, Any] | None = None,
+        continuous: bool = False,
+        executor_backend: str = "win32",
+        cua_target: dict | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
+        if executor_backend not in {"win32", "cua"} or (executor_backend == "cua" and provider != "trained_d"):
+            raise ValueError("Cua 实验后端仅支持本地原生模型")
+        if executor_backend == "cua":
+            from trace2task.cua_scope import normalize_scope
+            cua_target = normalize_scope(cua_target)
+        if orchestration not in {"legacy", "langgraph"}:
+            raise ValueError("不支持的任务管理模式")
+        if execution_scope != "desktop" and (orchestration != "legacy" or resume_from):
+            raise ValueError("LangGraph 试验仅支持桌面执行")
+        if resume_from:
+            if orchestration != "langgraph":
+                raise ValueError("恢复任务需要 LangGraph 模式")
+            resumed = (self.project_root / resume_from).resolve()
+            runs_root = (self.project_root / "runs").resolve()
+            if not resumed.is_relative_to(runs_root) or resumed == runs_root:
+                raise ValueError("只能恢复本项目 runs 下的运行")
+            if not (resumed / "checkpoints.sqlite").is_file():
+                raise ValueError("找不到该运行的检查点")
+            resume_from = str(resumed)
         if not isinstance(use_experience, bool):
             raise TypeError("使用经验必须是布尔值")
         if execution_scope not in {"window", "desktop"}:
@@ -956,7 +993,18 @@ class WebConsoleController:
             raise ValueError("请输入一条任务指令")
         if len(normalized_instruction) > 2_000:
             raise ValueError("任务指令不能超过 2000 个字符")
-        if provider not in {"codex", "api"}:
+        if provider == "trained_d":
+            if execution_scope != "desktop" or use_experience or orchestration != "legacy" or resume_from:
+                raise ValueError("D 模型仅支持主屏桌面、无经验、独立任务")
+            if type(continuous) is not bool:
+                raise ValueError("continuous 必须为布尔值")
+            from trace2task.local_gui_protocol import MODELS
+            if model == DEFAULT_CODEX_MODEL:
+                model = "D-5970"  # Legacy caller omitted the D model identifier.
+            if model not in ("D-5970", *MODELS):
+                raise ValueError("不支持的本地 GPU 模型")
+            reasoning_effort = "low"
+        if provider not in {"codex", "api", "trained_d"}:
             raise ValueError("执行模型来源必须是 codex 或 api")
         if not isinstance(background, bool) or not isinstance(adaptive_reasoning, bool):
             raise TypeError("输入模式和自适应推理设置必须是布尔值")
@@ -1033,6 +1081,11 @@ class WebConsoleController:
                 adaptive_reasoning=adaptive_reasoning,
                 use_experience=use_experience,
                 execution_scope=execution_scope,
+                orchestration=orchestration,
+                resume_from=resume_from,
+                continuous=continuous,
+                executor_backend=executor_backend,
+                cua_target=cua_target,
             )
             if selection_mode == "auto":
                 job.logs.append(
@@ -3253,9 +3306,34 @@ class WebConsoleController:
                 kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
             run_failure: Exception | None = None
             try:
-                if desktop:
+                if job.provider == "trained_d":
+                    from trace2task.trained_model_runner import run_trained_desktop
+
+                    if not execute:
+                        raise ValueError("D 模型预览请使用预测入口")
+
+                    def approve(batch):
+                        token = uuid.uuid4().hex
+                        job.approval_event.clear()
+                        with self._lock:
+                            job.pending_batch = {**batch, "token": token}
+                        self._update(job, log="等待本批动作确认；可在页面确认或按 F9 停止。")
+                        while not job.approval_event.wait(.1):
+                            kwargs["emergency_stop"].raise_if_requested()
+                        kwargs["emergency_stop"].raise_if_requested()
+
+                    result = run_trained_desktop(
+                        instruction=job.instruction, output_root=self.project_root / "runs",
+                        emergency_stop=kwargs["emergency_stop"], status_callback=kwargs["status_callback"],
+                        approve=approve, continuous=job.continuous, model=job.model,
+                        executor_backend=job.executor_backend,
+                        cua_target=job.cua_target,
+                    )
+                    job.pending_batch = None
+                elif desktop:
                     from trace2task.desktop_runner import run_desktop_baseline
 
+                    kwargs.update(orchestration=job.orchestration, resume_from=job.resume_from or None)
                     result = run_desktop_baseline(task_path=task_path,
                                                   use_experience=job.use_experience, **kwargs)
                 else:
@@ -3299,12 +3377,28 @@ class WebConsoleController:
                 )
                 return
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
+            if job.provider == "trained_d" and payload.get("stop_reason") in {
+                "no_progress",
+                "model_done_unverified",
+                "effect_unverifiable",
+            }:
+                final_status = "stopped"
             if payload.get("stop_reason") == "error" or (
                 desktop and payload.get("stop_reason") == "action_limit"
             ):
                 final_status = "failed"
-            self._update(job, status=final_status, result=payload, error=payload.get("error"),
-                         log="任务运行结束。" + ("模型完成声明未经独立验证。" if desktop else ""))
+            completion_note = ""
+            if payload.get("stop_reason") == "effect_unverifiable":
+                completion_note = "动作已送达，但效果无法确认；任务已停止。"
+            elif desktop:
+                completion_note = "模型完成声明未经独立验证。"
+            self._update(
+                job,
+                status=final_status,
+                result=payload,
+                error=payload.get("error"),
+                log="任务运行结束。" + completion_note,
+            )
         except Exception as error:  # noqa: BLE001 - job failures must become UI state
             self._update(
                 job,
@@ -3430,9 +3524,34 @@ class WebConsoleController:
 class WebConsoleHandler(BaseHTTPRequestHandler):
     controller: WebConsoleController
     asset_root: Path
+    csrf_token: str
 
     def do_GET(self) -> None:
+        try:
+            self._require_loopback_host()
+        except ValueError as error:
+            self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/desktop-checkpoints":
+            runs = self.controller.project_root / "runs"
+            items = []
+            for directory in sorted(runs.glob("*-desktop-*"), reverse=True):
+                if not directory.resolve().is_relative_to(runs.resolve()):
+                    continue
+                try:
+                    state = json.loads((directory / "task-state.json").read_text(encoding="utf-8"))
+                    if state.get("status") == "complete" or not (directory / "checkpoints.sqlite").is_file():
+                        continue
+                    items.append({"path": directory.relative_to(self.controller.project_root).as_posix(),
+                                  "name": directory.name, "instruction": state.get("instruction", ""),
+                                  "uncertain": bool(state.get("pending_action"))})
+                except (OSError, ValueError):
+                    continue
+                if len(items) >= 30:
+                    break
+            self._json({"runs": items})
+            return
         if parsed.path == "/api/state":
             self._json(
                 {
@@ -3549,16 +3668,27 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             ".js": "text/javascript; charset=utf-8",
             ".css": "text/css; charset=utf-8",
         }[path.suffix]
-        self._bytes(path.read_bytes(), content_type=content_type)
+        data = path.read_bytes()
+        if asset == "index.html":
+            # A per-server token complements the loopback Host/Origin checks below.
+            # It stops a hostile page from submitting a state-changing local request
+            # even when the browser is pointed at a rebinding hostname.
+            data = data.replace(
+                b"__TRACE2TASK_CSRF_TOKEN__",
+                self.csrf_token.encode("ascii"),
+            )
+        self._bytes(data, content_type=content_type)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            self._require_api_same_origin()
             payload = self._read_json(
                 max_bytes=(
                     MAX_NARRATION_REQUEST_BYTES
                     if parsed.path
                     in {
+                        "/api/trained-model/predict",
                         "/api/recordings/narration",
                         "/api/recordings/transcribe",
                         "/api/transcribe",
@@ -3566,8 +3696,47 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     else MAX_REQUEST_BYTES
                 )
             )
+            if parsed.path == "/api/local-model/service":
+                active = self.controller.active_job()
+                if active and active.get("status") not in {"completed", "failed", "cancelled", "stopped"}:
+                    raise RuntimeError("请先停止当前任务，再管理本地模型服务")
+                from trace2task.local_model_service import control_service
+                self._json(control_service(payload.get("action"), payload.get("model"), self.controller.project_root))
+                return
+            if parsed.path == "/api/cua/windows":
+                import tempfile
+
+                from trace2task.cua_backend import CuaBackend
+                with tempfile.TemporaryDirectory(prefix="trace2task-catalog-") as folder:
+                    driver = CuaBackend(folder, lambda *args, **kwargs: None)
+                    try:
+                        driver.start()
+                        self._json({"windows": driver.windows(), "apps": [
+                            {"name": a.get("name"), "launch_path": a["launch_path"]}
+                            for a in driver.call("list_apps", {}).get("apps", []) if a.get("launch_path")]})
+                    finally:
+                        driver.close()
+                return
+            if parsed.path == "/api/trained-model/predict":
+                from trace2task.local_model_service import service_busy
+                if service_busy():
+                    raise RuntimeError("本地模型服务正在启动或关闭，请稍候")
+                from trace2task.trained_model_client import predict_local
+
+                active = self.controller.active_job()
+                if active and active.get("status") in {
+                    "queued", "running", "stopping", "awaiting_recording_start", "awaiting_narration",
+                }:
+                    raise RuntimeError("请先结束当前任务，再使用 D 模型预览")
+                selected = payload.get("model", "D-5970")
+                if selected == "D-5970":
+                    result = predict_local(payload.get("task", ""), image=payload.get("image"))
+                else:
+                    from trace2task.local_gui_client import predict_gui
+                    result = predict_gui(payload.get("task", ""), model=selected, image=payload.get("image"))
+                self._json(result)
+                return
             if parsed.path in {"/api/model-settings/save", "/api/model-settings/clear"}:
-                self._require_api_same_origin()
                 if parsed.path.endswith("/clear"):
                     self._json(self.controller.api_settings.clear())
                 else:
@@ -3584,8 +3753,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     ))
                 return
             if parsed.path == "/api/jobs":
-                if payload.get("provider") == "api":
-                    self._require_api_same_origin()
+                from trace2task.local_model_service import service_busy
+                if service_busy():
+                    raise RuntimeError("本地模型服务正在启动或关闭，请稍候")
                 result = self.controller.start_job(
                     task_path=payload.get("task_path", ""),
                     instruction=payload.get("instruction", ""),
@@ -3595,13 +3765,29 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         "reasoning_effort", DEFAULT_CODEX_REASONING_EFFORT
                     ),
                     background=payload.get("input_mode") == "background",
-                    adaptive_reasoning=payload.get("adaptive_reasoning", True),
+                    adaptive_reasoning=False,
                     use_experience=payload.get("use_experience", True),
                     execution_scope=payload.get("execution_scope", "window"),
+                    orchestration=payload.get("orchestration", "legacy"),
+                    resume_from=payload.get("resume_from", ""),
                     provider=payload.get("provider", "codex"),
                     api_options=payload.get("api"),
+                    continuous=payload.get("continuous", False),
+                    executor_backend=payload.get("executor_backend", "win32"),
+                    cua_target=payload.get("cua_target"),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
+                return
+            if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/approve"):
+                job_id = parsed.path.removeprefix("/api/jobs/").removesuffix("/approve")
+                with self.controller._lock:
+                    job = self.controller._jobs[job_id]
+                    if (job.provider != "trained_d" or job.status != "running"
+                            or not job.pending_batch or job.pending_batch["token"] != payload.get("token")):
+                        raise ValueError("该批次已过期或不存在，请刷新")
+                    job.pending_batch = None
+                    job.approval_event.set()
+                self._json({"status": "approved"})
                 return
             if parsed.path == "/api/experience-route":
                 self._json(
@@ -3791,16 +3977,27 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             )
 
     def _require_api_same_origin(self) -> None:
-        # Prevent cross-origin form posts/DNS rebinding from using server credentials.
+        # State-changing routes can start desktop control, read audio/screenshots,
+        # mutate taskpacks, or manage a local model.  Keep all of them behind the
+        # same protection, not just routes that happen to use an API key.
+        host = self._require_loopback_host()
+        origin = self.headers.get("Origin")
+        if origin != f"http://{host}":
+            raise ValueError("不允许跨站提交模型 API 请求")
+        if not secrets.compare_digest(
+            self.headers.get("X-Trace2Task-CSRF", ""), self.csrf_token
+        ):
+            raise ValueError("本机控制台请求缺少有效的安全令牌；请刷新页面后重试")
+        if self.headers.get_content_type() != "application/json":
+            raise ValueError("模型 API 请求必须使用 application/json")
+
+    def _require_loopback_host(self) -> str:
+        """Reject DNS-rebinding hosts before serving local task data or images."""
         port = self.server.server_address[1]
         host = self.headers.get("Host", "")
         if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
-            raise ValueError("模型 API 请求必须通过本机控制台访问")
-        origin = self.headers.get("Origin")
-        if origin is not None and origin != f"http://{host}":
-            raise ValueError("不允许跨站提交模型 API 请求")
-        if self.headers.get_content_type() != "application/json":
-            raise ValueError("模型 API 请求必须使用 application/json")
+            raise ValueError("本机控制台请求必须通过 127.0.0.1 或 localhost 访问")
+        return host
 
     def _read_json(self, *, max_bytes: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length", "0")
@@ -3837,7 +4034,17 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'")
+        # The local structured-action preview returns an annotated image as a data
+        # URL.  Permit that one rendering path without opening scripts, network
+        # connections, frames, or form submissions to arbitrary origins.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "img-src 'self' data:; connect-src 'self'; form-action 'self'; "
+            "base-uri 'none'; object-src 'none'; frame-ancestors 'none'",
+        )
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(data)
 
@@ -3860,6 +4067,7 @@ def create_web_server(
 
     BoundWebConsoleHandler.controller = active_controller
     BoundWebConsoleHandler.asset_root = asset_root
+    BoundWebConsoleHandler.csrf_token = secrets.token_urlsafe(32)
 
     return ThreadingHTTPServer(("127.0.0.1", port), BoundWebConsoleHandler)
 

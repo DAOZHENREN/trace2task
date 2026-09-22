@@ -142,7 +142,7 @@ def _provider_error_detail(raw: bytes, api_key: str) -> str:
     return " ".join(message.split())[:400]
 
 
-def _post_completion(config: ModelAPIConfig, payload: dict[str, Any]) -> dict[str, Any]:
+def _post_completion(config: ModelAPIConfig, payload: dict[str, Any], *, audit=None) -> dict[str, Any]:
     request = Request(
         config.endpoint,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -156,10 +156,19 @@ def _post_completion(config: ModelAPIConfig, payload: dict[str, Any]) -> dict[st
     try:
         with build_opener(_NoRedirects()).open(request, timeout=config.timeout_seconds) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
+            if audit is not None:
+                audit.record("http_response", secrets=(config.api_key,),
+                             status=response.status, body=raw.decode("utf-8", errors="replace"),
+                             truncated=len(raw) > MAX_RESPONSE_BYTES)
     except HTTPError as error:
         status = error.code
         try:
-            detail = _provider_error_detail(error.read(8192), config.api_key)
+            error_body = error.read(MAX_RESPONSE_BYTES + 1)
+            if audit is not None:
+                audit.record("http_response", secrets=(config.api_key,), status=status,
+                             body=error_body.decode("utf-8", errors="replace"),
+                             truncated=len(error_body) > MAX_RESPONSE_BYTES)
+            detail = _provider_error_detail(error_body[:8192], config.api_key)
         except (OSError, ValueError):
             detail = ""
         finally:
@@ -214,6 +223,7 @@ class ModelAPISession:
         self._closed = threading.Event()
         self._generation = 1
         self.last_turn_metrics: CodexTurnMetrics | None = None
+        self.audit = None
 
     def reset_thread(self) -> None:
         if self._closed.is_set():
@@ -290,7 +300,22 @@ class ModelAPISession:
         elif effort != "default":
             payload["reasoning_effort"] = effort
         reused = bool(self._history)
-        result = self._request_interruptibly(payload)
+        if self.audit is not None:
+            self.audit.record("model_request", secrets=(self.config.api_key,),
+                              provider="chat_completions", generation=self._generation,
+                              endpoint=self.config.endpoint, method="POST",
+                              headers={"Authorization": "[REDACTED]",
+                                       "Content-Type": "application/json", "Accept": "application/json"},
+                              payload=payload)
+        try:
+            result = self._request_interruptibly(payload)
+        except Exception as error:
+            if self.audit is not None:
+                self.audit.record("model_error", secrets=(self.config.api_key,),
+                                  error_type=type(error).__name__, message=str(error))
+            raise
+        if self.audit is not None:
+            self.audit.record("model_response", secrets=(self.config.api_key,), payload=result)
         choices = result.get("choices")
         if not isinstance(choices, list) or len(choices) != 1:
             raise RuntimeError("Model API returned no single completion choice")
@@ -335,7 +360,11 @@ class ModelAPISession:
 
         def request() -> None:
             try:
-                results.put(self._requester(self.config, payload))
+                if self._requester is _post_completion:
+                    result = _post_completion(self.config, payload, audit=self.audit)
+                else:
+                    result = self._requester(self.config, payload)
+                results.put(result)
             except Exception as error:  # noqa: BLE001 - return errors to the calling thread
                 results.put(error)
 

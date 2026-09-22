@@ -12,3 +12,13 @@ taskpacks/.trash/
 taskpacks/*-windows-taskpack/
 evaluations/
 tmp/
+
+# Local credentials and model assets must not enter source releases.
+.env
+.env.*
+!.env.example
+models/
+*.safetensors
+*.gguf
+*.pt
+*.pth

@@ -21,6 +21,9 @@ WINDOWS_INSTRUCTION = (
     "state shown in the final reference frame."
 )
 KEY_HOLD_THRESHOLD_MS = 300
+# Desktop polling can delay releases while screenshots are encoded. Only infer
+# text entry for short printable input; sustained controls keep strict checks.
+DESKTOP_TEXT_PRESS_LIMIT_MS = 500
 WAIT_THRESHOLD_MS = 500
 MAX_COMPILED_WAIT_MS = 10_000
 MAX_KEY_HOLD_MS = 5_000
@@ -652,6 +655,13 @@ def compile_windows_trace(
         or isinstance(metadata.get("waa_task_id"), str)
     ):
         capability_profile = "text_entry"
+    if capability_profile is None and metadata.get("execution_scope") == "desktop":
+        key_intervals, _, _ = _pair_input_intervals(raw_events)
+        text_intervals, _, _ = _classify_messaging_keyboard(key_intervals)
+        if text_intervals and all(
+            _duration(interval) <= DESKTOP_TEXT_PRESS_LIMIT_MS for interval in text_intervals
+        ):
+            capability_profile = "text_entry"
     if capability_profile not in {None, *TEXT_ENTRY_CAPABILITY_PROFILES}:
         raise ValueError(f"Unsupported Windows capability profile: {capability_profile!r}")
     inferred, ignored_releases = _compile_actions(

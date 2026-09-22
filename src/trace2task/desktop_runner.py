@@ -15,6 +15,7 @@ from trace2task.actions import ActionCall, parameterized_action_schema
 from trace2task.codex_agent import resolve_codex_binary
 from trace2task.codex_app_server import CodexAppServerSession
 from trace2task.execution_runtime import ExecutionRuntime, capture_with_timing
+from trace2task.io_audit import IOAudit
 from trace2task.model_api import ModelAPISession
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import (
@@ -27,6 +28,55 @@ from trace2task.windows_control import (
 )
 from trace2task.windows_runner import EmergencyStopRequested
 from trace2task.windows_task import load_windows_task
+
+
+class NoProgressGuard:
+    """Conservative repeated-click guard, not a semantic success verifier."""
+
+    def __init__(self):
+        self.anchor = None
+        self.context = None
+        self.clicks = []
+        self.blocked_attempts = 0
+
+    def observe(self, frame, handle):
+        pixels = pygame.image.tobytes(pygame.transform.smoothscale(frame, (64, 40)), "RGB")
+        context = (handle, frame.get_size())
+        changed = self.anchor is None or context != self.context
+        if not changed:
+            # Ignore small animations/noise; compare against an anchor, not just
+            # adjacent frames, so gradual changes can eventually release a block.
+            changed = sum(abs(a - b) > 24 for a, b in zip(pixels, self.anchor)) / len(pixels) > 0.08
+        if changed:
+            self.anchor, self.context = pixels, context
+            self.clicks.clear()
+            self.blocked_attempts = 0
+
+    def repeated(self, action):
+        if action.skill not in {"click", "double_click"}:
+            return False
+        args = action.to_payload()["args"]
+        return sum(
+            old["button"] == args["button"]
+            and abs(old["x"] - args["x"]) <= 0.015
+            and abs(old["y"] - args["y"]) <= 0.015
+            for old in self.clicks
+        ) >= 3
+
+    def delivered(self, action):
+        if action.skill in {"click", "double_click"}:
+            self.clicks.append(action.to_payload()["args"])
+
+    def context_note(self):
+        if not self.clicks:
+            return ""
+        return (
+            "\nNo-progress guard: no substantial visual change confirmed since these clicks: "
+            + json.dumps(self.clicks[-12:])
+            + ". Small animations do not confirm progress. Repeating a nearby click after three "
+            "deliveries is blocked. Diagnose the missing effect; propose only a justified alternative, "
+            "not a coordinate nudge to bypass the guard. Do not claim completion to bypass it."
+        )
 
 SKILLS = ("click", "double_click", "type_text", "press_key", "hotkey", "wait")
 SCHEMA = {
@@ -111,8 +161,14 @@ def run_desktop_baseline(
     max_actions=80,
     task_path=None,
     use_experience=False,
+    orchestration="legacy",
+    resume_from=None,
 ):
     """Run a bounded baseline. Completion is a model claim, not evaluator truth."""
+    if orchestration not in {"legacy", "langgraph"}:
+        raise ValueError("Unknown desktop orchestration")
+    if resume_from and orchestration != "langgraph":
+        raise ValueError("恢复任务需要 LangGraph 模式")
     experience_context = None
     if use_experience:
         if task_path is None:
@@ -146,6 +202,8 @@ def run_desktop_baseline(
         "actions": 0,
         "trace_path": str(trace),
         "stop_reason": "action_limit",
+        "orchestration": orchestration,
+        "resumed_from": str(resume_from) if resume_from else None,
     }
     run_started = time.monotonic()
     performance = dict.fromkeys(
@@ -173,7 +231,16 @@ def run_desktop_baseline(
             )
 
     model_session = session
+    workflow = None
     try:
+        output_schema = SCHEMA
+        if orchestration == "langgraph":
+            from trace2task.desktop_workflow import PROGRESS_SCHEMA, DesktopWorkflow
+            workflow = DesktopWorkflow(root, instruction, experience_context, resume_from)
+            output_schema = {**SCHEMA, "properties": {**SCHEMA["properties"], "progress": PROGRESS_SCHEMA},
+                             "required": [*SCHEMA["required"], "progress"]}
+            result["checkpoint_path"] = str(root / "checkpoints.sqlite")
+            status_callback("LangGraph 任务状态已启用；恢复时重新观察，不重放旧动作。")
         emergency_stop.start()
         backend = backend or Win32Backend()
         capture = capture or GdiWindowCapture(desktop=True)
@@ -199,6 +266,9 @@ def run_desktop_baseline(
                 timeout_seconds=120,
             )
         )
+        audit = IOAudit(root)
+        model_session.audit = audit
+        runtime.audit = audit
         record(
             "start",
             instruction=instruction,
@@ -208,15 +278,18 @@ def run_desktop_baseline(
             experience_mode="feedback" if use_experience else "baseline",
             experience=experience_context,
             coordinate_space="primary_desktop_normalized",
+            orchestration=orchestration,
         )
+        status_callback(f"桌面任务管理：{orchestration}；无进展重复点击保护已启用。")
         if experience_context:
             status_callback(f"已加载经验：{experience_context['task_id']}；使用语义状态图和人工规则，"
                             "不回放原始坐标。")
         status_callback("桌面执行：3 秒后截图；主屏所有可见内容会发送给所选模型。F9 停止。")
         emergency_stop.sleep(3)
-        history = []
+        history = list(workflow.state["recent_actions"]) if workflow else []
         stale_plans = 0
         recovery_note = ""
+        progress_guard = NoProgressGuard()
 
         def recover_stale_plan():
             nonlocal stale_plans, recovery_note
@@ -233,6 +306,9 @@ def run_desktop_baseline(
                 expected_size=[desktop.window.client_width, desktop.window.client_height],
                 actual_size=list(size()),
             )
+            if workflow:
+                workflow.update(status="reobserve", pending_action=None,
+                                last_outcome={"effect": "stale_plan_discarded", "reason": recovery_note})
             if stale_plans >= 3:
                 raise WindowSafetyError(
                     "桌面连续 3 次在规划或执行前变化，已停止；请勿切换窗口或调整分辨率后重试"
@@ -245,6 +321,7 @@ def run_desktop_baseline(
             window = desktop.observe()
             frame, capture_ms = capture_with_timing(capture, window)
             performance["capture_ms"] += capture_ms
+            progress_guard.observe(frame, window.handle)
             image_path = root / "frames" / f"{turn:04d}.png"
             encode_started = time.monotonic()
             pygame.image.save(frame, image_path)
@@ -276,6 +353,16 @@ def run_desktop_baseline(
                 "cycle was performed; track actual executed progress. Experience from one app applies "
                 "only inside that app, not to other applications."
             )
+            prompt += progress_guard.context_note()
+            if workflow:
+                prompt += (
+                    "\nPersistent task working state: " + workflow.context()
+                    + "\nReturn progress with current_subgoal, remaining_subgoals, observed_evidence, "
+                    "pending_checks. Keep these concise and revise using the NEW screenshot. "
+                    "An action being delivered does NOT prove its effect. Check the result of a "
+                    "previous input before repeating it. Evidence in memory is a past model report, "
+                    "not independent verification. Never execute coordinates from memory."
+                )
             record("model_input", prompt=prompt, frame=str(image_path.relative_to(root)))
             model_session.reset_thread()
             round_timing = {
@@ -288,14 +375,16 @@ def run_desktop_baseline(
             }
             rounds.append(round_timing)
             try:
-                raw = runtime.plan(
-                    partial(
+                request_plan = partial(runtime.plan, partial(
                         model_session.run_turn,
                         prompt=prompt,
                         image_path=image_path,
-                        output_schema=SCHEMA,
-                    )
-                )
+                        output_schema=output_schema,
+                    ))
+                if workflow:
+                    raw, parsed_plan = workflow.plan(request_plan, parse_plan, prompt, str(image_path))
+                else:
+                    raw = request_plan()
             finally:
                 model_ms = runtime.last_plan_ms
                 performance["model_roundtrip_ms"] += model_ms
@@ -308,7 +397,7 @@ def run_desktop_baseline(
                     performance.get("model_completion_wait_ms", 0.0) + metrics.completion_wait_ms
                 )
             record("model_output", response=raw, elapsed_ms=round(model_ms))
-            plan, actions = parse_plan(raw)
+            plan, actions = parsed_plan if workflow else parse_plan(raw)
             status_callback(
                 f"[plan {turn + 1}] 模型响应完成：{model_ms / 1000:.2f} 秒，"
                 f"计划 {len(actions)} 个动作。"
@@ -323,16 +412,42 @@ def run_desktop_baseline(
             except DesktopObservationChanged:
                 recover_stale_plan()
                 continue
+            if workflow:
+                workflow.accept_observation()
+                status_callback("当前子目标：" + workflow.state["progress"]["current_subgoal"])
             if plan["task_complete"]:
+                if workflow:
+                    workflow.update(status="complete")
                 result.update(task_complete=True, stop_reason="model_reported_complete")
                 break
             for action in actions:
                 emergency_stop.raise_if_requested()
+                if progress_guard.repeated(action):
+                    progress_guard.blocked_attempts += 1
+                    recovery_note = (
+                        "Repeated click blocked BEFORE execution: no substantial visual progress "
+                        "confirmed. Diagnose why prior clicks failed and choose a justified alternative."
+                    )
+                    record("no_progress_blocked", action=action.to_payload(),
+                           attempt=progress_guard.blocked_attempts, reason=recovery_note)
+                    status_callback("无进展保护：已拦截重复点击，丢弃剩余批次并重新分析。")
+                    if workflow:
+                        workflow.update(status="reobserve", pending_action=None,
+                                        last_outcome={"effect": "no_progress_blocked", "reason": recovery_note})
+                    if progress_guard.blocked_attempts >= 3:
+                        result.update(stop_reason="no_progress", task_complete=False)
+                        status_callback("连续 3 次恢复仍提出无进展重复点击，已停止；请人工检查现场。")
+                    break
                 try:
+                    if workflow:
+                        workflow.before_action(action)
                     outcome = runtime.execute(motor, action)
                 except DesktopObservationChanged:
                     recover_stale_plan()
                     break
+                if workflow:
+                    workflow.after_action(action, asdict(outcome))
+                progress_guard.delivered(action)
                 stale_plans = 0
                 recovery_note = ""
                 result["actions"] += 1
@@ -350,13 +465,17 @@ def run_desktop_baseline(
                 ):
                     record("batch_boundary", reason="observe_after_ui_action")
                     break
-            if result["actions"] >= max_actions:
+            if result["actions"] >= max_actions or result["stop_reason"] == "no_progress":
                 break
     except EmergencyStopRequested:
         result["stop_reason"] = "emergency_stop"
     except Exception as error:  # noqa: BLE001 - persist failed runs for inspection
         result.update(stop_reason="error", error=f"{type(error).__name__}: {error}")
     finally:
+        if workflow:
+            workflow.export()
+            result["task_state"] = json.loads((root / "task-state.json").read_text(encoding="utf-8"))
+            workflow.close()
         if model_session is not None:
             model_session.close()
         emergency_stop.close()

@@ -1,5 +1,8 @@
 const elements = {
   executionScope: document.querySelector("#execution-scope"),
+  desktopWorkflowSettings: document.querySelector("#desktop-workflow-settings"),
+  desktopOrchestration: document.querySelector("#desktop-orchestration"),
+  desktopResume: document.querySelector("#desktop-resume"),
   experienceHelp: document.querySelector("#experience-help"),
   version: document.querySelector("#version"),
   taskpack: document.querySelector("#taskpack"),
@@ -22,9 +25,9 @@ const elements = {
   reasoningEffort: document.querySelector("#reasoning-effort"),
   inputMode: document.querySelector("#input-mode"),
   inputModeHelp: document.querySelector("#input-mode-help"),
-  adaptiveReasoning: document.querySelector("#adaptive-reasoning"),
+  adaptiveReasoning: {checked: false, disabled: true}, // Automatic escalation is not exposed.
   instruction: document.querySelector("#instruction"),
-  useExperience: document.querySelector("#use-experience"),
+  useExperience: {checked: true, disabled: false}, // Derived from the task selector, not a separate control.
   charCount: document.querySelector("#char-count"),
   warning: document.querySelector("#capability-warning"),
   error: document.querySelector("#form-error"),
@@ -205,9 +208,87 @@ let defaultWaaExamplePath = "";
 let dictationSession = null;
 const taskDetailFragments = new Map();
 
+// Task-end audio: only observed active -> terminal transitions, never old results.
+let taskAudio = null;
+const soundJobs = new Map();
+const soundedJobs = new Set();
+const taskSound = document.querySelector("#task-sound");
+const taskSoundStatus = document.querySelector("#task-sound-status");
+try { taskSound.checked = localStorage.getItem("trace2task.taskSound") !== "off"; } catch (_) { /* optional */ }
+
+async function unlockTaskAudio() {
+  if (!taskSound.checked) return;
+  try {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!Audio) throw Error("此浏览器不支持提示音");
+    taskAudio ||= new Audio();
+    if (taskAudio.state === "suspended") await taskAudio.resume();
+  } catch (error) {
+    taskSoundStatus.textContent = `提示音不可用：${error.message}`;
+  }
+}
+
+function playTaskSound(status) {
+  if (!taskSound.checked) return;
+  if (!taskAudio || taskAudio.state !== "running") {
+    taskSoundStatus.textContent = "任务已结束，但声音未启用；请点击“试听”并检查浏览器静音设置。";
+    return;
+  }
+  try {
+    const notes = status === "completed" ? [660, 880] : [440, 330, 330];
+    notes.forEach((frequency, index) => {
+      const start = taskAudio.currentTime + index * .22;
+      const oscillator = taskAudio.createOscillator();
+      const gain = taskAudio.createGain();
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(.12, start + .015);
+      gain.gain.linearRampToValueAtTime(0, start + .17);
+      oscillator.connect(gain);
+      gain.connect(taskAudio.destination);
+      oscillator.onended = () => { oscillator.disconnect(); gain.disconnect(); };
+      oscillator.start(start);
+      oscillator.stop(start + .18);
+    });
+    taskSoundStatus.textContent = status === "completed" ? "任务已结束，已播放提示音。" : "任务失败或停止，已播放提示音。";
+  } catch (_) {
+    taskSoundStatus.textContent = "任务已结束，但提示音播放失败。";
+  }
+}
+
+function notifyTaskEnd(job) {
+  const previous = soundJobs.get(job.job_id);
+  soundJobs.set(job.job_id, job.status);
+  const active = ["queued", "running", "stopping", "awaiting_recording_start", "awaiting_narration"];
+  if (active.includes(previous) && ["completed", "failed", "stopped", "partial"].includes(job.status)
+      && !soundedJobs.has(job.job_id)) {
+    soundedJobs.add(job.job_id);
+    playTaskSound(job.status);
+  }
+}
+
+document.addEventListener("pointerdown", unlockTaskAudio, {passive: true});
+document.addEventListener("keydown", unlockTaskAudio, {passive: true});
+taskSound.addEventListener("change", () => {
+  try { localStorage.setItem("trace2task.taskSound", taskSound.checked ? "on" : "off"); } catch (_) { /* optional */ }
+  if (taskSound.checked) unlockTaskAudio();
+  taskSoundStatus.textContent = taskSound.checked ? "提示音已开启，可点击试听。" : "提示音已关闭。";
+});
+document.querySelector("#task-sound-test").addEventListener("click", async () => {
+  await unlockTaskAudio();
+  playTaskSound("completed");
+});
+// End task-end audio.
+
 async function request(path, options = {}) {
+  const csrf = document.querySelector('meta[name="trace2task-csrf"]')?.content;
+  if (!csrf) throw new Error("页面安全令牌缺失；请刷新 Trace2Task 控制台后重试");
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Trace2Task-CSRF": csrf,
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const payload = await response.json();
@@ -216,7 +297,8 @@ async function request(path, options = {}) {
 }
 
 function selectedTask() {
-  return taskpacks.find((task) => task.path === elements.taskpack.value) || null;
+  const path = elements.taskpack.value.replace(/^baseline:/, "");
+  return taskpacks.find((task) => task.path === path) || null;
 }
 
 function selectedWindow() {
@@ -319,9 +401,11 @@ function canAutoExecute() {
 }
 
 function renderTaskMeta() {
+  elements.useExperience.checked = elements.taskpack.value !== "__baseline__"
+    && !elements.taskpack.value.startsWith("baseline:");
   elements.experienceHelp.textContent = elements.executionScope.value === "desktop"
     ? "开启后手动选择语义经验，使用任务状态图和人工规则指导桌面规划，不复用录制坐标。关闭即 Baseline。"
-    : "关闭后不读取示范、编译阶段或人工反馈；仍需选择任务以确定目标窗口、允许操作和结果验证。";
+    : "在下拉列表中选择使用经验，或仅选择目标窗口（不使用经验）；后者保留允许操作和结果验证。";
   if (elements.executionScope.value === "desktop") {
     const task = selectedTask();
     elements.taskMeta.textContent = elements.useExperience.checked
@@ -342,7 +426,7 @@ function renderTaskMeta() {
     return;
   }
   const target = [task.process_name, task.title_contains].filter(Boolean).join(" · ");
-  elements.taskMeta.textContent = `${task.confirmed ? "已确认" : "草稿"} · ${target || "未命名窗口"} · 最多 ${task.max_actions} 步`;
+  elements.taskMeta.textContent = `${elements.useExperience.checked ? "使用经验" : "不使用经验，仅确定目标窗口"} · ${task.confirmed ? "已确认" : "草稿"} · ${target || "未命名窗口"} · 最多 ${task.max_actions} 步`;
   if (task.missing_message_capabilities.length) {
     elements.warning.textContent = `这份旧示范缺少消息输入能力（${task.missing_message_capabilities.join(", ")}）。可以先测试规划，但正式发消息前需要升级任务模板。`;
     elements.warning.classList.remove("hidden");
@@ -353,6 +437,9 @@ function renderTaskMeta() {
 }
 
 function renderInputModeHelp() {
+  const desktop = elements.executionScope.value === "desktop";
+  document.querySelector("#input-mode-field").hidden = desktop;
+  elements.inputModeHelp.hidden = desktop;
   if (elements.executionScope.value === "desktop") {
     elements.inputModeHelp.textContent = "桌面范围只支持主显示器前台操作，可跨窗口；运行期间请勿使用鼠标键盘。";
     return;
@@ -367,8 +454,9 @@ function populateTaskpacks(records) {
   taskpacks = records;
   elements.taskpack.replaceChildren();
   const automatic = document.createElement("option");
-  automatic.value = "";
-  automatic.textContent = "自动选择经验（推荐）";
+  const desktop = elements.executionScope.value === "desktop";
+  automatic.value = desktop ? "__baseline__" : "";
+  automatic.textContent = desktop ? "不使用经验 · 桌面 Baseline" : "自动选择经验（推荐）";
   elements.taskpack.append(automatic);
   records.forEach((task) => {
     const option = document.createElement("option");
@@ -376,8 +464,19 @@ function populateTaskpacks(records) {
     option.textContent = `${task.task_id} · ${task.execution_scope === "desktop" ? "桌面经验" : task.process_name || "Windows"}${task.confirmed ? "" : "（草稿）"}`;
     elements.taskpack.append(option);
   });
-  const previousTask = records.find((task) => task.path === previous);
-  elements.taskpack.value = previousTask ? previousTask.path : "";
+  if (!desktop) {
+    const group = document.createElement("optgroup");
+    group.label = "不使用经验 · 仅选择目标窗口";
+    records.filter(task => task.execution_scope !== "desktop").forEach(task => {
+      const option = document.createElement("option");
+      option.value = `baseline:${task.path}`;
+      option.textContent = `${task.task_id} · ${task.process_name || "Windows"}（不使用经验）`;
+      group.append(option);
+    });
+    elements.taskpack.append(group);
+  }
+  elements.taskpack.value = [...elements.taskpack.options].some(option => option.value === previous)
+    ? previous : automatic.value;
   renderTaskMeta();
   renderLibrary();
 }
@@ -459,15 +558,56 @@ async function clearAPISettings() {
   }
 }
 
+let localServiceBusy = false;
+for (const action of ["start", "stop"]) {
+  document.querySelector(`#local-service-${action}`).addEventListener("click", async () => {
+    if (localServiceBusy) return;
+    const status = document.querySelector("#local-service-status");
+    if (isBusy()) { status.textContent = "请先停止当前任务，再管理模型服务。"; return; }
+    localServiceBusy = true;
+    const buttons = ["start", "stop"].map(value => document.querySelector(`#local-service-${value}`));
+    buttons.forEach(button => button.disabled = true);
+    status.textContent = action === "start" ? "正在清理旧服务并加载所选模型，请稍候…" : "正在关闭本地模型服务，释放显存…";
+    try {
+      const result = await request("/api/local-model/service", {method: "POST", body: JSON.stringify({action, model: elements.localModel.value})});
+      status.textContent = result.message;
+    } catch (error) { status.textContent = `操作失败：${error.message}`; }
+    finally { localServiceBusy = false; buttons.forEach(button => button.disabled = false); }
+  });
+}
+
+function usesTrainedModel() {
+  return elements.modelProvider.value === "local" && ["trained_d", "qwen3-vl-2b", "gui-owl-2b", "mai-ui-2b"].includes(elements.localModel.value);
+}
+
 function usesModelApi() {
-  return ["api", "local"].includes(elements.modelProvider.value);
+  return elements.modelProvider.value === "api" || (elements.modelProvider.value === "local" && !usesTrainedModel());
 }
 
 function syncProviderFields() {
-  elements.codexModelSettings.classList.toggle("hidden", usesModelApi());
+  const trained = usesTrainedModel();
+  if (trained) {
+    elements.executionScope.value = "desktop";
+    elements.useExperience.checked = false;
+    populateTaskpacks(taskpacks);
+    elements.taskpack.value = "__baseline__";
+    renderTaskMeta();
+    renderInputModeHelp();
+  }
+  document.querySelector("#trained-model-settings").classList.toggle("hidden", !trained);
+  elements.codexModelSettings.classList.toggle("hidden", usesModelApi() || trained);
   elements.apiModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "api");
   elements.localModelSettings.classList.toggle("hidden", elements.modelProvider.value !== "local");
+  document.querySelector("#api-model-primary").hidden = elements.modelProvider.value !== "api";
+  document.querySelector("#codex-advanced").hidden = elements.modelProvider.value !== "codex";
+  document.querySelector("#local-advanced").hidden = elements.modelProvider.value !== "local" || trained;
+  document.querySelector("#trained-advanced").hidden = !trained;
+  document.querySelector("#trained-output").hidden = !trained;
+  if (elements.modelProvider.value === "api" && !savedAPISettings?.saved) {
+    document.querySelector("#execution-advanced").open = true;
+  }
   elements.adaptiveReasoning.disabled = isBusy() || usesModelApi() || elements.executionScope.value === "desktop";
+  setBusy(isBusy());
 }
 
 function populateAgentOptions(options) {
@@ -690,7 +830,7 @@ function makePerformanceTimeline(performance, stages = []) {
   summary.textContent = `查看性能时间轴 · 模型 ${formatDuration(performance.model_roundtrip_ms || performance.planning_ms)} / 总计 ${formatDuration(performance.total_elapsed_ms)}`;
   const grid = document.createElement("div");
   grid.className = "performance-grid";
-  [
+  const metrics = [
     ["总耗时", performance.total_elapsed_ms],
     ["规划总计", performance.planning_ms],
     ["模型回合", performance.model_roundtrip_ms],
@@ -699,7 +839,10 @@ function makePerformanceTimeline(performance, stages = []) {
     ["显式等待", performance.explicit_wait_ms],
     ["本地等稳", performance.local_wait_until_ms],
     ["本地动作", performance.action_ms],
-  ].forEach(([label, value]) => {
+  ];
+  if (performance.startup_ms !== undefined) metrics.push(["启动 / 装载", performance.startup_ms]);
+  if (performance.cancel_wait_ms !== undefined) metrics.push(["停止等待", performance.cancel_wait_ms]);
+  metrics.forEach(([label, value]) => {
     const metric = document.createElement("div");
     const name = document.createElement("span");
     const duration = document.createElement("strong");
@@ -724,6 +867,206 @@ function makePerformanceTimeline(performance, stages = []) {
     details.append(stageList);
   }
   return details;
+}
+
+function modelIoStatusLabel(round) {
+  const status = String(round?.status || "unknown").toLowerCase();
+  if (status === "cancel_pending") {
+    return "正在等待模型调用取消；未执行未返回的计划";
+  }
+  if (status === "discarded") return "停止后返回，未执行";
+  if (["cancelled", "canceled", "stopped", "aborted"].includes(status)) {
+    return "已取消；未执行未返回的计划";
+  }
+  if (["error", "failed", "failure"].includes(status)) return "模型调用失败";
+  if (["no_output", "empty", "no-response", "no_response"].includes(status)) {
+    return "模型未返回可用输出";
+  }
+  if (["completed", "complete", "success", "predicted"].includes(status)) {
+    return "模型回合已归档";
+  }
+  return `状态：${round?.status || "未记录"}`;
+}
+
+function makeRunAuditLinks(result) {
+  if (!result || typeof result !== "object") return null;
+  const entries = [
+    ["打开完整运行日志", result.trace_path],
+    ["打开 I/O 审计归档", result.audit_path || result.audit_index_path],
+  ].filter(([, path]) => typeof path === "string" && path);
+  if (!entries.length) return null;
+  const actions = document.createElement("div");
+  actions.className = "library-actions";
+  entries.forEach(([label, path]) => actions.append(makeModelArchiveButton(label, path)));
+  return actions;
+}
+
+function modelIoDuration(round) {
+  const timings = round?.timings || {};
+  return Number(
+    round?.model_roundtrip_ms
+    ?? timings.model_roundtrip_ms
+    ?? timings.elapsed_ms
+    ?? timings.total_elapsed_ms
+    ?? timings.total_ms
+    ?? 0,
+  );
+}
+
+function modelIoText(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "未记录";
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatModelDuration(milliseconds) {
+  const value = Number(milliseconds || 0);
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)} 秒`;
+  return `${Math.round(value)} 毫秒`;
+}
+
+function makeModelPayload(label, value) {
+  if (value === undefined || value === null || value === "") return null;
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  const content = document.createElement("pre");
+  content.textContent = modelIoText(value);
+  details.append(summary, content);
+  return details;
+}
+
+function makeModelArchiveButton(label, path) {
+  if (!path || typeof path !== "string") return null;
+  return makeMiniButton(label, () => openLocal(path));
+}
+
+function makeModelIoTimeline(rounds) {
+  if (!Array.isArray(rounds) || !rounds.length) return null;
+  const timeline = document.createElement("details");
+  timeline.className = "performance-timeline";
+  const summary = document.createElement("summary");
+  summary.textContent = `查看模型输入与输出 · ${rounds.length} 回合`;
+  const list = document.createElement("div");
+  list.className = "performance-stages";
+
+  rounds.forEach((round, index) => {
+    const entry = document.createElement("details");
+    entry.className = "guidance-revision";
+    const entrySummary = document.createElement("summary");
+    const stepIndex = Number.isInteger(round?.step_index) ? round.step_index + 1 : index + 1;
+    entrySummary.textContent = `模型回合 ${stepIndex} · ${modelIoStatusLabel(round)} · ${formatModelDuration(modelIoDuration(round))}`;
+    const body = document.createElement("div");
+    body.className = "guidance-revision-body";
+
+    const metadata = document.createElement("p");
+    const requestId = round?.request_id ? ` · 请求 ${round.request_id}` : "";
+    metadata.textContent = `本轮耗时：${formatModelDuration(modelIoDuration(round))}${requestId}`;
+    body.append(metadata);
+
+    const tokens = round?.tokens || {};
+    const memory = round?.memory || {};
+    const diagnostics = [
+      ["输入 Token", tokens.input_tokens],
+      ["输出 Token", tokens.output_tokens],
+      ["显存起始 · 已分配", memory.before?.allocated_bytes === undefined ? undefined : formatBytes(memory.before.allocated_bytes)],
+      ["显存起始 · 预留", memory.before?.reserved_bytes === undefined ? undefined : formatBytes(memory.before.reserved_bytes)],
+      ["显存峰值 · 已分配", (memory.peak?.peak_allocated_bytes ?? memory.peak?.allocated_bytes) === undefined
+        ? undefined : formatBytes(memory.peak?.peak_allocated_bytes ?? memory.peak?.allocated_bytes)],
+      ["显存峰值 · 预留", (memory.peak?.peak_reserved_bytes ?? memory.peak?.reserved_bytes) === undefined
+        ? undefined : formatBytes(memory.peak?.peak_reserved_bytes ?? memory.peak?.reserved_bytes)],
+      ["回收后显存 · 已分配", memory.after_cleanup?.allocated_bytes === undefined ? undefined : formatBytes(memory.after_cleanup.allocated_bytes)],
+      ["回收后显存 · 预留", memory.after_cleanup?.reserved_bytes === undefined ? undefined : formatBytes(memory.after_cleanup.reserved_bytes)],
+    ].filter(([, value]) => value !== undefined && value !== null);
+    if (diagnostics.length) {
+      const grid = document.createElement("div");
+      grid.className = "performance-grid";
+      diagnostics.forEach(([label, value]) => {
+        const metric = document.createElement("div");
+        const name = document.createElement("span");
+        const metricValue = document.createElement("strong");
+        name.textContent = label;
+        metricValue.textContent = String(value);
+        metric.append(name, metricValue);
+        grid.append(metric);
+      });
+      body.append(grid);
+    }
+
+    const timingLabels = {
+      load_ms: "载入",
+      preprocess_ms: "预处理",
+      generate_ms: "生成",
+      decode_ms: "解码",
+      total_ms: "本轮总计",
+    };
+    const phaseMs = round?.timings;
+    const phaseEntries = phaseMs && typeof phaseMs === "object"
+      ? Object.entries(phaseMs).filter(([name, value]) => name in timingLabels && Number.isFinite(Number(value)))
+      : [];
+    if (phaseEntries.length) {
+      const phaseText = document.createElement("p");
+      phaseText.textContent = `分段耗时：${phaseEntries
+        .map(([name, value]) => `${timingLabels[name]} ${formatModelDuration(value)}`)
+        .join(" · ")}`;
+      body.append(phaseText);
+    }
+
+    if (round?.error) {
+      const error = document.createElement("p");
+      error.className = "guidance-feedback";
+      error.textContent = `错误：${modelIoText(round.error)}`;
+      body.append(error);
+    }
+
+    [
+      ["查看实际请求内容", round?.request ?? round?.model_input ?? round?.input],
+      ["查看模型原始输出", round?.raw_output],
+      ["查看解码后的预测", round?.prediction],
+      ["查看响应内容", round?.response ?? round?.model_output ?? round?.output],
+    ].forEach(([label, value]) => {
+      const payload = makeModelPayload(label, value);
+      if (payload) body.append(payload);
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "library-actions";
+    const inputPath = round?.input_path || round?.request_path;
+    const requestButton = makeModelArchiveButton("打开输入归档", inputPath);
+    const requestRecordButton = round?.request_path && round.request_path !== inputPath
+      ? makeModelArchiveButton("打开请求记录", round.request_path)
+      : null;
+    const responseButton = makeModelArchiveButton("打开输出归档", round?.response_path);
+    const outputButton = makeModelArchiveButton("打开本轮目录", round?.output_directory);
+    [requestButton, requestRecordButton, responseButton, outputButton]
+      .filter(Boolean)
+      .forEach(button => actions.append(button));
+    if (round?.screenshot) {
+      const image = document.createElement("a");
+      image.className = "mini-button";
+      image.textContent = "查看输入截图";
+      image.href = `/api/local-image?path=${encodeURIComponent(round.screenshot)}`;
+      image.target = "_blank";
+      image.rel = "noopener";
+      actions.append(image);
+    }
+    if (actions.childElementCount) body.append(actions);
+    entry.append(entrySummary, body);
+    list.append(entry);
+  });
+  timeline.append(summary, list);
+  return timeline;
 }
 
 function renderLibrary() {
@@ -1978,14 +2321,18 @@ function isBusy() {
 }
 
 function setBusy(busy) {
+  busy = busy || trainedPreviewBusy;
   const desktop = elements.executionScope.value === "desktop";
   elements.executionScope.disabled = busy;
+  elements.desktopWorkflowSettings.hidden = !desktop;
+  elements.desktopOrchestration.disabled = busy;
+  elements.desktopResume.disabled = busy || elements.desktopOrchestration.value !== "langgraph";
   elements.planButton.disabled = busy || (!desktop && !taskpacks.length);
   const task = selectedTask();
   elements.executeButton.disabled = busy || (desktop
     ? elements.useExperience.checked && (!task?.confirmed || !task?.semantic_experience)
     : task ? !canExecuteTask(task) || task.execution_scope === "desktop" : !canAutoExecute());
-  elements.taskpack.disabled = busy || (desktop && !elements.useExperience.checked);
+  elements.taskpack.disabled = busy;
   elements.model.disabled = busy;
   [
     elements.modelProvider, elements.localModel, elements.apiBaseUrl, elements.apiModel, elements.apiKey,
@@ -1997,6 +2344,16 @@ function setBusy(busy) {
   elements.adaptiveReasoning.disabled = busy || desktop || usesModelApi();
   elements.instruction.disabled = busy;
   elements.useExperience.disabled = busy;
+  if (usesTrainedModel()) {
+    elements.planButton.disabled = busy;
+    elements.executeButton.disabled = busy;
+    elements.executeButton.title = "本地模型主屏连续执行；F9 停止";
+    [elements.executionScope, elements.taskpack, elements.useExperience,
+      elements.desktopOrchestration, elements.desktopResume, elements.inputMode,
+      elements.adaptiveReasoning].forEach(el => { el.disabled = true; });
+  } else {
+    elements.executeButton.title = "";
+  }
   elements.viewTabs.forEach((button) => { button.disabled = busy; });
   elements.recordSource.disabled = busy;
   elements.waaRoot.disabled = busy;
@@ -2023,6 +2380,19 @@ function setBusy(busy) {
 }
 
 function renderJob(job) {
+  notifyTaskEnd(job);
+  const batch = job.provider === "trained_d" && job.status === "running" ? job.pending_batch : null;
+  document.querySelector("#trained-batch").hidden = !batch;
+  if (batch) {
+    document.querySelector("#trained-batch-actions").textContent = JSON.stringify(batch.actions, null, 2);
+    document.querySelector("#trained-batch-image").src = batch.annotated_image || "";
+    document.querySelector("#trained-approve").onclick = async () => {
+      try {
+        await request(`/api/jobs/${job.job_id}/approve`, {method: "POST", body: JSON.stringify({token: batch.token})});
+        document.querySelector("#trained-batch").hidden = true;
+      } catch (error) { showError(error.message); }
+    };
+  }
   activeJobId = job.job_id;
   elements.empty.classList.add("hidden");
   elements.jobView.classList.remove("hidden");
@@ -2044,6 +2414,7 @@ function renderJob(job) {
     : modelLabels[job.model] || job.model || "—";
   elements.jobEffort.textContent = effortLabels[job.reasoning_effort] || job.reasoning_effort || "—";
   elements.jobInstruction.textContent = job.instruction;
+  document.querySelector("#job-latest-progress").textContent = job.logs?.at(-1) || "等待执行…";
   elements.narrationSubmit.textContent = job.defer_compilation
     ? "保存讲解和录制，稍后编译"
     : "确认讲解并开始编译";
@@ -2080,6 +2451,10 @@ function renderJob(job) {
       );
       if (performanceTimeline) elements.jobPerformance.append(performanceTimeline);
     }
+    const modelIoTimeline = makeModelIoTimeline(job.result?.model_io);
+    if (modelIoTimeline) elements.jobPerformance.append(modelIoTimeline);
+    const auditLinks = makeRunAuditLinks(job.result);
+    if (auditLinks) elements.jobPerformance.append(auditLinks);
     elements.jobResult.textContent = job.error || JSON.stringify(job.result, null, 2);
   } else {
     elements.resultPanel.classList.add("hidden");
@@ -2530,8 +2905,191 @@ async function deleteLocalAsset(endpoint, payload) {
   }
 }
 
+let trainedPreviewBusy = false;
+
+async function previewTrainedModel() {
+  if (isBusy() || trainedPreviewBusy) return;
+  const task = elements.instruction.value.trim();
+  if (!task) return showError("请输入任务指令");
+  const status = document.querySelector("#trained-model-status");
+  const annotation = document.querySelector("#trained-model-annotation");
+  const output = document.querySelector("#trained-model-result");
+  trainedPreviewBusy = true;
+  setBusy(true);
+  annotation.hidden = true;
+  output.textContent = "";
+  status.textContent = "正在连接本地模型；加载完成后延时 3 秒截图。请切换到目标画面。未执行任何操作。";
+  try {
+    const body = {task, model: elements.localModel.value === "trained_d" ? "D-5970" : elements.localModel.value};
+    const file = document.querySelector("#trained-model-image").files[0];
+    if (file) {
+      if (file.size > 14 * 1024 * 1024) throw Error("请选择小于 14 MB 的图片");
+      body.image = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(",")[1]);
+        reader.onerror = () => reject(Error("读取图片失败"));
+        reader.readAsDataURL(file);
+      });
+      status.textContent = "正在加载模型并预测所选图片；未执行操作。";
+    }
+    const value = await request("/api/trained-model/predict", {method: "POST", body: JSON.stringify(body)});
+    if (value.annotated_image) {
+      annotation.src = value.annotated_image;
+      annotation.hidden = false;
+      delete value.annotated_image;
+    }
+    output.textContent = JSON.stringify(value, null, 2);
+    status.textContent = value.status === "predicted"
+      ? "预测完成，未执行操作。下方显示动作、耗时、峰值显存和本地日志目录。"
+      : "预测失败，未执行操作。请查看下方错误信息。";
+  } catch (error) {
+    status.textContent = `预测失败：${error.message}（未执行操作）`;
+  } finally {
+    trainedPreviewBusy = false;
+    setBusy(isBusy());
+  }
+}
+
+let cuaCatalogEntries = [];
+
+function cuaTargetKey(target) {
+  if (Number.isInteger(target?.pid) && Number.isInteger(target?.window_id)) {
+    return `window:${target.pid}:${target.window_id}`;
+  }
+  if (typeof target?.launch_path === "string" && target.launch_path) {
+    return `launch:${target.launch_path}`;
+  }
+  return "";
+}
+
+// This is deliberately a small, pure boundary: only checked catalog entries cross
+// from the UI into a Cua job. The complete operating-system catalog never does.
+function cuaTargetConfig(entries, selectedKeys, initialKey) {
+  const selected = entries.filter((entry) => selectedKeys.has(entry.key));
+  const initialIndex = selected.findIndex((entry) => entry.key === initialKey);
+  return {
+    targets: selected.map((entry) => entry.target),
+    initial_index: initialIndex >= 0 ? initialIndex : 0,
+  };
+}
+
+function selectedCuaKeys() {
+  return new Set([...document.querySelectorAll("#cua-target-list input[type=checkbox]:checked")]
+    .map((input) => input.value));
+}
+
+function selectedCuaEntries() {
+  const selected = selectedCuaKeys();
+  return cuaCatalogEntries.filter((entry) => selected.has(entry.key));
+}
+
+function syncCuaInitialTarget(preferredKey = document.querySelector("#cua-target").value) {
+  const select = document.querySelector("#cua-target");
+  const selected = selectedCuaEntries();
+  select.replaceChildren();
+  if (!selected.length) {
+    select.add(new Option("请先勾选一个目标", ""));
+    select.disabled = true;
+    return;
+  }
+  for (const entry of selected) select.add(new Option(entry.label, entry.key));
+  select.disabled = false;
+  select.value = selected.some((entry) => entry.key === preferredKey) ? preferredKey : selected[0].key;
+}
+
+function renderCuaCatalog(catalog) {
+  const previousKeys = selectedCuaKeys();
+  const previousInitial = document.querySelector("#cua-target").value;
+  const entries = [];
+  for (const windowInfo of catalog.windows || []) {
+    const target = {pid: windowInfo.pid, window_id: windowInfo.window_id};
+    const key = cuaTargetKey(target);
+    if (!key) continue;
+    entries.push({key, target, label: `窗口：${windowInfo.app_name || "未知应用"} · ${windowInfo.title || "无标题"}`});
+  }
+  for (const app of catalog.apps || []) {
+    const target = {launch_path: app.launch_path};
+    const key = cuaTargetKey(target);
+    if (!key) continue;
+    entries.push({key, target, label: `启动：${app.name || app.launch_path}`});
+  }
+  cuaCatalogEntries = [...new Map(entries.map((entry) => [entry.key, entry])).values()];
+
+  const list = document.querySelector("#cua-target-list");
+  list.replaceChildren();
+  if (!entries.length) {
+    list.textContent = "未发现可授权的窗口或可启动应用。";
+    syncCuaInitialTarget("");
+    return;
+  }
+  for (const entry of cuaCatalogEntries) {
+    const label = document.createElement("label");
+    label.className = "cua-target-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = entry.key;
+    checkbox.checked = previousKeys.has(entry.key);
+    checkbox.addEventListener("change", () => syncCuaInitialTarget());
+    const text = document.createElement("span");
+    text.textContent = entry.label;
+    label.append(checkbox, text);
+    list.append(label);
+  }
+  // A refresh retains only the same explicit identities. Newly discovered items
+  // are never selected implicitly.
+  syncCuaInitialTarget(previousInitial);
+}
+
+function cuaTargetSelection() {
+  const config = cuaTargetConfig(cuaCatalogEntries, selectedCuaKeys(), document.querySelector("#cua-target").value);
+  return {...config, labels: selectedCuaEntries().map((entry) => entry.label)};
+}
+
+document.querySelector("#local-executor").addEventListener("change", (event) => {
+  document.querySelector("#cua-target-settings").hidden = event.target.value !== "cua";
+});
+document.querySelector("#cua-refresh").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = "正在枚举…";
+  try {
+    const catalog = await request("/api/cua/windows", {method: "POST", body: "{}"});
+    renderCuaCatalog(catalog);
+  } catch (error) { showError(error.message); }
+  finally { button.disabled = false; button.textContent = "刷新窗口 / 应用"; }
+});
+
 async function startJob(mode) {
   clearError();
+  if (usesTrainedModel()) {
+    const executorBackend = document.querySelector("#local-executor").value;
+    const cuaSelection = executorBackend === "cua" ? cuaTargetSelection() : null;
+    if (executorBackend === "cua" && !cuaSelection.targets.length) return showError("请刷新并勾选至少一个 Cua 目标窗口或应用");
+    if (executorBackend === "cua" && cuaSelection.targets.length > 12) return showError("每次最多授权 12 个目标，请取消勾选无关项目");
+    if (mode !== "execute") {
+      if (executorBackend === "cua") return showError("Cua 窗口截图预览尚未开放。请用临时文档开始实验执行；Win32 的预览仍使用主屏截图。");
+      return previewTrainedModel();
+    }
+    const instruction = elements.instruction.value.trim();
+    if (!instruction) return showError("请输入任务指令");
+    if (document.querySelector("#trained-model-image").files.length) return showError("真实执行请先清除所选图片，必须使用实时主屏截图");
+    const continuous = true;
+    const scopeNotice = executorBackend === "cua"
+      ? `Cua 后台实验：仅授权 ${cuaSelection.labels.join("；")}。窗口授权精确到该窗口；启动项允许请求启动该应用（可能激活窗口），然后重新定位窗口。不自动转前台输入。停止需等待驱动调用返回。`
+      : "将操作主屏桌面，连续执行。";
+    if (!window.confirm(`${elements.localModel.selectedOptions[0].textContent} ${scopeNotice} 最多 40 个动作，F9 停止。\n请先使用临时记事本测试。\n\n${instruction}`)) return;
+    setBusy(true);
+    try {
+      const job = await request("/api/jobs", {method: "POST", body: JSON.stringify({
+        provider: "trained_d", model: elements.localModel.value === "trained_d" ? "D-5970" : elements.localModel.value, mode: "execute", instruction, executor_backend: executorBackend,
+        execution_scope: "desktop", use_experience: false, orchestration: "legacy", continuous,
+        cua_target: executorBackend === "cua" ? {targets: cuaSelection.targets, initial_index: cuaSelection.initial_index} : null,
+      })});
+      renderJob(job);
+      pollTimer = setTimeout(pollJob, 250);
+    } catch (error) { setBusy(false); showError(error.message); }
+    return;
+  }
   if (dictationSession) return showError("请先结束语音输入并等待转写完成");
   const desktop = elements.executionScope.value === "desktop";
   const task = desktop && !elements.useExperience.checked ? null : selectedTask();
@@ -2552,7 +3110,7 @@ async function startJob(mode) {
   const reasoningEffort = local ? "default" : usesModelApi()
     ? elements.apiReasoningEffort.value : elements.reasoningEffort.value;
   const inputMode = desktop ? "foreground" : elements.inputMode.value;
-  const adaptiveReasoning = !desktop && !usesModelApi() && elements.adaptiveReasoning.checked;
+  const adaptiveReasoning = false;
   if (!instruction) return showError("请输入一条任务指令");
   if (!model) return showError("请输入 API 视觉模型 ID");
   const apiOptions = local ? {
@@ -2609,6 +3167,8 @@ async function startJob(mode) {
         adaptive_reasoning: adaptiveReasoning,
         use_experience: elements.useExperience.checked,
         execution_scope: desktop ? "desktop" : "window",
+        orchestration: desktop ? elements.desktopOrchestration.value : "legacy",
+        resume_from: desktop && elements.desktopOrchestration.value === "langgraph" ? elements.desktopResume.value : "",
       }),
     });
     renderJob(job);
@@ -2666,31 +3226,61 @@ async function initialize() {
   }
 }
 
-elements.taskpack.addEventListener("change", renderTaskMeta);
-elements.useExperience.addEventListener("change", () => {
-  setBusy(isBusy());
+elements.taskpack.addEventListener("change", () => {
   renderTaskMeta();
+  setBusy(isBusy());
 });
 let windowScopeOptions = null;
+async function refreshDesktopCheckpoints() {
+  try {
+    const data = await request("/api/desktop-checkpoints");
+    const selected = elements.desktopResume.value;
+    elements.desktopResume.replaceChildren(new Option("开始新任务", ""));
+    for (const run of data.runs) {
+      const option = new Option(`${run.name} · ${run.instruction}${run.uncertain ? "（结果不确定，需核对）" : ""}`, run.path);
+      option.dataset.instruction = run.instruction;
+      option.disabled = run.uncertain;
+      elements.desktopResume.append(option);
+    }
+    if ([...elements.desktopResume.options].some(option => option.value === selected)) elements.desktopResume.value = selected;
+  } catch (error) { showError(error.message); }
+}
+elements.desktopOrchestration.addEventListener("change", () => {
+  setBusy(isBusy());
+  refreshDesktopCheckpoints();
+});
+elements.desktopResume.addEventListener("focus", refreshDesktopCheckpoints);
+elements.desktopResume.addEventListener("change", () => {
+  const option = elements.desktopResume.selectedOptions[0];
+  if (option?.value) {
+    elements.instruction.value = option.dataset.instruction;
+    elements.instruction.dispatchEvent(new Event("input"));
+  }
+});
 elements.executionScope.addEventListener("change", () => {
   if (elements.executionScope.value === "desktop") {
     windowScopeOptions = {
+      taskSelection: elements.taskpack.value,
       useExperience: elements.useExperience.checked,
       inputMode: elements.inputMode.value,
       adaptiveReasoning: elements.adaptiveReasoning.checked,
     };
     elements.useExperience.checked = false;
+    elements.taskpack.value = "";
     elements.inputMode.value = "foreground";
     elements.adaptiveReasoning.checked = false;
+    refreshDesktopCheckpoints();
   } else if (windowScopeOptions) {
+    populateTaskpacks(taskpacks);
+    elements.taskpack.value = windowScopeOptions.taskSelection;
     elements.useExperience.checked = windowScopeOptions.useExperience;
     elements.inputMode.value = windowScopeOptions.inputMode;
     elements.adaptiveReasoning.checked = windowScopeOptions.adaptiveReasoning;
     windowScopeOptions = null;
   }
-  setBusy(isBusy());
+  populateTaskpacks(taskpacks);
   renderInputModeHelp();
-  renderTaskMeta();
+  setBusy(isBusy());
 });
 elements.inputMode.addEventListener("change", renderInputModeHelp);
 elements.instruction.addEventListener("input", () => {
@@ -2698,6 +3288,7 @@ elements.instruction.addEventListener("input", () => {
 });
 elements.planButton.addEventListener("click", () => startJob("plan"));
 elements.modelProvider.addEventListener("change", syncProviderFields);
+elements.localModel.addEventListener("change", syncProviderFields);
 elements.apiBaseUrl.addEventListener("input", renderAPISettingsStatus);
 elements.apiSaveSettings.addEventListener("click", saveAPISettings);
 elements.apiClearSettings.addEventListener("click", clearAPISettings);
@@ -2749,5 +3340,80 @@ elements.refreshLibrary.addEventListener("click", async () => {
   }
 });
 
+function arrangeExecutionLayout() {
+  const panel = document.querySelector("#execute-panel");
+  const grid = document.createElement("div");
+  grid.className = "task-primary-grid";
+  panel.querySelector(".card-heading").after(grid);
+  const field = (id) => {
+    const group = document.createElement("div");
+    group.className = "task-primary-field";
+    const control = document.getElementById(id);
+    group.append(panel.querySelector(`label[for="${id}"]`), control.closest(".select-wrap") || control);
+    grid.append(group);
+    return group;
+  };
+  field("execution-scope");
+  field("taskpack");
+  field("model-provider");
+  const models = document.createElement("div");
+  models.className = "task-primary-field";
+  grid.append(models);
+
+  const advanced = document.createElement("details");
+  advanced.id = "execution-advanced";
+  advanced.className = "execution-advanced";
+  const summary = document.createElement("summary");
+  summary.textContent = "高级选项 · 连接配置、思考强度、输入模式与任务恢复";
+  advanced.append(summary);
+  panel.querySelector(".actions").after(advanced);
+  const section = (id) => {
+    const node = document.createElement("div");
+    node.id = id;
+    advanced.append(node);
+    return node;
+  };
+  section("codex-advanced").append(elements.reasoningEffort.closest(".agent-settings > div"));
+  models.append(elements.codexModelSettings, elements.localModelSettings);
+  const local = section("local-advanced");
+  elements.localModelSettings.querySelectorAll("p.field-help").forEach(p => local.append(p));
+  const apiPrimary = document.createElement("div");
+  apiPrimary.id = "api-model-primary";
+  apiPrimary.append(elements.apiModel.closest(".agent-settings > div"));
+  models.append(apiPrimary);
+  advanced.append(elements.apiModelSettings, elements.desktopWorkflowSettings,
+    panel.querySelector(".execution-options"), elements.inputModeHelp);
+  const trainedAdvanced = section("trained-advanced");
+  const trained = document.querySelector("#trained-model-settings");
+  trainedAdvanced.append(trained.querySelector('label[for="trained-model-image"]'),
+    document.querySelector("#trained-model-image"));
+  trained.querySelectorAll("p.field-help").forEach(p => trainedAdvanced.append(p));
+  const output = document.createElement("div");
+  output.id = "trained-output";
+  output.className = "trained-output";
+  output.append(document.querySelector("#trained-model-status"), document.querySelector("#trained-model-annotation"),
+    document.querySelector("#trained-batch"));
+  const raw = document.createElement("details");
+  const rawLabel = document.createElement("summary");
+  rawLabel.textContent = "查看模型原始输出";
+  raw.append(rawLabel, document.querySelector("#trained-model-result"));
+  output.append(raw);
+  document.querySelector(".activity-card .card-heading").after(output);
+  const logDetails = document.createElement("details");
+  logDetails.className = "runtime-log-details";
+  const logSummary = document.createElement("summary");
+  logSummary.textContent = "查看运行日志";
+  const heading = elements.jobLog.previousElementSibling;
+  heading.before(logDetails);
+  logDetails.append(logSummary, heading, elements.jobLog);
+  const resultDetails = document.createElement("details");
+  const resultSummary = document.createElement("summary");
+  resultSummary.textContent = "查看完整结果数据";
+  elements.jobResult.before(resultDetails);
+  resultDetails.append(resultSummary, elements.jobResult);
+  renderInputModeHelp();
+}
+
+arrangeExecutionLayout();
 renderRecordingSource();
 initialize();

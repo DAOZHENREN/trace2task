@@ -83,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open the local browser control console.",
     )
     web_console.add_argument("--port", type=int, default=8765)
+    desktop = subparsers.add_parser("desktop", help="Open the native desktop console.")
+    desktop.add_argument("--project-root", type=Path, default=Path.cwd())
     web_console.add_argument(
         "--no-open",
         action="store_true",
@@ -466,6 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "desktop":
+        from trace2task.desktop_app import main as desktop_main
+
+        desktop_main(["--project-root", str(args.project_root)])
+        return 0
     if args.command == "web":
         serve_web_console(port=args.port, open_browser=not args.no_open)
         return 0

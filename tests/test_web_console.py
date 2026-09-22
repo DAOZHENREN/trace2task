@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import queue
+import re
 import shutil
 import threading
 import time
@@ -24,6 +25,15 @@ from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_
 from trace2task.windows_runner import WindowsAgentRunFailed
 
 
+def _csrf_headers(opener: Any, base: str) -> dict[str, str]:
+    """Read the token from the same local page a browser would load."""
+    with opener.open(base + "/", timeout=5) as response:
+        page = response.read().decode("utf-8")
+    match = re.search(r'name="trace2task-csrf" content="([^"]+)"', page)
+    assert match is not None
+    return {"Origin": base, "X-Trace2Task-CSRF": match.group(1)}
+
+
 def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypatch):
     controller = WebConsoleController(tmp_path)
     calls = []
@@ -39,6 +49,22 @@ def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypat
     assert job["task_path"] == ""
     assert job["selection_mode"] == "desktop"
     assert job["execution_scope"] == "desktop"
+
+
+def test_langgraph_web_settings_and_resume_path_guard(tmp_path, monkeypatch):
+    controller = WebConsoleController(tmp_path)
+    monkeypatch.setattr(controller, "_run_job", lambda *args: None)
+    with pytest.raises(ValueError, match="runs"):
+        controller.start_job(task_path="", instruction="test", execute=False,
+                             execution_scope="desktop", use_experience=False,
+                             orchestration="langgraph", resume_from="../outside")
+    with pytest.raises(ValueError, match="仅支持桌面"):
+        controller.start_job(task_path="", instruction="test", execute=False,
+                             orchestration="langgraph")
+    job = controller.start_job(task_path="", instruction="test", execute=False,
+                               execution_scope="desktop", use_experience=False,
+                               orchestration="langgraph")
+    assert job["orchestration"] == "langgraph"
 
 
 def test_desktop_rejects_background(tmp_path):
@@ -113,6 +139,41 @@ def test_shared_web_worker_handles_desktop_results(tmp_path, monkeypatch, reason
     assert result["result"]["use_experience"] is False
     assert result["result"]["performance"]["model_roundtrip_ms"] == 123
     assert calls[0]["emergency_stop"].stop_event is controller._jobs[job["job_id"]].stop_event
+
+
+def test_trained_model_effect_unverifiable_stops_without_completion_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trace2task import trained_model_runner
+
+    monkeypatch.setattr(
+        trained_model_runner,
+        "run_trained_desktop",
+        lambda **kwargs: {
+            "stop_reason": "effect_unverifiable",
+            "task_complete": False,
+            "executed_actions": 1,
+        },
+    )
+    controller = WebConsoleController(tmp_path)
+
+    job = controller.start_job(
+        task_path="",
+        instruction="在测试页点击一次",
+        execute=True,
+        provider="trained_d",
+        model="D-5970",
+        execution_scope="desktop",
+        use_experience=False,
+        continuous=True,
+    )
+    completed = controller.wait(job["job_id"])
+
+    assert completed["status"] == "stopped"
+    assert completed["result"]["task_complete"] is False
+    assert completed["result"]["stop_reason"] == "effect_unverifiable"
+    assert "效果无法确认；任务已停止" in completed["logs"][-1]
+    assert "完成声明" not in completed["logs"][-1]
 
 
 @pytest.fixture(autouse=True)
@@ -522,9 +583,19 @@ def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Pa
         with opener.open(base + "/api/state") as response:
             state = json.loads(response.read())
         assert "default" in state["agent_options"]["api_defaults"]["reasoning_efforts"]
+        for path in ("/", "/api/state"):
+            bad_get = Request(
+                base + path,
+                headers={"Host": f"evil.test:{server.server_port}"},
+            )
+            with pytest.raises(HTTPError) as error:
+                opener.open(bad_get, timeout=5)
+            assert error.value.code == 400
+            error.value.close()
         for headers in [
             {"Origin": "https://unrelated.example"},
             {"Host": f"rebind.example:{server.server_port}"},
+            {"Origin": base},
         ]:
             request = Request(base + "/api/jobs", data=body, headers={
                 "Content-Type": "application/json", **headers,
@@ -534,8 +605,25 @@ def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Pa
             assert error.value.code == 400
             error.value.close()
         assert not calls
+        # The source console may be opened as localhost even though the server
+        # itself binds to 127.0.0.1; preserve that normal browser entry point.
+        localhost = f"http://localhost:{server.server_port}"
+        localhost_request = Request(
+            base + "/api/experience-route",
+            data=json.dumps({"instruction": "给联系人发消息"}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Host": f"localhost:{server.server_port}",
+                "Origin": localhost,
+                "X-Trace2Task-CSRF": _csrf_headers(opener, base)[
+                    "X-Trace2Task-CSRF"
+                ],
+            },
+        )
+        with opener.open(localhost_request, timeout=5) as response:
+            assert json.loads(response.read())["task_id"] == "wechat-example"
         request = Request(base + "/api/jobs", data=body, headers={
-            "Content-Type": "application/json", "Origin": base,
+            "Content-Type": "application/json", **_csrf_headers(opener, base),
         })
         with opener.open(request, timeout=5) as response:
             job = json.loads(response.read())
@@ -570,6 +658,7 @@ def test_api_profile_http_save_reload_clear_and_origin_guard(
         "reasoning_effort": "default", "api_key": "test-private-key",
     }).encode()
     try:
+        csrf_headers = _csrf_headers(opener, base)
         for operation in ("save", "clear"):
             bad = Request(base + "/api/model-settings/" + operation, data=body, headers={
                 "Content-Type": "application/json", "Origin": "https://unrelated.example",
@@ -580,7 +669,7 @@ def test_api_profile_http_save_reload_clear_and_origin_guard(
             error.value.close()
         assert not controller.api_settings.path.exists()
         valid = Request(base + "/api/model-settings/save", data=body, headers={
-            "Content-Type": "application/json", "Origin": base,
+            "Content-Type": "application/json", **csrf_headers,
         })
         with opener.open(valid, timeout=5) as response:
             saved = json.loads(response.read())
@@ -594,7 +683,7 @@ def test_api_profile_http_save_reload_clear_and_origin_guard(
         assert state["agent_options"]["api_defaults"]["saved_settings"] == saved
         assert "test-private-key" not in json.dumps(state)
         clear = Request(base + "/api/model-settings/clear", data=b"{}", headers={
-            "Content-Type": "application/json", "Origin": base,
+            "Content-Type": "application/json", **csrf_headers,
         })
         with opener.open(clear, timeout=5) as response:
             cleared = json.loads(response.read())
@@ -2632,6 +2721,8 @@ def test_web_server_serves_console_state_and_job_api(
     try:
         with opener.open(f"{base}/", timeout=5) as response:
             html = response.read().decode("utf-8")
+            content_security_policy = response.headers["Content-Security-Policy"]
+        csrf_headers = _csrf_headers(opener, base)
         with opener.open(f"{base}/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
         with opener.open(f"{base}/api/state", timeout=5) as response:
@@ -2650,7 +2741,7 @@ def test_web_server_serves_console_state_and_job_api(
         route_request = Request(
             f"{base}/api/experience-route",
             data=json.dumps({"instruction": "给文件传输助手发消息"}).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **csrf_headers},
             method="POST",
         )
         with opener.open(route_request, timeout=5) as response:
@@ -2667,7 +2758,7 @@ def test_web_server_serves_console_state_and_job_api(
         request = Request(
             f"{base}/api/jobs",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **csrf_headers},
             method="POST",
         )
         with opener.open(request, timeout=5) as response:
@@ -2677,7 +2768,7 @@ def test_web_server_serves_console_state_and_job_api(
             data=json.dumps(
                 {"path": "runs/candidates/example", "summary": "人工微调后的摘要"}
             ).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **csrf_headers},
             method="POST",
         )
         with opener.open(summary_request, timeout=5) as response:
@@ -2689,6 +2780,12 @@ def test_web_server_serves_console_state_and_job_api(
         thread.join(timeout=2)
 
     assert "用一句话，调用一次示范经验" in html
+    assert "trace2task-csrf" in html
+    assert "__TRACE2TASK_CSRF_TOKEN__" not in html
+    assert "img-src 'self' data:" in content_security_policy
+    assert "connect-src 'self'" in content_security_policy
+    assert csrf_headers["X-Trace2Task-CSRF"] not in javascript
+    assert csrf_headers["X-Trace2Task-CSRF"] not in json.dumps(state)
     assert "录制新经验" in html
     assert "同时录制人工讲解" in html
     assert "放弃本次录制" in html

@@ -7,6 +7,18 @@ from trace2task.compiler_snapshot import MARKER, freeze_snapshot, tree_digest, v
 from trace2task.web_console import WebConsoleController, _taskpack_tree_digest
 
 
+def _create_symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        # Windows permits this only when Developer Mode is enabled or the test
+        # process has the Create Symbolic Links privilege.  Do not hide other
+        # filesystem failures: they can indicate a real regression.
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("Windows test process lacks symbolic-link privilege")
+        raise
+
+
 def fixture_pack(tmp_path):
     root = tmp_path / "source"
     root.mkdir()
@@ -64,7 +76,7 @@ def test_frozen_content_tamper_rejected(tmp_path, tamper):
     elif tamper == "remove":
         target.unlink()
     elif tamper == "symlink":
-        target.with_name("external").symlink_to(trace)
+        _create_symlink_or_skip(target.with_name("external"), trace)
     else:
         target.parent.parent.joinpath("provenance", "source-trace.jsonl").write_text("bad")
     with pytest.raises(RuntimeError):
@@ -111,7 +123,7 @@ def test_web_marker_reuse_requires_current_source_binding(tmp_path):
 def test_source_symlinks_rejected(tmp_path, target):
     task, trace = fixture_pack(tmp_path)
     link = task.parent / (MARKER if target == "marker" else "link")
-    link.symlink_to(trace.parent if target == "directory" else trace)
+    _create_symlink_or_skip(link, trace.parent if target == "directory" else trace)
     with pytest.raises(RuntimeError):
         freeze(tmp_path, task, trace)
 
