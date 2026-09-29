@@ -96,8 +96,13 @@ class ExecutionRuntime:
             self.audit.record("executor_result", plan=self.plans,
                               result=asdict(result) if is_dataclass(result) else vars(result))
         self.executed_actions += 1
+        outcome = (
+            "已送达，效果待观察"
+            if getattr(result, "effect", None) == "unverifiable"
+            else "完成"
+        )
         self.status_callback(
             f"[action {self.executed_actions}/{self.max_actions}] {action.skill} "
-            f"完成，耗时 {result.elapsed_ms:.0f} ms。"
+            f"{outcome}，耗时 {result.elapsed_ms:.0f} ms。"
         )
         return result

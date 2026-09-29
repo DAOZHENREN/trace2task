@@ -5,6 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/trace2task/web/app.js'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '../src/trace2task/web/index.html'), 'utf8');
 const helpers = source.slice(
   source.indexOf('function cuaTargetKey'),
   source.indexOf('function selectedCuaKeys'),
@@ -51,4 +52,18 @@ test('Cua preserves selected order and indexes the chosen initial target in that
 test('Cua target labels use textContent rather than HTML insertion for catalog names', () => {
   assert.match(source, /text\.textContent = entry\.label/);
   assert.doesNotMatch(source.slice(source.indexOf('function renderCuaCatalog'), source.indexOf('function cuaTargetSelection')), /innerHTML/);
+});
+
+test('Cua search matches title, app name and launch path without changing authorization', () => {
+  const context = vm.createContext({});
+  vm.runInContext(helpers, context);
+  const entry = {label: '窗口：CalculatorApp.exe · 计算器', target: {pid: 10, window_id: 20}};
+  const app = {label: '启动：记事本', target: {launch_path: 'C:\\Windows\\notepad.exe'}};
+  assert.equal(context.cuaCatalogMatches(entry, 'calculator'), true);
+  assert.equal(context.cuaCatalogMatches(entry, '计算'), true);
+  assert.equal(context.cuaCatalogMatches(app, 'NOTEPAD.EXE'), true);
+  assert.equal(context.cuaCatalogMatches(entry, 'wechat'), false);
+  assert.ok(html.includes('id="cua-target-search"'));
+  assert.match(source, /row\.hidden = !checked &&/);
+  assert.match(source, /document\.querySelector\("#cua-target-search"\)\.addEventListener\("input", filterCuaCatalog\)/);
 });

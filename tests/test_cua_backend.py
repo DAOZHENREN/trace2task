@@ -23,14 +23,27 @@ def test_normalized_window_coordinate():
     assert (value['pid'],value['window_id'])==(1,2)
 
 
-def test_ambiguous_text_refused():
+def test_complete_tree_without_unique_editable_control_refuses_text():
     with pytest.raises(ValueError):
         action_request(ActionCall('type_text',{'text': 'test'}),state())
 
 
+def test_incomplete_control_tree_uses_cua_focused_control_route():
+    value = state()
+    value['elements_complete'] = False
+    tool, payload = action_request(ActionCall('type_text', {'text': 'test'}), value)
+    assert tool == 'type_text'
+    assert payload == {
+        'pid': 1, 'window_id': 2, 'session': 'test', 'delivery_mode': 'background',
+        'text': 'test',
+    }
+    # The host did not invent a location or promote this to a UIA token route.
+    assert 'x' not in payload and 'y' not in payload and 'element_token' not in payload
+
+
 def test_text_uses_snapshot_token():
     value=state()
-    value['elements']=[{'enabled': True,'actions': ['set_value'],'element_token': 's00000001:0'}]
+    value['elements']=[{'role': 'Edit', 'enabled': True,'actions': ['set_value'],'element_token': 's00000001:0'}]
     assert action_request(ActionCall('type_text',{'text': 'test'}),value)[1]['element_token']=='s00000001:0'
 
 
@@ -76,12 +89,11 @@ def test_window_selection_is_fresh_and_exact(tmp_path):
         backend.bind({'pid': 11,'window_id': 20})
 
 
-def test_extended_actions_not_enabled_in_win32():
+def test_extended_action_decoding_is_backend_independent():
     from trace2task.local_gui_protocol import decode
     text = '{"actions":[{"skill":"switch_window","args":{"pid":1,"window_id":2}}]}'
-    with pytest.raises(ValueError):
-        decode('qwen3-vl-2b',text)
-    assert decode('qwen3-vl-2b',text,cua=True)['actions'][0]['skill'] == 'switch_window'
+    assert decode('qwen3-vl-2b', text) == decode('qwen3-vl-2b', text, cua=True)
+    assert decode('qwen3-vl-2b', text)['actions'][0]['skill'] == 'switch_window'
 
 
 def test_unverifiable_is_preserved():

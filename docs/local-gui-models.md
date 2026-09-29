@@ -31,27 +31,65 @@ Reference dependencies: torch 2.7.1+cu128, transformers 4.57.1, Pillow, safetens
 
 ## Usage and scope
 
-Select the model, enter a task and use **只生成计划** first (screenshot preview, no input).
+Select the model, enter a harmless task, and check the backend and target before starting.
+The current execution page no longer exposes a separate plan-only button.
 **开始执行** runs continuously after initial confirmation, with F9/stop and a 40-action
-limit. Primary desktop only, Baseline without experience in this first integration.
-Outputs go through existing ActionCall validation, focus/frame guards and no-progress
-protection. `done`/terminate remains unverified, never proof of success.
+limit. Win32 binds the current desktop foreground; Cua binds only selected windows.
+Confirmed experience is optional where the model input format supports it. Native
+model replies are normalized to `ActionPlan`; the execution core checks the target,
+then the selected backend adapter checks its own capabilities before dispatch.
+An unsupported action produces no-input feedback for a fresh observation, while
+authorization failures remain fatal. `done`/terminate is not proof of success.
 
 These are **local adaptation profiles, not reproductions of official benchmark scores**:
 BF16/SDPA, one screenshot, maximum 1,048,576 image pixels, 6,144 input tokens,
-512 generated tokens, last four actually executed steps, one next action per response.
+512 generated tokens and last four actually executed steps. Qwen can return up to
+eight actions per response; GUI-Owl and MAI keep their native single tool call.
+The core executes a valid batch in order without treating ordinary redraws as
+an interruption. It rechecks the authorized target before every action and
+reobserves after the batch; target/geometry changes and uncertain delivery stop
+the remainder. Every delivered action gets its own receipt and history entry.
 Over-budget, truncated, unknown or unsupported output is rejected, not executed.
+If a fully generated answer fails action-format validation, the loop archives its
+raw output, sends no input, and asks the model to regenerate from a fresh screenshot
+with the parser error as feedback. It permits at most two correction attempts;
+generation/transport errors and uncertain post-dispatch outcomes are not retried.
 
-GUI-Owl preserves the official desktop cookbook system prompt (MIT attribution in
-local_gui_owl_prompt.py), then appends explicit host capability restrictions.
-Its official desktop tool is `computer_use`, coordinates 0..1000.
+GUI-Owl uses the official desktop cookbook system prompt (MIT attribution in
+`local_gui_owl_prompt.py`) without a backend-specific suffix. Its
+`computer_use` coordinates are 0..1000. The intermediate adapter converts native
+click, key, type, wait, scroll, drag, and pointer-move actions to the unified
+protocol; the execution core then validates the bound target before dispatch.
+An omitted click position or drag start uses only a cursor position established
+by a previously delivered action in that target. It is never guessed from the
+user's live pointer. Unsupported or unfaithful mappings produce an explicit
+no-input feedback and a fresh observation, rather than silently changing the
+requested action. Cua's window cursor move is currently overlay-only, so native
+background hover is one such explicit capability gap. GUI-Owl `answer`,
+`interact`, and failure termination are non-input control outcomes.
+The driver checks its own action routes independently of model identity;
+backend capabilities are not inserted into the model prompt. An authorized
+window/app catalog can be supplied as neutral task data when applicable, and
+unsupported routes receive explicit no-input feedback from the execution core.
+
+In the desktop program, local GUI models expose an editable system prompt and
+per-round user prompt template under Advanced Options. Profiles are saved per
+model and Win32/Cua backend in `runs/local-gui/prompt-profiles.json` in the
+selected data directory. The template must keep the task, executed history,
+experience and execution-feedback placeholders. The old context placeholders
+remain accepted but are optional; only authorized target references are filled.
+Profiles are frozen when a task starts; the read-only
+completion review keeps its separate fixed prompt. The model's actual system
+and user messages, raw reply, and executor receipt are archived per round and
+shown as a conversation in Agent Activity. Editing a prompt does not bypass
+the action decoder, authorization scope, or execution core.
 MAI's official navigation tool is `mobile_use`, coordinates 0..999. MAI's supplied
 navigation prompt is mobile-oriented: our clearly labelled experimental Windows
 adaptation removes the Android launcher and navigation commands. It is NOT an
 official MAI desktop navigation recipe. Both use tool_call JSON, never Python eval.
-Supported subset: click/double click, type, validated keys, wait, terminate.
-Scroll, swipe, mobile open/system_button, mouse_move and implicit-start drag fail
-explicitly; they are not guessed or converted into unrelated Windows operations.
+MAI remains a separate, narrower Windows adaptation; its mobile launcher, swipe,
+system buttons, and unsupported pointer actions fail explicitly rather than being
+guessed or converted into unrelated Windows operations.
 
 Qwen uses a direct structured JSON next-action prompt. This differs from D-5970's
 frozen structured-head record format and should be disclosed in experiments.

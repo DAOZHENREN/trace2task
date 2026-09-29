@@ -8,7 +8,7 @@
 
 Trace2Task 现在包含 **Windows 桌面软件、本地网页控制台、多种模型后端，以及检验 Trace 和经验是否有效的实验流程**。
 
-> **项目状态：** 持续开发中的研究软件。本文描述 2026 年 9 月的当前源码，包版本号仍为 `0.18.1`；旧安装包不一定包含 `main` 的全部新功能。原生模型适配和 Cua 仍属实验能力。“动作已送达”或模型说“完成”，不等于任务已经验证成功。
+> **项目状态：** 持续开发中的研究软件。本文描述 2026 年 9 月的当前源码（`0.18.8`）；旧安装包不一定包含 `main` 的全部新功能。原生模型适配和 Cua 仍属实验能力。“动作已送达”或模型说“完成”，不等于任务已经验证成功。
 
 [开始使用](#开始使用) · [当前功能](#当前功能) · [模型支持](#模型支持) · [量化实验](#量化验证-trace-和经验) · [文档导航](#文档导航)
 
@@ -57,12 +57,12 @@ flowchart LR
 ```
 
 - 选择单窗口或整个主显示器，使用经验指导，或者无经验 **Baseline**。
-- 通用 Agent 路径支持手选经验和适用的自动检索；桌面经验模式需要合适的已审查任务模型。
-- 执行前可“只生成计划”。通用 Agent 可返回有上限的多动作批次，视觉检查点、焦点变化或异常可以丢弃剩余动作并重新观察。
+- 明确选择已审查、已语义编译的经验，或使用 Baseline；是否支持经验取决于模型和执行路径。
+- 开始前确认操作目标。Agent 可返回有上限的多动作批次；目标变化或异常可以丢弃剩余动作。当前执行页面已移除单独的“只生成计划”按钮。
 - 查看进度、停止原因和无进展保护；支持 **F9 / 停止按钮**，停止延迟取决于后端。
 - 通用桌面路径可启用 **LangGraph 子目标记忆与 SQLite 检查点**。恢复时重新看图，不回放旧坐标，也不盲目重试结果不确定的操作。
 
-原生 2B 和 D 模型适配目前不接入经验或 LangGraph，不能把它们当作通用 Agent 路径的完整替代。
+原生 2B 适配支持可选的编译经验；D 保留冻结输入协议。两者均不使用 LangGraph 检查点恢复，不能把它们当作旧通用 Agent 路径的完整替代。详见[统一执行契约](docs/unified-execution-core.md)。
 
 ### 桌面软件与网页控制台
 
@@ -72,6 +72,8 @@ flowchart LR
 - **安装包构建：** PyInstaller + Inno Setup 生成按用户安装的 Windows x64 程序，自带 Python、快捷方式和卸载入口。程序、数据、模型分开存放。
 - **本地模型管理：** 启动/关闭已识别的 Trace2Task 模型服务，显示加载或错误状态，跨任务复用模型，不是每次预测都重新加载。
 - **统一控制台：** 录制、任务与经验详情、审查、反馈、模型选择、运行状态和逐轮模型输入输出查看。
+- **可选 OpenCUA 录制：** 视频、输入事件与近似参考帧提取，需要单独配置组件；该归档尚未接入 Compiler。详见[录制边界](docs/opencua-recording.md)。
+- **远程 RSI 练习：** 在单独配置的隔离 Linux 虚拟机中运行官方 RSIAgent，查看预算、停止/恢复、独立验证与候选记忆。候选不会自动替换生效经验，详见[部署与验收边界](docs/rsi-integration.md)。
 
 安装程序**不包含**模型权重、Codex CLI、Cua Driver 或 benchmark 虚拟机。关闭程序不会自动卸载独立模型服务。
 
@@ -147,7 +149,7 @@ uv run --extra desktop trace2task desktop --project-root "D:\Trace2TaskData"
 1. 打开“执行任务”，选择范围，先用空白记事本或测试页面。
 2. 选择 **Codex、模型 API 或本地模型**。本地运行环境和权重需另行准备，选择不等于自动下载。
 3. 选择 **Baseline / 不使用经验**，或后端支持的已审查经验。
-4. 输入一句指令，先点“只生成计划”查看动作。
+4. 输入一句无破坏性的指令，核对模型、执行后端和操作目标。
 5. 核对范围后确认执行，需要时按 **F9 / 停止**。
 
 使用 Codex 前单独运行 `codex login`。ChatGPT 订阅不等于任意 API 服务额度。
@@ -191,7 +193,7 @@ uv pip install -r packaging\windows\requirements-build.txt
 
 条件需要在实验规范中声明并绑定兼容的冻结资产。仅仅点了确认，**不算另一种 Reviewed compile 方法**；实质改动经验后才有理由单列比较。不是每个任务都有全部条件，也不是实验都已完成。
 
-研究工具支持 held-out 变体、哈希、重复实验和耗时/动作/模型调用报告。远程 WAA VM 的**任务级重置不等于整机快照恢复**。WAA/VM 需单独配置，桌面软件不会自动安装它们。OSWorld 是设计参考，不是已交付的集成。
+研究工具支持 held-out 变体、哈希、重复实验和耗时/动作/模型调用报告。远程 WAA VM 的**任务级重置不等于整机快照恢复**。WAA/VM 需单独配置，桌面软件不会自动安装它们。另有 [RSIAgent 接入](docs/rsi-integration.md)，使用固定版本的 OSWorld-V2 虚拟机进行离线练习；这不等于 OSWorld benchmark 成绩，也不会自动安装虚拟机。
 
 配置后的单窗口 Effect Verifier 可以生成独立回执。仅依赖截图/模型自述时标为未验证；桌面/原生运行不能因为模型输出 `done` 就当成独立验证成功。
 
@@ -216,6 +218,7 @@ uv pip install -r packaging\windows\requirements-build.txt
 | Qwen 2B、GUI-Owl、MAI 与服务 | [原生 GUI 模型](docs/local-gui-models.md) |
 | D 结构化动作模型 | [D 模型接入](docs/trained-model-local.md) |
 | 子目标与恢复 | [LangGraph](docs/langgraph-desktop.md) |
+| 远程隔离练习与候选审查 | [RSIAgent 接入](docs/rsi-integration.md) |
 | 明确授权的后台目标 | [Cua 后端](docs/cua-experimental-backend.md) |
 | 模型/执行器日志 | [I/O 审计](docs/model-io-audit.md) · [本地运行实测](docs/local-model-runtime-validation.md) |
 | 发布前修复与剩余限制 | [2026-09-22 审查记录](docs/release-audit-2026-09-22.md) |

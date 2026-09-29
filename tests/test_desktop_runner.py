@@ -330,8 +330,15 @@ def test_desktop_uses_semantics_and_guidance_not_recorded_actions(tmp_path, monk
     contract = SimpleNamespace(
         task=SimpleNamespace(task_id="desktop-example", requires_confirmation=False),
         execution_scope="desktop", selector=SimpleNamespace(process_name="desktop", title_contains="all"),
-        semantic_experience=SimpleNamespace(stage_index_payload=lambda: {"summary": "SEMANTIC_EVIDENCE"}),
-        human_guidance=SimpleNamespace(prompt_payload=lambda: {"summary": "HUMAN_RULE"}),
+        semantic_experience=SimpleNamespace(stage_index_payload=lambda: {
+            "goal": "SEMANTIC_EVIDENCE", "completion": {"mode": "state"},
+            "state_graph": {"entry_state_id": "open", "states": [
+                {"id": "open", "name": "Open", "visual_anchors": ["screen"]}],
+                "transitions": [], "terminals": []},
+        }),
+        human_guidance=SimpleNamespace(prompt_payload=lambda: {
+            "revision": 1, "rules": [{"id": "rule-1", "scope": {"type": "global", "id": "global"},
+                                      "prefer": "HUMAN_RULE"}]}),
         demonstration=[{"x": 0.123456, "text": "NEVER_COPY_THIS"}],
     )
     monkeypatch.setattr(desktop_runner, "load_windows_task", lambda _: contract)
@@ -373,6 +380,39 @@ def test_timing_is_logged_and_persisted(tmp_path, monkeypatch):
     assert saved["performance"] == perf
     assert any("模型响应完成" in message for message in messages)
     assert any("耗时 125 ms" in message for message in messages)
+
+
+def test_desktop_batch_keeps_multiple_actions_but_exposes_backend_receipts(tmp_path):
+    backend = Backend()
+    messages = []
+    model = Model([plan(TEXT, TEXT), plan(complete=True)])
+    result = run(tmp_path, model, backend, status_callback=messages.append)
+    assert result['actions'] == 2
+    assert backend.inputs == ['hello', 'hello']
+    assert result['stage_timings'][0]['executed_actions'] == 2
+    events = [json.loads(line) for line in Path(result['trace_path']).read_text(encoding='utf-8').splitlines()]
+    delivered = [event['result'] for event in events if event['type'] == 'action']
+    assert [item['effect'] for item in delivered] == ['unverifiable', 'unverifiable']
+    assert all(item['receipt']['route'] == 'win32_foreground_input' for item in delivered)
+    assert '"effect": "unverifiable"' in model.prompts[1]['prompt']
+    assert any('已送达，效果待观察' in message for message in messages)
+
+
+def test_desktop_adapter_rejects_wrong_target_receipt_without_retry(tmp_path, monkeypatch):
+    from trace2task.windows_control import MotorResult, WindowsMotorExecutor
+
+    calls = []
+
+    def wrong_target(_self, action):
+        calls.append(action.to_payload())
+        return MotorResult(action.skill, 999, 1)
+
+    monkeypatch.setattr(WindowsMotorExecutor, 'execute', wrong_target)
+    result = run(tmp_path, Model([plan(TEXT)]), Backend())
+    assert result['stop_reason'] == 'error'
+    assert result['actions'] == 0
+    assert 'receipt target differs' in result['error']
+    assert len(calls) == 1
 
 
 def test_failed_model_call_keeps_performance(tmp_path):

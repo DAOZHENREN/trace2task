@@ -1,4 +1,4 @@
-"""Experimental window-scoped Cua transport. No foreground fallback or retries."""
+"""Experimental window-scoped Cua transport with explicit refusal handling."""
 import json
 import os
 import subprocess
@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from trace2task.cua_window import inspect_window
+from trace2task.execution_protocol import ActionUnavailable, DriverRefusal
 
 DEFAULT_DRIVER = 'D:/Tools/cua-driver-probe/v0.28.2/cua-driver-rs-0.28.2-windows-x86_64/cua-driver.exe'
 EXCLUDED_APPS = {'trace2task.exe', 'chatgpt.exe', 'codex.exe', 'cua-driver.exe'}
@@ -26,9 +27,30 @@ def response_value(stdout, returncode=0):
         raise RuntimeError('Cua returned a non-JSON error: ' + stdout[:500]) from None
     if not isinstance(value, dict):
         raise RuntimeError('Invalid Cua response')  # noqa: TRY004 - transport protocol failure
+    if value.get('code') == 'background_unavailable':
+        raise DriverRefusal(value)
+    # Unknown error codes are not a delivery receipt even when effect=unverifiable.
+    if value.get('code'):
+        raise RuntimeError('Cua returned a non-success code: ' + json.dumps(value, ensure_ascii=False)[:1000])
     if value.get('isError') or value.get('error') or value.get('refusal') or value.get('status') in {'refused', 'error', 'failed'}:
         raise RuntimeError('Cua refused/failed: ' + json.dumps(value, ensure_ascii=False)[:1000])
     return value
+
+
+def text_element(state):
+    """Resolve a unique editable control, never a window's settable title."""
+    elements = state.get('elements')
+    if (state.get('elements_complete') is not True or not isinstance(elements, list)
+            or any(not isinstance(element, dict) for element in elements)):
+        raise ActionUnavailable('Cua 文本控件树不完整；未输入文本')
+    editable = [element for element in elements if element.get('enabled') is True
+                and element.get('role') in ('Edit', 'Document', 'TextBox', 'TextField', 'TextArea')
+                and isinstance(element.get('actions'), list)
+                and 'set_value' in element['actions']
+                and isinstance(element.get('element_token'), str) and element['element_token']]
+    if len(editable) != 1:
+        raise ActionUnavailable('Cua 文本目标不唯一或没有可编辑文本控件；未输入文本')
+    return editable[0]
 
 
 def action_request(call, state):
@@ -58,6 +80,8 @@ def action_request(call, state):
             'to_y': min(height-1, int(args['end_y']*height)),
             'button': args['button'], 'duration_ms': args['duration_ms']}
     if call.skill == 'scroll':
+        if 'x' in args or 'y' in args:
+            raise ActionUnavailable('后台滚动不支持坐标指定子区域；请改用明确起终点拖动该区域的滚动条，或不带坐标滚动当前区域')
         return 'scroll', {**common, **args}
     if call.skill in {'click', 'double_click'}:
         width, height = pixels('screenshot_width'), pixels('screenshot_height')
@@ -65,27 +89,24 @@ def action_request(call, state):
                          'y': min(height-1, int(args['y']*height)),
                          'button': args['button'], 'count': 2 if call.skill == 'double_click' else 1}
     if call.skill == 'type_text':
-        # Do not guess which of several editable controls owns input focus.
-        elements = state.get('elements')
-        if (not state.get('elements_complete') or not isinstance(elements, list)
-                or any(not isinstance(element, dict) for element in elements)):
-            raise ValueError('Cua 文本控件树不完整；未输入文本')
-        editable = [element for element in elements if element.get('enabled') is True
-                    and isinstance(element.get('actions'), list)
-                    and 'set_value' in element['actions']
-                    and isinstance(element.get('element_token'), str)
-                    and element['element_token']]
-        if len(editable) != 1:
-            raise ValueError('Cua 文本目标不唯一或控件树不完整；未输入文本')
-        return 'type_text', {**common, 'element_token': editable[0]['element_token'], 'text': args['text']}
+        if 'x' in args or 'y' in args:
+            width, height = pixels('screenshot_width'), pixels('screenshot_height')
+            return 'type_text', {**common, 'x': min(width-1, int(args['x']*width)),
+                                 'y': min(height-1, int(args['y']*height)), 'text': args['text']}
+        if state.get('elements_complete') is False:
+            # A degraded accessibility tree is not proof that native focused
+            # text delivery is unavailable. Let Cua decide for this exact
+            # window; never invent a coordinate or use global input here.
+            return 'type_text', {**common, 'text': args['text']}
+        return 'type_text', {**common, 'element_token': text_element(state)['element_token'], 'text': args['text']}
     if call.skill == 'press_key':
         return 'press_key', {**common, 'key': {'enter':'return', 'page_up':'pageup', 'page_down':'pagedown'}.get(args['key'], args['key'])}
     if call.skill == 'hotkey':
         keys = args['keys']
         if any(k not in {'ctrl', 'shift', 'alt'} for k in keys[:-1]) or keys[-1] in {'ctrl', 'shift', 'alt'}:
-            raise ValueError('Cua 组合键必须是修饰键加一个普通按键')
+            raise ActionUnavailable('Cua 组合键必须是修饰键加一个普通按键')
         return 'press_key', {**common, 'key': {'enter':'return', 'page_up':'pageup', 'page_down':'pagedown'}.get(keys[-1], keys[-1]), 'modifiers': keys[:-1]}
-    raise ValueError(f'Cua 实验后端暂不支持 {call.skill}；未执行')
+    raise ActionUnavailable(f'Cua 实验后端暂不支持 {call.skill}；未执行')
 
 
 class CuaBackend:

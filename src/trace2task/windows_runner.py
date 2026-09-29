@@ -23,6 +23,7 @@ from trace2task.execution_runtime import ExecutionRuntime, capture_with_timing
 from trace2task.io_audit import IOAudit
 from trace2task.model_api import API_REASONING_EFFORTS, ModelAPIConfig, validate_api_model
 from trace2task.recording import TraceWriter, make_run_dir
+from trace2task.window_execution import WindowExecutionAdapter
 from trace2task.windows_agent import (
     WINDOWS_DECISION_TIMEOUT_SECONDS,
     CodexWindowsAgent,
@@ -697,6 +698,7 @@ def run_windows_agent(
         sleeper=active_emergency.sleep,
         background=background,
     )
+    action_adapter = WindowExecutionAdapter(executor, active_emergency)
     try:
         active_emergency.start()
         active_emergency.raise_if_requested()
@@ -955,7 +957,8 @@ def run_windows_agent(
                     pending_visual_action = action
                     pending_visual_baseline = surface.copy()
                 try:
-                    motor_result = runtime.execute(executor, action)
+                    action_adapter.bind(window)
+                    motor_result = runtime.execute(action_adapter, action)
                 except EmergencyStopRequested:
                     raise
                 except WindowSafetyError:

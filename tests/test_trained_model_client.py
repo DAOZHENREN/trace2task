@@ -4,6 +4,7 @@ from io import BytesIO
 import pytest
 
 from trace2task import trained_model_client as client
+from trace2task.execution_protocol import COORDINATE_SPACE, PROTOCOL_VERSION
 
 
 def test_prediction_bridge_keeps_image_local_and_does_not_execute(monkeypatch):
@@ -18,12 +19,17 @@ def test_prediction_bridge_keeps_image_local_and_does_not_execute(monkeypatch):
                     return BytesIO(b'{"protocol":2,"status":"ready"}')
                 return BytesIO(b"'X-Preview-Token':'" + b"a" * 32 + b"'")
             requests.append(request)
-            return BytesIO(json.dumps({"status": "predicted", "executed": False}).encode())
+            return BytesIO(json.dumps({"status": "predicted", "executed": False,
+                "prediction": {"actions": [{"skill": "click", "args": {"x": .5, "y": .5}}]}}).encode())
 
     monkeypatch.setattr(client, "build_opener", lambda *args: Opener())
     monkeypatch.setattr(client.socket, "create_connection", lambda *args, **kwargs: BytesIO())
     result = client.predict_local("hello", image="aGVsbG8=")
     assert result["executed"] is False
+    assert result["prediction"] == {
+        "protocol_version": PROTOCOL_VERSION, "coordinate_space": COORDINATE_SPACE,
+        "actions": [{"skill": "click", "args": {"x": .5, "y": .5, "button": "left"}}],
+    }
     assert requests[0].full_url == "http://127.0.0.1:8767/predict"
     assert json.loads(requests[0].data) == {"task": "hello", "image": "aGVsbG8=", "capture": False}
 

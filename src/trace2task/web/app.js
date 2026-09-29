@@ -1,5 +1,6 @@
 const elements = {
   executionScope: document.querySelector("#execution-scope"),
+  operationScope: document.querySelector("#operation-scope"),
   desktopWorkflowSettings: document.querySelector("#desktop-workflow-settings"),
   desktopOrchestration: document.querySelector("#desktop-orchestration"),
   desktopResume: document.querySelector("#desktop-resume"),
@@ -11,6 +12,18 @@ const elements = {
   modelProvider: document.querySelector("#model-provider"),
   localModelSettings: document.querySelector("#local-model-settings"),
   localModel: document.querySelector("#local-model"),
+  localPromptSettings: document.querySelector("#local-prompt-settings"),
+  localSystemPrompt: document.querySelector("#local-system-prompt"),
+  localTurnTemplate: document.querySelector("#local-turn-template"),
+  localPromptsSave: document.querySelector("#local-prompts-save"),
+  localPromptsReset: document.querySelector("#local-prompts-reset"),
+  localPromptsStatus: document.querySelector("#local-prompts-status"),
+  chatPromptSettings: document.querySelector("#chat-prompt-settings"),
+  chatPromptHelp: document.querySelector("#chat-prompt-help"),
+  chatPromptGuidance: document.querySelector("#chat-prompt-guidance"),
+  chatPromptsSave: document.querySelector("#chat-prompts-save"),
+  chatPromptsReset: document.querySelector("#chat-prompts-reset"),
+  chatPromptsStatus: document.querySelector("#chat-prompts-status"),
   codexModelSettings: document.querySelector("#codex-model-settings"),
   apiModelSettings: document.querySelector("#api-model-settings"),
   apiBaseUrl: document.querySelector("#api-base-url"),
@@ -31,7 +44,6 @@ const elements = {
   charCount: document.querySelector("#char-count"),
   warning: document.querySelector("#capability-warning"),
   error: document.querySelector("#form-error"),
-  planButton: document.querySelector("#plan-button"),
   executeButton: document.querySelector("#execute-button"),
   empty: document.querySelector("#empty-state"),
   jobView: document.querySelector("#job-view"),
@@ -42,6 +54,7 @@ const elements = {
   jobEffort: document.querySelector("#job-effort"),
   jobInstruction: document.querySelector("#job-instruction"),
   jobLog: document.querySelector("#job-log"),
+  modelChat: document.querySelector("#model-chat"),
   resultPanel: document.querySelector("#result-panel"),
   jobPerformance: document.querySelector("#job-performance"),
   jobResult: document.querySelector("#job-result"),
@@ -50,12 +63,10 @@ const elements = {
   viewTabs: [...document.querySelectorAll(".view-tab")],
   viewPanels: [...document.querySelectorAll(".view-panel")],
   recordSource: document.querySelector("#record-source"),
-  localRecordingFields: document.querySelector("#local-recording-fields"),
   waaRecordingFields: document.querySelector("#waa-recording-fields"),
   waaRoot: document.querySelector("#waa-root"),
   waaExample: document.querySelector("#waa-example"),
   waaTaskMeta: document.querySelector("#waa-task-meta"),
-  recordWindow: document.querySelector("#record-window"),
   recordName: document.querySelector("#record-name"),
   recordModel: document.querySelector("#record-model"),
   recordReasoningEffort: document.querySelector("#record-reasoning-effort"),
@@ -69,8 +80,6 @@ const elements = {
   compilerModel: document.querySelector("#compiler-model"),
   compilerReasoningEffort: document.querySelector("#compiler-reasoning-effort"),
   experienceModelSummary: document.querySelector("#experience-model-summary"),
-  windowMeta: document.querySelector("#window-meta"),
-  refreshWindows: document.querySelector("#refresh-windows"),
   recordButton: document.querySelector("#record-button"),
   recordStopButton: document.querySelector("#record-stop-button"),
   recordError: document.querySelector("#record-error"),
@@ -89,6 +98,21 @@ const elements = {
   taskDetailTags: document.querySelector("#task-detail-tags"),
   taskDetailBody: document.querySelector("#task-detail-body"),
   taskDetailActions: document.querySelector("#task-detail-actions"),
+  rsiStatus: document.querySelector("#rsi-status"),
+  rsiMessage: document.querySelector("#rsi-message"),
+  rsiChecks: document.querySelector("#rsi-checks"),
+  rsiInstruction: document.querySelector("#rsi-instruction"),
+  rsiModel: document.querySelector("#rsi-model"),
+  rsiReasoningEffort: document.querySelector("#rsi-reasoning-effort"),
+  rsiMaxCalls: document.querySelector("#rsi-max-calls"),
+  rsiWallSeconds: document.querySelector("#rsi-wall-seconds"),
+  rsiProjectBudget: document.querySelector("#rsi-project-budget"),
+  rsiStart: document.querySelector("#rsi-start"),
+  rsiRefresh: document.querySelector("#rsi-refresh"),
+  rsiStop: document.querySelector("#rsi-stop"),
+  rsiRunCount: document.querySelector("#rsi-run-count"),
+  rsiRunList: document.querySelector("#rsi-run-list"),
+  rsiDetail: document.querySelector("#rsi-detail"),
 };
 
 const statusLabels = {
@@ -101,9 +125,15 @@ const statusLabels = {
   completed: "已完成",
   partial: "录制成功",
   failed: "失败",
+  preflight: "预检中",
+  needs_recovery: "需要恢复",
+  finalizing: "正在清理资源",
+  cancelled: "已取消",
 };
 
 const modelLabels = {
+  "gpt-6-sol": "GPT-6 Sol",
+  "gpt-6-luna": "GPT-6 Luna",
   "gpt-5.6-sol": "Sol · 最强",
   "gpt-5.6-terra": "Terra · 平衡",
   "gpt-5.6-luna": "Luna · 更快",
@@ -192,9 +222,9 @@ function makeGuidanceField(label, value, className = "") {
 let taskpacks = [];
 let candidates = [];
 let recordings = [];
-let localWindows = [];
 let activeJobId = null;
 let pollTimer = null;
+let modelChatSignature = "";
 let refreshedRecordingJobId = null;
 let backendSupportsIncrementalGuidance = false;
 let narrationCapture = null;
@@ -206,6 +236,19 @@ let waaTasks = [];
 let waaTaskCatalogRoot = null;
 let defaultWaaExamplePath = "";
 let dictationSession = null;
+let rsiHealth = null;
+let rsiRuns = [];
+const RSI_POLL_INTERVAL_MS = 3_000;
+let selectedRsiRunId = null;
+let rsiEventCursor = 0;
+let rsiEvents = [];
+let rsiPollTimer = null;
+let rsiRecovery = null;
+let rsiRecoveryRunId = null;
+// Candidate prose and a user's unfinished review note are local, per-page
+// state.  They are keyed by the immutable candidate digest so a later run or
+// candidate cannot inherit an earlier run's text.
+const rsiCandidateViews = new Map();
 const taskDetailFragments = new Map();
 
 // Task-end audio: only observed active -> terminal transitions, never old results.
@@ -301,11 +344,6 @@ function selectedTask() {
   return taskpacks.find((task) => task.path === path) || null;
 }
 
-function selectedWindow() {
-  const handle = Number(elements.recordWindow.value);
-  return localWindows.find((windowInfo) => windowInfo.handle === handle) || null;
-}
-
 function usesWaaRecording() {
   return elements.recordSource.value === "waa";
 }
@@ -325,7 +363,7 @@ function renderWaaTaskMeta() {
   const apps = task.related_apps?.length ? task.related_apps.join("、") : task.domain;
   const evaluator = task.evaluator?.length ? task.evaluator.join(" + ") : "WAA evaluator";
   const variant = task.variant_id
-    ? ` · 经验族：${task.experience_family_id} · ${task.variant_id}（仅演示）`
+    ? ` · 实验组：${task.experience_family_id} · ${task.variant_id}（仅演示）`
     : "";
   elements.waaTaskMeta.textContent = `${task.instruction}${variant} · 应用：${apps} · Evaluator：${evaluator} · Reset：${task.reset_paths.length} 条规则已配置`;
 }
@@ -370,24 +408,29 @@ async function refreshWaaTasks({ force = false } = {}) {
 
 function renderRecordingSource() {
   const waa = usesWaaRecording();
-  elements.localRecordingFields.classList.toggle("hidden", waa || elements.recordSource.value === "desktop");
+  const native = elements.recordSource.value === "opencua";
+  elements.recordNarration.disabled = native || isBusy();
+  if (native) elements.recordNarration.checked = false;
+  elements.recordDeferCompilation.disabled = native || isBusy();
+  if (native) elements.recordDeferCompilation.checked = true;
   elements.waaRecordingFields.classList.toggle("hidden", !waa);
   elements.recordButton.disabled = isBusy()
-    || (!waa && elements.recordSource.value !== "desktop" && !selectedWindow())
     || (waa && !selectedWaaTask());
 }
 
 function switchView(view) {
+  if (view !== "rsi") clearTimeout(rsiPollTimer);
   closeTaskDetail();
   document.body.classList.toggle("library-mode", view === "library");
+  document.body.classList.toggle("rsi-mode", view === "rsi");
   elements.viewTabs.forEach((tabButton) => {
     tabButton.classList.toggle("active", tabButton.dataset.view === view);
   });
   elements.viewPanels.forEach((panel) => {
     panel.classList.toggle("hidden", panel.id !== `${view}-panel`);
   });
-  if (view === "record" && !usesWaaRecording() && !localWindows.length) refreshWindows();
   if (view === "library") refreshState();
+  if (view === "rsi") refreshRsi();
 }
 
 function canExecuteTask(task) {
@@ -396,22 +439,28 @@ function canExecuteTask(task) {
   return !isWechat || !task.missing_message_capabilities.includes("type_text");
 }
 
-function canAutoExecute() {
-  return taskpacks.some((task) => canExecuteTask(task));
-}
-
 function renderTaskMeta() {
   elements.useExperience.checked = elements.taskpack.value !== "__baseline__"
     && !elements.taskpack.value.startsWith("baseline:");
   elements.experienceHelp.textContent = elements.executionScope.value === "desktop"
     ? "开启后手动选择语义经验，使用任务状态图和人工规则指导桌面规划，不复用录制坐标。关闭即 Baseline。"
     : "在下拉列表中选择使用经验，或仅选择目标窗口（不使用经验）；后者保留允许操作和结果验证。";
+  if (!backendMatchesScope()) {
+    elements.warning.textContent = elements.operationScope.value === "selected_windows"
+      ? "指定窗口 / 应用目前需要 Cua 后端；请在模型旁选择 Cua。"
+      : "全桌面目前需要 Win32 后端；请在模型旁选择 Win32。";
+    elements.warning.classList.remove("hidden");
+    elements.executeButton.disabled = true;
+    return;
+  }
   if (elements.executionScope.value === "desktop") {
     const task = selectedTask();
     elements.taskMeta.textContent = elements.useExperience.checked
       ? (task ? `经验：${task.task_id} · 来源：${task.execution_scope === "desktop" ? "桌面" : "单窗口（仅对应应用内参考）"}` : "请手动选择已语义编译的经验。")
       : "Baseline：只发送指令、主屏截图和最近操作，不读取任何经验。";
-    elements.warning.textContent = "会控制主显示器上的多个程序并占用鼠标键盘。请先关闭敏感内容；F9 或停止按钮中止。模型自报完成不等于独立验证成功。";
+    elements.warning.textContent = elements.operationScope.value === "selected_windows"
+      ? "仅操作下方授权的窗口或应用。后台优先；明确拒绝后该窗口改走前台。F9 或停止按钮中止。模型自报完成不等于独立验证成功。"
+      : "会控制主显示器上的多个程序并占用鼠标键盘。请先关闭敏感内容；F9 或停止按钮中止。模型自报完成不等于独立验证成功。";
     elements.warning.classList.remove("hidden");
     elements.executeButton.disabled = isBusy() || (elements.useExperience.checked && (!task?.confirmed || !task?.semantic_experience));
     return;
@@ -419,10 +468,10 @@ function renderTaskMeta() {
   const task = selectedTask();
   if (!task) {
     elements.taskMeta.textContent = taskpacks.length
-      ? `将从 ${taskpacks.filter((item) => item.confirmed).length} 个已确认 Trace 中自动选择；低置信度会拒绝执行。`
+      ? "请选择目标任务；使用经验时必须手动选择，Baseline 可直接指定窗口。"
       : "没有找到可用的 Windows 示范任务。";
     elements.warning.classList.add("hidden");
-    elements.executeButton.disabled = !canAutoExecute() || isBusy();
+    elements.executeButton.disabled = true;
     return;
   }
   const target = [task.process_name, task.title_contains].filter(Boolean).join(" · ");
@@ -456,12 +505,12 @@ function populateTaskpacks(records) {
   const automatic = document.createElement("option");
   const desktop = elements.executionScope.value === "desktop";
   automatic.value = desktop ? "__baseline__" : "";
-  automatic.textContent = desktop ? "不使用经验 · 桌面 Baseline" : "自动选择经验（推荐）";
+  automatic.textContent = desktop ? "不使用经验 · 桌面 Baseline" : "请选择任务经验";
   elements.taskpack.append(automatic);
   records.forEach((task) => {
     const option = document.createElement("option");
     option.value = task.path;
-    option.textContent = `${task.task_id} · ${task.execution_scope === "desktop" ? "桌面经验" : task.process_name || "Windows"}${task.confirmed ? "" : "（草稿）"}`;
+    option.textContent = `${task.task_id}${task.confirmed ? "" : "（草稿）"}`;
     elements.taskpack.append(option);
   });
   if (!desktop) {
@@ -580,17 +629,145 @@ function usesTrainedModel() {
   return elements.modelProvider.value === "local" && ["trained_d", "qwen3-vl-2b", "gui-owl-2b", "mai-ui-2b"].includes(elements.localModel.value);
 }
 
+let promptProfileKey = "";
+let promptDirty = false;
+let promptLoaded = false;
+let chatPromptProviderLoaded = "";
+let chatPromptDirty = false;
+
+function editableChatPromptProvider() {
+  if (elements.modelProvider.value === "codex") return "codex";
+  return usesModelApi() ? "api" : "";
+}
+
+async function loadChatPrompts() {
+  const provider = editableChatPromptProvider();
+  elements.chatPromptSettings.classList.toggle("hidden", !provider);
+  if (!provider) { chatPromptProviderLoaded = ""; chatPromptDirty = false; return; }
+  elements.chatPromptHelp.textContent = provider === "api"
+    ? "此内容会附加到实际 API 请求的 system 消息；下方逐轮日志会显示完整系统消息。"
+    : "Codex 的内置系统提示词由 App Server 管理，当前接口不会返回或允许编辑；此处编辑的是本程序每轮发送给 Codex 的执行指导，逐轮日志会如实标注。";
+  if (provider === chatPromptProviderLoaded) return;
+  chatPromptProviderLoaded = "";
+  elements.chatPromptsStatus.textContent = "正在读取已保存提示词…";
+  try {
+    const profile = await request(`/api/chat-prompts?provider=${provider}`);
+    if (editableChatPromptProvider() !== provider) return;
+    elements.chatPromptGuidance.value = profile.guidance;
+    chatPromptProviderLoaded = provider;
+    chatPromptDirty = false;
+    elements.chatPromptsStatus.textContent = profile.customized ? "正在使用已保存的自定义指导。" : "使用默认提示词。";
+  } catch (error) {
+    if (editableChatPromptProvider() === provider) elements.chatPromptsStatus.textContent = `提示词读取失败：${error.message}`;
+  }
+}
+
+async function saveChatPrompts(reset = false) {
+  const provider = editableChatPromptProvider();
+  if (!provider || provider !== chatPromptProviderLoaded || isBusy()) return;
+  elements.chatPromptsSave.disabled = true;
+  elements.chatPromptsReset.disabled = true;
+  try {
+    const profile = await request("/api/chat-prompts", {method: "POST", body: JSON.stringify({
+      provider, guidance: reset ? "" : elements.chatPromptGuidance.value,
+    })});
+    if (editableChatPromptProvider() !== provider) return;
+    elements.chatPromptGuidance.value = profile.guidance;
+    chatPromptDirty = false;
+    elements.chatPromptsStatus.textContent = reset ? "已恢复默认。" : "已保存；下一次任务生效。";
+  } catch (error) {
+    elements.chatPromptsStatus.textContent = `保存失败：${error.message}`;
+  } finally {
+    elements.chatPromptsSave.disabled = false;
+    elements.chatPromptsReset.disabled = false;
+  }
+}
+
+function editableLocalPromptKey() {
+  if (!usesTrainedModel() || elements.localModel.value === "trained_d") return "";
+  return `${elements.localModel.value}:${document.querySelector("#local-executor").value}`;
+}
+
+async function loadLocalPrompts() {
+  const key = editableLocalPromptKey();
+  elements.localPromptSettings.classList.toggle("hidden", !key);
+  if (!key) { promptProfileKey = ""; promptDirty = false; promptLoaded = false; return; }
+  if (key === promptProfileKey) return;
+  promptProfileKey = key;
+  promptLoaded = false;
+  elements.localPromptsStatus.textContent = "正在读取已保存提示词…";
+  try {
+    const [model, backend] = key.split(":");
+    const profile = await request(`/api/local-prompts?model=${encodeURIComponent(model)}&backend=${backend}`);
+    if (promptProfileKey !== key) return;
+    elements.localSystemPrompt.value = profile.effective.system_prompt;
+    elements.localTurnTemplate.value = profile.effective.turn_template;
+    promptDirty = false;
+    promptLoaded = true;
+    elements.localPromptsStatus.textContent = profile.customized
+      ? "正在使用本机保存的自定义提示词。" : "正在使用模型默认提示词。";
+  } catch (error) {
+    if (promptProfileKey === key) elements.localPromptsStatus.textContent = `提示词读取失败：${error.message}`;
+  }
+}
+
+async function saveLocalPrompts(reset = false) {
+  const key = editableLocalPromptKey();
+  if (!key || key !== promptProfileKey || isBusy()) return;
+  const [model, backend] = key.split(":");
+  elements.localPromptsSave.disabled = true;
+  elements.localPromptsReset.disabled = true;
+  try {
+    const profile = await request("/api/local-prompts", {method: "POST", body: JSON.stringify({
+      model, backend,
+      profile: reset ? null : {system_prompt: elements.localSystemPrompt.value,
+        turn_template: elements.localTurnTemplate.value},
+    })});
+    if (promptProfileKey !== key) return;
+    elements.localSystemPrompt.value = profile.effective.system_prompt;
+    elements.localTurnTemplate.value = profile.effective.turn_template;
+    promptDirty = false;
+    promptLoaded = true;
+    elements.localPromptsStatus.textContent = reset ? "已恢复模型默认提示词。" : "已保存；下一次任务开始生效。";
+  } catch (error) {
+    elements.localPromptsStatus.textContent = `保存失败：${error.message}`;
+  } finally {
+    elements.localPromptsSave.disabled = false;
+    elements.localPromptsReset.disabled = false;
+  }
+}
+
 function usesModelApi() {
   return elements.modelProvider.value === "api" || (elements.modelProvider.value === "local" && !usesTrainedModel());
 }
 
+function backendMatchesScope() {
+  return elements.operationScope.value === "desktop"
+    || document.querySelector("#local-executor").value === "cua";
+}
+
+function cuaJobTarget(selection) {
+  return selection ? {targets: selection.targets, initial_index: selection.initial_index}
+    : document.querySelector("#local-executor").value === "cua"
+      ? {kind: "desktop", display_id: "primary"} : null;
+}
+
 function syncProviderFields() {
   const trained = usesTrainedModel();
+  const backend = document.querySelector("#local-executor");
+  const selected = elements.operationScope.value === "selected_windows";
+  if (selected) elements.desktopOrchestration.value = "legacy";
+  elements.desktopWorkflowSettings.hidden = selected;
+  document.querySelector("#execution-backend-help").textContent = !backendMatchesScope()
+    ? (selected ? "指定窗口 / 应用目前使用 Cua；请选择 Cua 后端。" : "全桌面目前使用 Win32；请选择 Win32 后端。")
+    : selected
+    ? "仅操作已授权目标。后台优先；明确拒绝后该窗口改走前台，并尝试恢复原焦点。"
+    : "全桌面可跨应用；本机桌面输入会占用系统键鼠。";
+  document.querySelector("#cua-target-settings").hidden = !selected || backend.value !== "cua";
   if (trained) {
     elements.executionScope.value = "desktop";
-    elements.useExperience.checked = false;
     populateTaskpacks(taskpacks);
-    elements.taskpack.value = "__baseline__";
+    if (elements.localModel.value === "trained_d") elements.taskpack.value = "__baseline__";
     renderTaskMeta();
     renderInputModeHelp();
   }
@@ -602,7 +779,8 @@ function syncProviderFields() {
   document.querySelector("#codex-advanced").hidden = elements.modelProvider.value !== "codex";
   document.querySelector("#local-advanced").hidden = elements.modelProvider.value !== "local" || trained;
   document.querySelector("#trained-advanced").hidden = !trained;
-  document.querySelector("#trained-output").hidden = !trained;
+  loadLocalPrompts();
+  loadChatPrompts();
   if (elements.modelProvider.value === "api" && !savedAPISettings?.saved) {
     document.querySelector("#execution-advanced").open = true;
   }
@@ -822,17 +1000,23 @@ function makeCandidateReview(candidate) {
   return container;
 }
 
-function makePerformanceTimeline(performance, stages = []) {
+function makePerformanceTimeline(performance, stages = [], job = null) {
   if (!performance || !Object.keys(performance).length) return null;
+  const submitted = job?.created_at ? Date.parse(job.created_at) : NaN;
+  const finished = job?.updated_at ? Date.parse(job.updated_at) : NaN;
+  const jobWallMs = Number.isFinite(submitted) && Number.isFinite(finished)
+    && finished >= submitted && !["queued", "running", "stopping"].includes(job.status)
+    ? finished - submitted : null;
   const details = document.createElement("details");
   details.className = "performance-timeline";
   const summary = document.createElement("summary");
-  summary.textContent = `查看性能时间轴 · 模型 ${formatDuration(performance.model_roundtrip_ms || performance.planning_ms)} / 总计 ${formatDuration(performance.total_elapsed_ms)}`;
+  summary.textContent = `查看性能时间轴 · 模型 ${formatDuration(performance.model_roundtrip_ms ?? performance.planning_ms)} / ${jobWallMs === null ? "Agent 循环" : "任务提交至结束"} ${formatDuration(jobWallMs ?? performance.total_elapsed_ms)}`;
   const grid = document.createElement("div");
   grid.className = "performance-grid";
   const metrics = [
-    ["总耗时", performance.total_elapsed_ms],
-    ["规划总计", performance.planning_ms],
+    ["任务提交至结束", jobWallMs],
+    ["Agent 循环", performance.total_elapsed_ms],
+    ...(performance.model_roundtrip_ms === undefined ? [["规划总计", performance.planning_ms]] : []),
     ["模型回合", performance.model_roundtrip_ms],
     ["模型生成等待", performance.model_completion_wait_ms],
     ["截图", performance.capture_ms],
@@ -843,6 +1027,7 @@ function makePerformanceTimeline(performance, stages = []) {
   if (performance.startup_ms !== undefined) metrics.push(["启动 / 装载", performance.startup_ms]);
   if (performance.cancel_wait_ms !== undefined) metrics.push(["停止等待", performance.cancel_wait_ms]);
   metrics.forEach(([label, value]) => {
+    if (value === null || value === undefined) return;
     const metric = document.createElement("div");
     const name = document.createElement("span");
     const duration = document.createElement("strong");
@@ -852,6 +1037,10 @@ function makePerformanceTimeline(performance, stages = []) {
     grid.append(metric);
   });
   details.append(summary, grid);
+  const scope = document.createElement("p");
+  scope.className = "field-help";
+  scope.textContent = "“Agent 循环”只统计执行器开始到退出；“任务提交至结束”还包含排队、初始化与结果整理，不包含提交前的准备或其他任务。各分项并非全部耗时，勿相加当作总计。";
+  details.append(scope);
   if (stages.length) {
     const stageList = document.createElement("div");
     stageList.className = "performance-stages";
@@ -875,6 +1064,7 @@ function modelIoStatusLabel(round) {
     return "正在等待模型调用取消；未执行未返回的计划";
   }
   if (status === "discarded") return "停止后返回，未执行";
+  if (status === "format_rejected") return "动作格式无效，未执行；请求模型纠正";
   if (["cancelled", "canceled", "stopped", "aborted"].includes(status)) {
     return "已取消；未执行未返回的计划";
   }
@@ -966,7 +1156,7 @@ function makeModelIoTimeline(rounds) {
     entry.className = "guidance-revision";
     const entrySummary = document.createElement("summary");
     const stepIndex = Number.isInteger(round?.step_index) ? round.step_index + 1 : index + 1;
-    entrySummary.textContent = `模型回合 ${stepIndex} · ${modelIoStatusLabel(round)} · ${formatModelDuration(modelIoDuration(round))}`;
+    entrySummary.textContent = `模型回合 ${stepIndex} · ${round?.purpose === "verify_completion" ? "只读完成核验" : modelIoStatusLabel(round)} · ${formatModelDuration(modelIoDuration(round))}`;
     const body = document.createElement("div");
     body.className = "guidance-revision-body";
 
@@ -1030,10 +1220,38 @@ function makeModelIoTimeline(rounds) {
       body.append(error);
     }
 
+    if (round?.execution) {
+      const execution = document.createElement("p");
+      const value = round.execution;
+      const label = value.status === "delivered"
+        ? value.delivery_mode_requested === "foreground" && value.background_refusal
+          ? (value.effect === "confirmed"
+            ? "后台拒绝，前台重试的效果已确认"
+            : "后台拒绝，前台已尝试；效果待观察")
+          : (value.effect === "confirmed" ? "动作已送达，驱动已确认效果" : "动作已送达，效果待确认")
+        : value.status === "driver_refused" ? "驱动拒绝后台输入，未记为已送达"
+        : value.status === "no_progress" ? "无进展保护：重复操作未执行，要求模型纠正"
+        : value.status === "rejected" ? "动作未执行，预检拒绝" : "执行中断或结果未知，不自动重试";
+      execution.textContent = `执行器：${label}${value.reason ? ` · ${value.reason}` : ""}。动作效果不等于整个任务成功。`;
+      body.append(execution);
+    }
+    if (round?.protocol_normalizations?.includes("complete_json_missing_tool_call_close")) {
+      const note = document.createElement("p");
+      note.textContent = "格式兼容：生成正常结束、JSON 完整，仅缺少工具调用结束标签；原始输出未修改。";
+      body.append(note);
+    }
+    if (round?.verification) {
+      const note = document.createElement("p");
+      const labels = {complete: "视觉证据支持完成", incomplete: "尚未完成", unknown: "无法确认"};
+      note.textContent = `只读核验：${labels[round.verification.verdict] || "结果无效"} · ${round.verification.evidence} · ${round.verification.missing || "无可见缺项"}。由同一本地模型判断，不是独立应用验证；本轮未执行动作。`;
+      body.append(note);
+    }
     [
       ["查看实际请求内容", round?.request ?? round?.model_input ?? round?.input],
       ["查看模型原始输出", round?.raw_output],
-      ["查看解码后的预测", round?.prediction],
+      ["查看解码后的预测（不是执行结果）", round?.prediction],
+      ["查看实际执行结果", round?.execution],
+      ["查看只读核验证据", round?.verification],
       ["查看响应内容", round?.response ?? round?.model_output ?? round?.output],
     ].forEach(([label, value]) => {
       const payload = makeModelPayload(label, value);
@@ -1069,6 +1287,179 @@ function makeModelIoTimeline(rounds) {
   return timeline;
 }
 
+function makeChatBubble(role, label, value) {
+  const bubble = document.createElement("div");
+  bubble.className = `model-chat-bubble ${role}`;
+  const heading = document.createElement("strong");
+  heading.textContent = label;
+  bubble.append(heading);
+  const text = modelIoText(value ?? "");
+  const content = document.createElement("pre");
+  content.textContent = text || "尚未返回";
+  bubble.append(content);
+  return bubble;
+}
+
+function describeUnifiedAction(action) {
+  const args = action?.args || {};
+  const point = (x, y) => `画面位置 ${Math.round(x * 100)}%、${Math.round(y * 100)}%`;
+  const button = {left: "左键", right: "右键", middle: "中键"}[args.button] || "左键";
+  switch (action?.skill) {
+    case "click": return `${button}点击 ${point(args.x, args.y)}`;
+    case "double_click": return `双击 ${point(args.x, args.y)}`;
+    case "move_cursor": return `移动鼠标到 ${point(args.x, args.y)}`;
+    case "hold_mouse": return `${button}按住 ${point(args.x, args.y)}，持续 ${args.duration_ms} 毫秒`;
+    case "drag": return `从 ${point(args.start_x, args.start_y)} 拖到 ${point(args.end_x, args.end_y)}，持续 ${args.duration_ms} 毫秒`;
+    case "type_text": return `输入文字「${args.text}」${args.x === undefined ? "（当前焦点）" : `，定位于 ${point(args.x, args.y)}`}`;
+    case "press_key": return `按键 ${args.key}`;
+    case "hold_key": return `按住 ${args.key}，持续 ${args.duration_ms} 毫秒`;
+    case "hotkey": return `组合键 ${args.keys?.join(" + ")}`;
+    case "wait": return `等待 ${args.duration_ms} 毫秒`;
+    case "scroll": return `向${{up: "上", down: "下", left: "左", right: "右"}[args.direction] || args.direction}滚动 ${args.amount} ${args.by === "page" ? "页" : "行"}${args.x === undefined ? "" : `，位置 ${point(args.x, args.y)}`}`;
+    case "switch_window": return `切换到窗口 PID ${args.pid} / HWND ${args.window_id}`;
+    case "launch_app": return `启动已授权应用 ${args.app_id}`;
+    default: return action?.skill || "未知动作";
+  }
+}
+
+function makeActionFlow(execution) {
+  const actions = execution?.normalized_plan?.actions;
+  if (!Array.isArray(actions)) return null;
+  const flow = document.createElement("div");
+  flow.className = "model-action-flow";
+  const heading = document.createElement("strong");
+  heading.textContent = "动作去向 · 模型原文 → 统一动作 → 执行器 → 回执";
+  flow.append(heading);
+  actions.forEach((action, index) => {
+    const card = document.createElement("div");
+    card.className = "model-action-card";
+    const line = document.createElement("strong");
+    line.textContent = action.done ? "完成声明 · 不发送键鼠动作" : `动作 ${index + 1} · ${describeUnifiedAction(action)}`;
+    card.append(line);
+    if (!action.done) {
+      const attempts = (execution.executor_requests || []).filter(item => item.action_index === index + 1);
+      if (attempts.length) {
+        attempts.forEach(item => {
+          const request = item.request || {};
+          const target = request.backend === "cua" ? "Cua" : request.backend === "win32" ? "Win32" : request.backend || "执行器";
+          const mode = {background: "后台", foreground: "前台", local: "本地", control: "目标控制"}[request.delivery_mode] || "";
+          const coords = request.backend === "cua" && Number.isFinite(request.args?.x) && Number.isFinite(request.args?.y)
+            ? ` · 像素坐标 ${request.args.x}、${request.args.y}` : "";
+          const states = {delivered: "已送达", refused: "明确拒绝，未送达", not_sent: "未发送", unknown: "结果未知", attempted: "已调用，送达待确认"};
+          const detail = document.createElement("p");
+          detail.textContent = `执行器收到：${target} ${mode} ${request.operation || "动作"}${coords} · ${states[item.status] || item.status}`;
+          card.append(detail);
+        });
+      } else {
+        const unsent = document.createElement("p");
+        unsent.textContent = `未发送到执行器${index === (execution.steps?.length || 0) && execution.reason ? `：${execution.reason}` : "（本轮未进入此动作）"}`;
+        card.append(unsent);
+      }
+      const step = execution.steps?.[index];
+      if (step?.receipt) {
+        const receipt = document.createElement("p");
+        receipt.textContent = `回执：${step.receipt.effect === "confirmed" ? "驱动确认效果" : "输入已送达，实际效果待看下一张截图"}${step.receipt.screen_position ? ` · 屏幕像素 ${step.receipt.screen_position.join("、")}` : ""}`;
+        card.append(receipt);
+      }
+    }
+    flow.append(card);
+  });
+  return flow;
+}
+
+function modelRoundImages(round) {
+  const images = [];
+  if (round.screenshot) images.push({path: round.screenshot, label: "当前截图 · 本轮操作依据"});
+  if (round.previous_screenshot) images.push({path: round.previous_screenshot, label: "对照截图 · 上一次动作前，仅供比较"});
+  const attachments = (round.input?.messages || []).flatMap(message =>
+    Array.isArray(message.content) ? message.content : []).filter(part =>
+      ["image", "image_url", "localImage", "input_image"].includes(part.type)).length;
+  const count = attachments || images.length;
+  const missing = Math.max(0, count - images.length);
+  const summary = count ? `本轮图片：${count} 张 · 可预览 ${images.length} 张`
+    + (missing ? `；${missing} 张缺少预览路径，请查看 I/O 归档` :
+      round.previous_screenshot ? "；包含当前截图和动作前对照图" : "；无动作前对照图")
+    : "本轮日志未记录图片信息，无法确认是否发送截图";
+  return {images, summary};
+}
+
+function makeModelChat(rounds) {
+  const chat = document.createElement("div");
+  if (!Array.isArray(rounds) || !rounds.length) {
+    chat.textContent = "任务开始后，这里会按轮次显示模型输入、回答和执行结果。";
+    return chat;
+  }
+  rounds.forEach((round, index) => {
+    const group = document.createElement("section");
+    group.className = "model-chat-round";
+    const title = document.createElement("h4");
+    const step = Number.isInteger(round.step_index) ? round.step_index + 1 : index + 1;
+    title.textContent = `第 ${step} 轮 · ${round.purpose === "verify_completion" ? "只读完成核验" : modelIoStatusLabel(round)} · ${formatModelDuration(modelIoDuration(round))}`;
+    group.append(title);
+    const messages = round.input?.messages || [];
+    if (round.system_managed_externally || round.provider === "codex") {
+      group.append(makeChatBubble("system", "Codex 内置系统指令 · 未由 App Server 返回",
+        "以下展示本程序实际发送的任务文字；Codex 内置系统指令不能从当前接口读取，也未伪装成已归档内容。"));
+    }
+    if (messages.length) {
+      messages.forEach((message, messageIndex) => {
+        const content = Array.isArray(message.content)
+          ? message.content.map(part => part.type === "text" ? part.text :
+            ["image", "image_url", "localImage", "input_image"].includes(part.type)
+              ? "[图片附件：用途及预览见下方“本轮图片”]" : modelIoText(part)).join("\n\n")
+          : message.content;
+        const labels = {system: "系统消息 · 实际发送", user: "输入给模型 · 实际发送",
+          assistant: "历史模型回答 · 实际发送"};
+        group.append(makeChatBubble(message.role, `${labels[message.role] || message.role} · ${messageIndex + 1}/${messages.length}`, content));
+      });
+    } else {
+      group.append(makeChatBubble("user", "输入给模型",
+        round.status === "pending" ? "模型请求正在准备中…" : round.input?.task || "输入见归档"));
+    }
+    const imageInfo = modelRoundImages(round);
+    const imageSummary = document.createElement("p");
+    imageSummary.className = "field-help";
+    imageSummary.textContent = imageInfo.summary;
+    group.append(imageSummary);
+    const gallery = document.createElement("div");
+    gallery.className = "model-chat-images";
+    imageInfo.images.forEach((item) => {
+      const figure = document.createElement("figure");
+      const caption = document.createElement("figcaption");
+      caption.textContent = item.label;
+      const link = document.createElement("a");
+      link.href = `/api/local-image?path=${encodeURIComponent(item.path)}`;
+      link.target = "_blank";
+      link.rel = "noopener";
+      const image = document.createElement("img");
+      image.className = "model-chat-image";
+      image.alt = `第 ${step} 轮 ${item.label}`;
+      image.loading = "lazy";
+      image.src = link.href;
+      image.addEventListener("error", () => {
+        caption.textContent = `${item.label} · 图片加载失败，文件可能已移动或删除`;
+      });
+      link.append(image);
+      figure.append(caption, link);
+      gallery.append(figure);
+    });
+    group.append(gallery);
+    if (round.raw_output || round.error || round.status !== "pending") {
+      group.append(makeChatBubble("assistant", round.raw_output_kind === "native_structured_actions"
+        ? "模型原生结构化输出 · 未经过统一协议转换" : "模型回答 · 原文",
+        round.raw_output || round.error || "模型未返回可用回答"));
+    }
+    const actionFlow = makeActionFlow(round.execution);
+    if (actionFlow) group.append(actionFlow);
+    if ((round.execution && !actionFlow) || round.verification) {
+      const receipt = round.execution || round.verification;
+      group.append(makeChatBubble("executor", round.verification ? "只读完成核验" : "执行器回执 · 非任务完成证明", receipt));
+    }
+    chat.append(group);
+  });
+  return chat;
+}
+
 function renderLibrary() {
   elements.taskpackCount.textContent = `${taskpacks.length} 项`;
   elements.candidateCount.textContent = `${candidates.length} 项`;
@@ -1097,7 +1488,7 @@ function renderLibrary() {
     title.textContent = task.task_id;
     const subtitle = document.createElement("div");
     subtitle.className = "library-subtitle";
-    subtitle.textContent = `${task.process_name || "Windows"} · ${task.title_contains || "未命名窗口"}`;
+    subtitle.textContent = task.semantic_experience?.goal || task.instruction || "未设置任务目标";
     nameBlock.append(title, subtitle);
     const status = document.createElement("span");
     status.className = `mini-tag ${task.confirmed ? "ok" : "warn"}`;
@@ -1166,11 +1557,11 @@ function renderLibrary() {
       guidance.title = task.human_guidance.summary;
       tags.append(guidance);
     }
-    if (task.experience_family_id) {
-      const family = document.createElement("span");
-      family.className = "mini-tag";
-      family.textContent = `经验族：${task.experience_family_id}`;
-      tags.append(family);
+    if (task.guidance_review_pending?.length) {
+      const pending = document.createElement("span");
+      pending.className = "mini-tag warn";
+      pending.textContent = `${task.guidance_review_pending.length} 条旧规则暂停生效 · 待复核`;
+      tags.append(pending);
     }
 
     let storyboard = null;
@@ -1681,6 +2072,19 @@ function renderLibrary() {
         row.append(warning);
         changeList.append(row);
       });
+      const review = proposal.guidance_review;
+      if (review) {
+        const retained = document.createElement("div");
+        retained.className = "semantic-stage";
+        retained.textContent = `继续生效的人工规则：${(review.carried_rule_ids || []).join("、") || "无"}`;
+        changeList.append(retained);
+        (review.pending || []).forEach((item) => {
+          const row = document.createElement("div");
+          row.className = "semantic-stage";
+          row.textContent = `待人工复核（不会给 Agent）：${item.rule?.id || "未知规则"} · ${item.reason}`;
+          changeList.append(row);
+        });
+      }
       changeDetails.append(changeSummary, changeList);
       const confirmActions = document.createElement("div");
       confirmActions.className = "library-actions";
@@ -1769,7 +2173,20 @@ function renderLibrary() {
     }
     const actions = document.createElement("div");
     actions.className = "library-actions";
-    if (recording.success) {
+    if (recording.recording_backend === "opencua") {
+      const native = document.createElement("span");
+      native.className = "mini-tag info";
+      native.textContent = "OpenCUA 原生归档 · 暂未接 Compiler";
+      tags.append(native);
+      if (recording.derivation?.status === "completed") {
+        const derived = document.createElement("span");
+        derived.className = "mini-tag ok";
+        derived.textContent = `${recording.derivation.action_count} 个动作组 · 已配图`;
+        tags.append(derived);
+        actions.append(makeMiniButton("打开动作图文目录", () => openLocal(recording.derivation.review_path)));
+      }
+    }
+    if (recording.success && recording.compilation_supported !== false) {
       actions.append(
         makeMiniButton(
           "编译 / 重试",
@@ -1779,9 +2196,11 @@ function renderLibrary() {
       );
     }
     actions.append(makeMiniButton("在本地查看", () => openLocal(recording.local_path)));
-    const deleteRecordingButton = makeMiniButton("删除", () => deleteRecording(recording));
-    deleteRecordingButton.classList.add("danger");
-    actions.append(deleteRecordingButton);
+    if (recording.recording_backend !== "opencua") {
+      const deleteRecordingButton = makeMiniButton("删除", () => deleteRecording(recording));
+      deleteRecordingButton.classList.add("danger");
+      actions.append(deleteRecordingButton);
+    }
     item.append(title, subtitle, tags, actions);
     elements.recordingList.append(item);
   });
@@ -1967,6 +2386,22 @@ function renderTaskDetailRoute() {
   if (fragments.guidanceDetails) {
     fragments.guidanceDetails.open = true;
     elements.taskDetailBody.append(fragments.guidanceDetails);
+  }
+  if (task.guidance_review_pending?.length) {
+    const pending = document.createElement("details");
+    pending.className = "semantic-storyboard guidance-storyboard";
+    pending.open = true;
+    const summary = document.createElement("summary");
+    summary.textContent = `暂停生效的旧规则 · ${task.guidance_review_pending.length} 条`;
+    pending.append(summary);
+    task.guidance_review_pending.forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "semantic-stage";
+      const rule = item.rule || {};
+      row.textContent = `${rule.id || "未知规则"}：${item.reason || "待复核"}。原建议：${rule.prefer || "无"}。这些内容目前不会发送给 Agent；如仍适用，请在后续反馈中重新确认。`;
+      pending.append(row);
+    });
+    elements.taskDetailBody.append(pending);
   }
   elements.taskDetailActions.replaceChildren();
   if (!task.confirmed) {
@@ -2315,23 +2750,678 @@ async function submitNarration() {
   }
 }
 
+function rsiRunIsActive(run) {
+  return ["queued", "preflight", "running", "finalizing"].includes(run?.state);
+}
+
+function rsiRunBlocksNewPractice(run) {
+  return rsiRunIsActive(run) || run?.state === "needs_recovery";
+}
+
+const rsiRecoveryReasonLabels = {
+  completed_boundary_verified: "已验证最后一个完成项目边界。",
+  cleanup_incomplete: "远端资源尚未完成清理，暂时不能恢复。",
+  immutable_manifest_mismatch: "运行版本或配置与原始清单不一致，拒绝恢复。",
+  official_boundary_rejected: "官方完成边界校验未通过，不能恢复。",
+  no_completed_boundary: "尚无可验证的完成项目边界，不能恢复。",
+  stop_requested: "该练习已请求停止，不能恢复。",
+};
+
+const rsiCodexAuthenticationRequired = "codex_authentication_required";
+
+function rsiHasCodexAuthenticationFailure(value) {
+  try {
+    return JSON.stringify(value || {}).toLowerCase().includes(rsiCodexAuthenticationRequired);
+  } catch (_) {
+    return false;
+  }
+}
+
+function rsiResultForDisplay(result) {
+  if (!rsiHasCodexAuthenticationFailure(result)) return result;
+  return {
+    ...result,
+    error_category: rsiCodexAuthenticationRequired,
+    error: "Codex 授权已失效或刷新失败；本次练习未自动重试。请在远端服务器终端使用既有账号重新登录 Codex 后，刷新本页并新建练习。",
+  };
+}
+
+function formatRsiMilliseconds(value) {
+  if (!Number.isInteger(value) || value < 0) return "未记录";
+  const seconds = Math.floor(value / 1000);
+  return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
+function rsiRecoveryReasonText(recovery) {
+  const reason = recovery?.reason || "recovery_not_allowed";
+  return rsiRecoveryReasonLabels[reason] || `远端未允许恢复（${reason}）。`;
+}
+
+function rsiSetStatus(health, message = "") {
+  const ready = health?.ready === true;
+  const state = health?.connection_state || "unconfigured";
+  elements.rsiStatus.className = `status-pill ${ready ? "running" : state === "unready" ? "partial" : "failed"}`;
+  elements.rsiStatus.textContent = ready ? "远端可用"
+    : state === "unready" ? "资源未就绪"
+    : state === "unreachable" ? "连接不可用" : "未配置";
+  elements.rsiMessage.textContent = message || health?.message
+    || (ready ? "远端隔离练习已就绪。练习结果必须经独立 Verifier 后才会成为可审查候选。" : "远端 RSI 部署尚未就绪。");
+  elements.rsiChecks.replaceChildren();
+  const missing = (health?.checks || []).filter((check) => check?.ready !== true);
+  if (state !== "unready" || !missing.length) {
+    elements.rsiChecks.classList.add("hidden");
+    return;
+  }
+  elements.rsiChecks.classList.remove("hidden");
+  const title = document.createElement("strong");
+  title.textContent = "尚未通过的远端准备检查";
+  const list = document.createElement("ul");
+  missing.forEach((check) => {
+    const item = document.createElement("li");
+    item.textContent = check.label || "未命名准备检查";
+    list.append(item);
+  });
+  const help = document.createElement("p");
+  help.textContent = "请在远端部署完成下载、Codex 授权或运行时安装后刷新；本机不会自动修复远端资源。";
+  elements.rsiChecks.append(title, list, help);
+}
+
+function rsiPopulateOptions(health) {
+  const replace = (element, values, preferred) => {
+    const current = element.value;
+    element.replaceChildren();
+    values.forEach((value) => element.append(new Option(value, value)));
+    element.value = values.includes(current) ? current : (values.includes(preferred) ? preferred : values[0] || "");
+  };
+  replace(elements.rsiModel, health?.models || [], "gpt-6-astra");
+  replace(elements.rsiReasoningEffort, health?.reasoning_efforts || [], "low");
+  const clampToProfileMaximum = (element, maximum) => {
+    if (!Number.isInteger(maximum)) return;
+    element.max = String(maximum);
+    if (Number(element.value) > maximum) element.value = String(maximum);
+  };
+  clampToProfileMaximum(elements.rsiMaxCalls, health?.max_model_calls);
+  clampToProfileMaximum(elements.rsiWallSeconds, health?.max_wall_seconds);
+  clampToProfileMaximum(elements.rsiProjectBudget, health?.max_project_budget);
+}
+
+function rsiSetControls() {
+  const ready = rsiHealth?.ready === true;
+  const hasRemoteChoices = Boolean(elements.rsiModel.value && elements.rsiReasoningEffort.value);
+  const active = rsiRuns.some(rsiRunBlocksNewPractice);
+  const selected = rsiRuns.find((run) => run.id === selectedRsiRunId);
+  const canStop = rsiRunBlocksNewPractice(selected) && !selected.stop_requested;
+  [elements.rsiInstruction, elements.rsiModel, elements.rsiReasoningEffort,
+    elements.rsiMaxCalls, elements.rsiWallSeconds, elements.rsiProjectBudget].forEach((field) => {
+    field.disabled = !ready || active;
+  });
+  elements.rsiStart.disabled = !ready || !hasRemoteChoices || active || !elements.rsiInstruction.value.trim();
+  elements.rsiStop.disabled = !canStop;
+}
+
+function rsiRunTitle(run) {
+  const direction = run.spec?.instruction || "未记录练习方向";
+  const state = run.state === "completed"
+    ? "练习已结束"
+    : statusLabels[run.state] || run.state || "未知状态";
+  return `${state} · ${direction}`;
+}
+
+function rsiEventText(event) {
+  const parts = [event.time || "时间未记录", event.kind || "event"];
+  const payload = event.payload || {};
+  for (const [key, value] of Object.entries(payload)) parts.push(`${key}=${value}`);
+  return parts.join(" · ");
+}
+
+function rsiLedgerSnapshot(run, events) {
+  const attempts = new Map();
+  let callsUsed = null;
+  for (const event of events || []) {
+    const payload = event?.payload || {};
+    const attemptNo = payload.attempt_no;
+    if (event.kind === "attempt_claimed" && Number.isInteger(attemptNo) && attemptNo > 0) {
+      attempts.set(attemptNo, {
+        number: attemptNo,
+        mode: payload.mode || "fresh",
+        state: "active",
+        cleanupConfirmed: null,
+        activeElapsedMs: null,
+      });
+      if (Number.isInteger(payload.model_calls_before)) {
+        callsUsed = Math.max(callsUsed ?? 0, payload.model_calls_before);
+      }
+    }
+    if (event.kind === "model_call_reserved" && Number.isInteger(payload.global_call_index)) {
+      callsUsed = Math.max(callsUsed ?? 0, payload.global_call_index);
+    }
+    if ((event.kind === "attempt_finalized" || event.kind === "attempt_abandoned_conservatively")
+        && Number.isInteger(attemptNo) && attemptNo > 0) {
+      const prior = attempts.get(attemptNo) || { number: attemptNo, mode: "未记录" };
+      attempts.set(attemptNo, {
+        ...prior,
+        state: event.kind === "attempt_finalized" ? "finalized" : "abandoned",
+        cleanupConfirmed: typeof payload.cleanup_confirmed === "boolean"
+          ? payload.cleanup_confirmed : false,
+        activeElapsedMs: Number.isInteger(payload.active_elapsed_ms)
+          ? payload.active_elapsed_ms : null,
+      });
+      if (Number.isInteger(payload.model_calls_used)) {
+        callsUsed = Math.max(callsUsed ?? 0, payload.model_calls_used);
+      }
+    }
+  }
+  const ordered = [...attempts.values()].sort((left, right) => left.number - right.number);
+  const current = ordered.at(-1) || null;
+  const settledElapsedMs = ordered.reduce(
+    (total, attempt) => total + (Number.isInteger(attempt.activeElapsedMs) ? attempt.activeElapsedMs : 0), 0,
+  );
+  const callLimit = run.spec?.max_model_calls;
+  const wallLimitMs = Number.isInteger(run.spec?.wall_seconds) ? run.spec.wall_seconds * 1000 : null;
+  return {
+    current,
+    attempts: ordered.length,
+    callsUsed,
+    callsRemaining: Number.isInteger(callsUsed) && Number.isInteger(callLimit)
+      ? Math.max(0, callLimit - callsUsed) : null,
+    settledElapsedMs,
+    settledRemainingMs: Number.isInteger(wallLimitMs) ? Math.max(0, wallLimitMs - settledElapsedMs) : null,
+  };
+}
+
+function rsiLedgerText(run, events) {
+  const ledger = rsiLedgerSnapshot(run, events);
+  const calls = Number.isInteger(ledger.callsUsed)
+    ? `${ledger.callsUsed} 已用 / ${ledger.callsRemaining ?? "?"} 剩余`
+    : "尚无已保留的调用账本记录";
+  const time = `已结算累计时间：${formatRsiMilliseconds(ledger.settledElapsedMs)}；已结算剩余：${formatRsiMilliseconds(ledger.settledRemainingMs)}。`;
+  if (!ledger.current) return `调用：${calls}。${time} 尚未取得 attempt 记录。`;
+  const cleanup = ledger.current.cleanupConfirmed === true ? "已确认"
+    : ledger.current.cleanupConfirmed === false ? "未确认" : "尚未进入清理";
+  const activeNotice = ledger.current.state === "active"
+    ? "当前 attempt 仍在运行，未结算的执行时间会在清理完成后入账。" : "";
+  return `Attempt #${ledger.current.number} · ${ledger.current.mode} · ${ledger.current.state}；清理：${cleanup}。调用：${calls}。${time} ${activeNotice}`;
+}
+
+function rsiCandidateKey(runId, digest) {
+  return typeof runId === "string" && typeof digest === "string" && digest
+    ? `${runId}--${digest}` : null;
+}
+
+function rsiSelectedCandidateMatches(runId, digest, allowReviewed = false) {
+  const selected = rsiRuns.find((run) => run.id === selectedRsiRunId);
+  return selectedRsiRunId === runId && selected?.candidate_sha256 === digest
+    && (allowReviewed || !selected.review);
+}
+
+function rsiCandidateEditorFocused(run) {
+  const key = rsiCandidateKey(run?.id, run?.candidate_sha256);
+  const editor = key && elements.rsiDetail.querySelector(`[data-rsi-candidate-key="${key}"] textarea`);
+  return Boolean(editor && document.activeElement === editor);
+}
+
+function updateFocusedRsiDetail(run) {
+  // A server-confirmed review always wins over local focus/draft preservation:
+  // the editor must disappear rather than leaving a stale submit affordance.
+  if (run.review || !rsiSelectedCandidateMatches(run.id, run.candidate_sha256)
+      || elements.rsiDetail.dataset.rsiRunId !== run.id || !rsiCandidateEditorFocused(run)) return false;
+  const ledger = elements.rsiDetail.querySelector(".rsi-ledger-detail");
+  if (ledger) ledger.textContent = rsiLedgerText(run, rsiEvents);
+  const log = elements.rsiDetail.querySelector(".rsi-event-log");
+  if (log) log.textContent = rsiEvents.length ? rsiEvents.map(rsiEventText).join("\n") : "尚无可显示事件。";
+  return true;
+}
+
+function makeRsiCandidateViewer(run, entry) {
+  const key = rsiCandidateKey(run.id, run.candidate_sha256);
+  const candidate = entry.candidate || {};
+  const verification = candidate.verification && typeof candidate.verification === "object"
+    ? candidate.verification : {};
+  const viewer = document.createElement("section");
+  viewer.className = "rsi-candidate-view";
+  viewer.dataset.rsiCandidateKey = key;
+  const heading = document.createElement("h4");
+  heading.textContent = run.review
+    ? "已归档候选经验（只读，尚未生效）" : "独立验证后的候选经验（尚未生效）";
+  const provenance = document.createElement("p");
+  provenance.className = "rsi-candidate-provenance";
+  const evidence = Array.isArray(verification.evidence) ? verification.evidence[0] : null;
+  const source = typeof candidate.source === "string" ? candidate.source : "未记录来源";
+  const verdict = typeof verification.verdict === "string" ? verification.verdict : "未记录结论";
+  const artifact = typeof verification.artifact === "string" ? verification.artifact : "未记录证据文件";
+  const evidenceHash = typeof evidence?.sha256 === "string" ? evidence.sha256 : "未记录";
+  provenance.textContent = `独立验证来源：${source}；结论：${verdict}；证据：${artifact}；证据 SHA-256：${evidenceHash}`;
+  const scope = document.createElement("p");
+  scope.className = "field-help";
+  scope.textContent = typeof verification.scope === "string"
+    ? verification.scope : "验证范围未记录；候选仍需人工审查。";
+  const memoryHeading = document.createElement("h5");
+  memoryHeading.textContent = "候选记忆文件";
+  const memory = candidate.memory && typeof candidate.memory === "object" && !Array.isArray(candidate.memory)
+    ? candidate.memory : {};
+  const memoryEntries = Object.entries(memory);
+  const memoryList = document.createElement("div");
+  memoryList.className = "rsi-candidate-memory-list";
+  if (!memoryEntries.length) {
+    const empty = document.createElement("p");
+    empty.className = "field-help";
+    empty.textContent = "候选中没有可显示的记忆文件。";
+    memoryList.append(empty);
+  }
+  memoryEntries.forEach(([name, value]) => {
+    const file = document.createElement("section");
+    file.className = "rsi-candidate-memory-file";
+    const fileName = document.createElement("h6");
+    fileName.textContent = name;
+    const fileText = document.createElement("pre");
+    // Intentionally textContent: remote candidate prose is untrusted model output.
+    fileText.textContent = typeof value?.text === "string" ? value.text : "[未提供可读文本]";
+    const fileHash = document.createElement("p");
+    fileHash.className = "field-help";
+    fileHash.textContent = `文件 SHA-256：${typeof value?.sha256 === "string" ? value.sha256 : "未记录"}`;
+    file.append(fileName, fileText, fileHash);
+    memoryList.append(file);
+  });
+  const raw = document.createElement("details");
+  raw.className = "rsi-candidate-raw";
+  const rawSummary = document.createElement("summary");
+  rawSummary.textContent = "完整候选 JSON（审计）";
+  const rawContent = document.createElement("pre");
+  rawContent.textContent = JSON.stringify(candidate, null, 2);
+  raw.append(rawSummary, rawContent);
+  viewer.append(heading, provenance, scope, memoryHeading, memoryList, raw);
+  // The review is immutable, but its underlying evidence must remain readable.
+  if (run.review) return viewer;
+  const note = document.createElement("textarea");
+  note.maxLength = 4000;
+  note.rows = 3;
+  note.placeholder = "可选：记录人工审查意见。接受只归档，不会自动修改当前经验。";
+  note.value = entry.draft || "";
+  note.addEventListener("input", () => { entry.draft = note.value; });
+  const accept = makeMiniButton("归档为接受", () => reviewRsiCandidate(run.id, run.candidate_sha256, "accepted"), true);
+  const reject = makeMiniButton("归档为拒绝", () => reviewRsiCandidate(run.id, run.candidate_sha256, "rejected"));
+  viewer.append(note, accept, reject);
+  return viewer;
+}
+
+function renderRsiDetail(run) {
+  if (run && updateFocusedRsiDetail(run)) return;
+  elements.rsiDetail.replaceChildren();
+  if (!run) {
+    elements.rsiDetail.classList.add("hidden");
+    return;
+  }
+  elements.rsiDetail.classList.remove("hidden");
+  elements.rsiDetail.dataset.rsiRunId = run.id;
+  const heading = document.createElement("h3");
+  heading.textContent = "练习详情";
+  const metadata = document.createElement("p");
+  metadata.className = "field-help";
+  metadata.textContent = `${run.id} · ${run.spec?.model || "未记录模型"} / ${run.spec?.reasoning_effort || "未记录强度"} · ${formatTimestamp(run.updated)}`;
+  const direction = document.createElement("p");
+  direction.className = "instruction-preview";
+  direction.textContent = run.spec?.instruction || "未记录练习方向";
+  elements.rsiDetail.append(heading, metadata, direction);
+
+  const ledger = document.createElement("section");
+  ledger.className = "rsi-ledger";
+  const ledgerHeading = document.createElement("h4");
+  ledgerHeading.textContent = "调用与清理账本";
+  const ledgerDetail = document.createElement("p");
+  ledgerDetail.className = "field-help rsi-ledger-detail";
+  ledgerDetail.textContent = rsiLedgerText(run, rsiEvents);
+  ledger.append(ledgerHeading, ledgerDetail);
+  elements.rsiDetail.append(ledger);
+
+  if (run.state === "completed" && !run.candidate_sha256) {
+    const noCandidate = document.createElement("p");
+    noCandidate.className = "rsi-no-candidate";
+    noCandidate.textContent = "练习流程已结束，但未生成可审查的已验证候选；流程结束不代表每个项目成功，请查看项目的独立验证结果。";
+    elements.rsiDetail.append(noCandidate);
+  }
+
+  if (run.stop_requested && run.state !== "cancelled") {
+    const stop = document.createElement("p");
+    stop.className = "rsi-stop-pending";
+    stop.textContent = "已请求停止：这不是已停止。正在等待远端 Worker 清理其拥有的虚拟机并写入最终状态。";
+    elements.rsiDetail.append(stop);
+  }
+  if (run.state === "needs_recovery" && !run.stop_requested) {
+    const recovery = document.createElement("section");
+    recovery.className = `rsi-recovery${rsiRecoveryRunId === run.id && rsiRecovery?.eligible ? " eligible" : ""}`;
+    const recoveryHeading = document.createElement("h4");
+    recoveryHeading.textContent = "恢复检查";
+    const explanation = document.createElement("p");
+    if (rsiRecoveryRunId !== run.id) {
+      explanation.textContent = "正在检查是否可从已完成项目边界恢复…";
+      recovery.append(recoveryHeading, explanation);
+    } else if (!rsiRecovery) {
+      explanation.textContent = "恢复检查暂不可用；不会重放未完成项目的任何操作。";
+      recovery.append(recoveryHeading, explanation);
+    } else {
+      explanation.textContent = rsiRecoveryReasonText(rsiRecovery);
+      const budget = document.createElement("p");
+      budget.className = "field-help";
+      const projects = Number.isInteger(rsiRecovery.boundary_projects)
+        ? `已完成项目边界：${rsiRecovery.boundary_projects}。` : "已完成项目边界：未记录。";
+      budget.textContent = `${projects} 剩余模型调用：${rsiRecovery.remaining_model_calls ?? "未记录"}；剩余练习时间：${formatRsiMilliseconds(rsiRecovery.remaining_wall_ms)}。`;
+      recovery.append(recoveryHeading, explanation, budget);
+      if (rsiRecovery.eligible === true) {
+        recovery.append(makeMiniButton("从已完成项目边界恢复", () => recoverRsiPractice(run), true));
+      }
+    }
+    const safety = document.createElement("p");
+    safety.className = "field-help";
+    safety.textContent = "恢复会再次由服务器验证；未完成项目的操作不会重放，模型调用和练习时间继续累计且不能重设。";
+    recovery.append(safety);
+    elements.rsiDetail.append(recovery);
+  }
+  const logHeading = document.createElement("h4");
+  logHeading.textContent = "受限运行事件";
+  const log = document.createElement("pre");
+  log.className = "rsi-event-log";
+  log.textContent = rsiEvents.length ? rsiEvents.map(rsiEventText).join("\n") : "尚无可显示事件。";
+  elements.rsiDetail.append(logHeading, log);
+
+  if (run.result?.status || run.result?.reason || run.result?.error) {
+    if (rsiHasCodexAuthenticationFailure(run.result)) {
+      const authentication = document.createElement("p");
+      authentication.className = "rsi-stop-pending";
+      authentication.textContent = "Codex 授权已失效或刷新失败。本次练习已停止，不会自动重试、复制凭据或回退到付费 API；请在远端服务器终端使用既有账号重新登录 Codex 后，新建练习。";
+      elements.rsiDetail.append(authentication);
+    }
+    const result = document.createElement("pre");
+    result.className = "rsi-result";
+    result.textContent = JSON.stringify(rsiResultForDisplay(run.result), null, 2);
+    elements.rsiDetail.append(result);
+  }
+  if (run.review) {
+    const reviewed = document.createElement("p");
+    reviewed.className = "rsi-reviewed";
+    reviewed.textContent = `候选经验已归档为人工${run.review.decision === "accepted" ? "接受" : "拒绝"}；它未自动写入当前 Trace 或生效经验。`;
+    elements.rsiDetail.append(reviewed);
+    const receipt = document.createElement("pre");
+    receipt.className = "rsi-review-receipt";
+    receipt.textContent = `审查时间：${formatTimestamp(run.review.time)}\n候选 SHA-256：${run.review.sha256}\n审查意见：${run.review.note || "未填写"}`;
+    elements.rsiDetail.append(receipt);
+  }
+  if (run.candidate_sha256) {
+    const candidateActions = document.createElement("div");
+    candidateActions.className = "button-row";
+    candidateActions.append(makeMiniButton(run.review ? "查看已归档候选（只读）" : "查看已验证候选", () => loadRsiCandidate(run), true));
+    elements.rsiDetail.append(candidateActions);
+    const entry = rsiCandidateViews.get(rsiCandidateKey(run.id, run.candidate_sha256));
+    if (entry?.candidate) elements.rsiDetail.append(makeRsiCandidateViewer(run, entry));
+  }
+}
+
+function renderRsiRuns() {
+  elements.rsiRunList.replaceChildren();
+  elements.rsiRunCount.textContent = `${rsiRuns.length} 项`;
+  if (!rsiRuns.length) {
+    const empty = document.createElement("p");
+    empty.className = "field-help";
+    empty.textContent = "尚无远程练习记录。";
+    elements.rsiRunList.append(empty);
+  }
+  rsiRuns.forEach((run) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `rsi-run${run.id === selectedRsiRunId ? " selected" : ""}`;
+    const title = document.createElement("strong");
+    title.textContent = rsiRunTitle(run);
+    const meta = document.createElement("span");
+    meta.textContent = `${formatTimestamp(run.created)} · ${run.spec?.max_model_calls ?? "?"} 次调用上限 · ${run.spec?.wall_seconds ?? "?"} 秒上限`;
+    item.append(title, meta);
+    item.addEventListener("click", () => selectRsiRun(run.id));
+    elements.rsiRunList.append(item);
+  });
+  renderRsiDetail(rsiRuns.find((run) => run.id === selectedRsiRunId));
+  rsiSetControls();
+}
+
+async function refreshRsiEvents() {
+  const run = rsiRuns.find((item) => item.id === selectedRsiRunId);
+  if (!run) return;
+  const runId = run.id;
+  const cursor = rsiEventCursor;
+  const payload = await request(`/api/rsi/events?run_id=${encodeURIComponent(runId)}&after=${cursor}`);
+  // A slow response for a previously selected run must never update the
+  // events, candidate viewer, or draft of the newly selected run.
+  if (selectedRsiRunId !== runId) return;
+  const received = payload.events || [];
+  received.forEach((event) => {
+    if (Number.isInteger(event.seq) && event.seq > rsiEventCursor) {
+      rsiEventCursor = event.seq;
+      rsiEvents.push(event);
+    }
+  });
+  rsiEvents = rsiEvents.slice(-300);
+  renderRsiDetail(run);
+}
+
+async function selectRsiRun(runId) {
+  selectedRsiRunId = runId;
+  rsiEventCursor = 0;
+  rsiEvents = [];
+  rsiRecovery = null;
+  rsiRecoveryRunId = null;
+  renderRsiRuns();
+  try {
+    const payload = await request(`/api/rsi/get?run_id=${encodeURIComponent(runId)}`);
+    if (selectedRsiRunId !== runId) return;
+    const index = rsiRuns.findIndex((run) => run.id === runId);
+    if (index >= 0 && payload.run) rsiRuns[index] = payload.run;
+    await refreshRsiEvents();
+    const current = rsiRuns.find((run) => run.id === runId);
+    if (current?.state === "needs_recovery") await refreshRsiRecovery(current);
+    renderRsiRuns();
+  } catch (error) {
+    rsiSetStatus(rsiHealth, `读取远程练习详情失败：${error.message}`);
+  }
+}
+
+async function refreshRsiRecovery(run) {
+  if (!run || run.id !== selectedRsiRunId || run.state !== "needs_recovery") return;
+  rsiRecoveryRunId = run.id;
+  rsiRecovery = null;
+  renderRsiDetail(run);
+  try {
+    const payload = await request(`/api/rsi/recovery?run_id=${encodeURIComponent(run.id)}`);
+    if (selectedRsiRunId === run.id) {
+      rsiRecovery = payload.recovery || null;
+      renderRsiDetail(rsiRuns.find((item) => item.id === run.id));
+    }
+  } catch (error) {
+    if (selectedRsiRunId === run.id) {
+      rsiRecovery = null;
+      rsiSetStatus(rsiHealth, `恢复检查失败：${error.message}`);
+      renderRsiDetail(rsiRuns.find((item) => item.id === run.id));
+    }
+  }
+}
+
+async function refreshRsi({poll = false} = {}) {
+  if (!poll) elements.rsiRefresh.disabled = true;
+  try {
+    // Health starts a remote admission probe and can be materially more
+    // expensive than reading the durable run ledger.  Background polling is
+    // deliberately observation-only: initial/manual refresh and every start
+    // or recovery still call this full check through `poll === false`.
+    const shouldRefreshHealth = !poll || !rsiHealth;
+    if (shouldRefreshHealth) {
+      rsiHealth = await request("/api/rsi/health");
+      rsiSetStatus(rsiHealth);
+      rsiPopulateOptions(rsiHealth);
+    }
+    if (rsiHealth.configured) {
+      const payload = await request("/api/rsi/runs?limit=50");
+      rsiRuns = payload.runs || [];
+      if (selectedRsiRunId && !rsiRuns.some((run) => run.id === selectedRsiRunId)) {
+        selectedRsiRunId = null;
+        rsiEvents = [];
+        rsiEventCursor = 0;
+        rsiRecovery = null;
+        rsiRecoveryRunId = null;
+      }
+      renderRsiRuns();
+      if (selectedRsiRunId) {
+        await refreshRsiEvents();
+        const selected = rsiRuns.find((run) => run.id === selectedRsiRunId);
+        if (selected?.state === "needs_recovery" && rsiRecoveryRunId !== selected.id) {
+          await refreshRsiRecovery(selected);
+        }
+      }
+    } else {
+      rsiRuns = [];
+      selectedRsiRunId = null;
+      renderRsiRuns();
+    }
+  } catch (error) {
+    rsiHealth = {
+      configured: rsiHealth?.configured === true,
+      ready: false,
+      connection_state: "unreachable",
+      checks: [], models: [], reasoning_efforts: [],
+      message: `远程 RSI 状态不可用：${error.message}`,
+    };
+    rsiSetStatus(rsiHealth);
+    rsiSetControls();
+  } finally {
+    elements.rsiRefresh.disabled = false;
+    clearTimeout(rsiPollTimer);
+    if (rsiRuns.some(rsiRunIsActive)) {
+      rsiPollTimer = setTimeout(() => refreshRsi({poll: true}), RSI_POLL_INTERVAL_MS);
+    }
+  }
+}
+
+async function startRsiPractice() {
+  if (rsiHealth?.ready !== true) return;
+  const instruction = elements.rsiInstruction.value.trim();
+  if (!instruction) return;
+  const confirmed = window.confirm(
+    `将在远程隔离虚拟机中启动一次有界自主练习。\n\n方向：${instruction}\n模型调用上限：${elements.rsiMaxCalls.value}\n最长时间：${elements.rsiWallSeconds.value} 秒\n\n不会操作本机桌面，也不会自动改写当前经验。确认开始？`,
+  );
+  if (!confirmed) return;
+  elements.rsiStart.disabled = true;
+  try {
+    const payload = await request("/api/rsi/start", {
+      method: "POST",
+      body: JSON.stringify({
+        instruction,
+        model: elements.rsiModel.value,
+        reasoning_effort: elements.rsiReasoningEffort.value,
+        max_model_calls: Number(elements.rsiMaxCalls.value),
+        wall_seconds: Number(elements.rsiWallSeconds.value),
+        project_budget: Number(elements.rsiProjectBudget.value),
+      }),
+    });
+    selectedRsiRunId = payload.run?.id || null;
+    rsiEvents = [];
+    rsiEventCursor = 0;
+    await refreshRsi();
+  } catch (error) {
+    rsiSetStatus(rsiHealth, `无法启动远程练习：${error.message}`);
+    rsiSetControls();
+  }
+}
+
+async function stopRsiPractice() {
+  const run = rsiRuns.find((item) => item.id === selectedRsiRunId);
+  if (!run || !rsiRunBlocksNewPractice(run) || run.stop_requested) return;
+  if (!window.confirm("请求停止此远程练习？请求会先持久化；远端虚拟机完成清理前不能视为已停止。")) return;
+  elements.rsiStop.disabled = true;
+  try {
+    await request("/api/rsi/stop", {method: "POST", body: JSON.stringify({run_id: run.id})});
+    await refreshRsi();
+  } catch (error) {
+    rsiSetStatus(rsiHealth, `无法请求停止：${error.message}`);
+    rsiSetControls();
+  }
+}
+
+async function recoverRsiPractice(run) {
+  if (!run || run.id !== selectedRsiRunId || rsiRecovery?.eligible !== true) return;
+  const confirmed = window.confirm(
+    "仅会从服务器已验证的完成项目边界恢复。\n\n未完成项目的操作和临时环境不会重放。模型调用和练习时间继续累计，不能重设。确认恢复？",
+  );
+  if (!confirmed) return;
+  try {
+    await request("/api/rsi/recover", {method: "POST", body: JSON.stringify({run_id: run.id})});
+    rsiRecovery = null;
+    rsiRecoveryRunId = null;
+    rsiEvents = [];
+    rsiEventCursor = 0;
+    await refreshRsi();
+  } catch (error) {
+    rsiSetStatus(rsiHealth, `无法恢复远程练习：${error.message}`);
+  }
+}
+
+async function loadRsiCandidate(run) {
+  const runId = run?.id;
+  const digest = run?.candidate_sha256;
+  const key = rsiCandidateKey(runId, digest);
+  if (!key || !rsiSelectedCandidateMatches(runId, digest, true)) return;
+  const existing = rsiCandidateViews.get(key);
+  if (existing?.candidate) {
+    renderRsiDetail(rsiRuns.find((item) => item.id === runId));
+    return;
+  }
+  const entry = existing || {runId, digest, candidate: null, draft: ""};
+  rsiCandidateViews.set(key, entry);
+  try {
+    const payload = await request(`/api/rsi/candidate?run_id=${encodeURIComponent(runId)}&digest=${encodeURIComponent(digest)}`);
+    if (!rsiSelectedCandidateMatches(runId, digest, true) || rsiCandidateViews.get(key) !== entry) return;
+    entry.candidate = payload.candidate || {};
+    renderRsiDetail(rsiRuns.find((item) => item.id === runId));
+  } catch (error) {
+    if (rsiSelectedCandidateMatches(runId, digest, true)) {
+      rsiSetStatus(rsiHealth, `读取候选经验失败：${error.message}`);
+    }
+  }
+}
+
+async function reviewRsiCandidate(runId, digest, decision) {
+  if (!rsiSelectedCandidateMatches(runId, digest)) return;
+  const entry = rsiCandidateViews.get(rsiCandidateKey(runId, digest));
+  if (!entry?.candidate) return;
+  const label = decision === "accepted" ? "接受" : "拒绝";
+  if (!window.confirm(`${label}该候选经验并写入不可变审查记录？这不会自动修改当前 Trace 或生效经验。`)) return;
+  try {
+    await request("/api/rsi/review", {
+      method: "POST",
+      body: JSON.stringify({run_id: runId, digest, decision, note: entry.draft}),
+    });
+    // A late review response cannot mutate a different selected run.  The
+    // subsequent list refresh supplies the immutable reviewed state, whose
+    // renderer intentionally does not include this editable viewer.
+    if (!rsiSelectedCandidateMatches(runId, digest)) return;
+    await refreshRsi();
+  } catch (error) {
+    if (rsiSelectedCandidateMatches(runId, digest)) {
+      rsiSetStatus(rsiHealth, `候选审查提交失败：${error.message}`);
+    }
+  }
+}
+
 function isBusy() {
   return ["queued", "running", "stopping", "awaiting_recording_start", "awaiting_narration"]
     .includes(elements.status.dataset.status);
 }
 
 function setBusy(busy) {
-  busy = busy || trainedPreviewBusy;
   const desktop = elements.executionScope.value === "desktop";
   elements.executionScope.disabled = busy;
-  elements.desktopWorkflowSettings.hidden = !desktop;
+  elements.operationScope.disabled = busy;
+  elements.desktopWorkflowSettings.hidden = !desktop || elements.operationScope.value === "selected_windows";
   elements.desktopOrchestration.disabled = busy;
   elements.desktopResume.disabled = busy || elements.desktopOrchestration.value !== "langgraph";
-  elements.planButton.disabled = busy || (!desktop && !taskpacks.length);
   const task = selectedTask();
-  elements.executeButton.disabled = busy || (desktop
+  elements.executeButton.disabled = busy || !backendMatchesScope() || (desktop
     ? elements.useExperience.checked && (!task?.confirmed || !task?.semantic_experience)
-    : task ? !canExecuteTask(task) || task.execution_scope === "desktop" : !canAutoExecute());
+    : task ? !canExecuteTask(task) || task.execution_scope === "desktop" : true);
   elements.taskpack.disabled = busy;
   elements.model.disabled = busy;
   [
@@ -2343,14 +3433,18 @@ function setBusy(busy) {
   elements.inputMode.disabled = busy || desktop;
   elements.adaptiveReasoning.disabled = busy || desktop || usesModelApi();
   elements.instruction.disabled = busy;
+  [elements.localSystemPrompt, elements.localTurnTemplate, elements.localPromptsSave,
+    elements.localPromptsReset, document.querySelector("#local-executor")].forEach((field) => {
+    field.disabled = busy;
+  });
   elements.useExperience.disabled = busy;
   if (usesTrainedModel()) {
-    elements.planButton.disabled = busy;
-    elements.executeButton.disabled = busy;
+    elements.executeButton.disabled = busy || !backendMatchesScope() || (elements.useExperience.checked
+      && (!task?.confirmed || !task?.semantic_experience));
     elements.executeButton.title = "本地模型主屏连续执行；F9 停止";
-    [elements.executionScope, elements.taskpack, elements.useExperience,
-      elements.desktopOrchestration, elements.desktopResume, elements.inputMode,
+    [elements.executionScope, elements.desktopOrchestration, elements.desktopResume, elements.inputMode,
       elements.adaptiveReasoning].forEach(el => { el.disabled = true; });
+    elements.taskpack.disabled = busy || elements.localModel.value === "trained_d";
   } else {
     elements.executeButton.title = "";
   }
@@ -2358,7 +3452,6 @@ function setBusy(busy) {
   elements.recordSource.disabled = busy;
   elements.waaRoot.disabled = busy;
   elements.waaExample.disabled = busy;
-  elements.recordWindow.disabled = busy;
   elements.recordName.disabled = busy;
   elements.recordModel.disabled = busy;
   elements.recordReasoningEffort.disabled = busy;
@@ -2366,9 +3459,7 @@ function setBusy(busy) {
   elements.recordDeferCompilation.disabled = busy;
   elements.compilerModel.disabled = busy;
   elements.compilerReasoningEffort.disabled = busy;
-  elements.refreshWindows.disabled = busy;
   elements.recordButton.disabled = busy
-    || (!usesWaaRecording() && elements.recordSource.value !== "desktop" && !selectedWindow())
     || (usesWaaRecording() && !selectedWaaTask());
   elements.refreshLibrary.disabled = busy;
   document.querySelectorAll(".mini-button").forEach((button) => {
@@ -2407,13 +3498,26 @@ function renderJob(job) {
       ? "编译"
       : job.kind === "revision"
         ? "经验修订"
-        : `${job.mode === "execute" ? "执行" : "预演"} · ${job.execution_scope === "desktop" ? "桌面" : "单窗口"}`;
+        : `${job.mode === "execute" ? "执行" : "预演"} · ${job.executor_backend === "cua" && job.cua_target?.kind !== "desktop" ? "指定窗口 / 应用" : job.execution_scope === "desktop" ? "全桌面" : "旧版单窗口"}`;
   elements.jobTask.textContent = job.task_id;
   elements.jobModel.textContent = job.provider === "api"
     ? `API · ${job.model || "—"}`
     : modelLabels[job.model] || job.model || "—";
   elements.jobEffort.textContent = effortLabels[job.reasoning_effort] || job.reasoning_effort || "—";
   elements.jobInstruction.textContent = job.instruction;
+  const rounds = job.model_io?.length ? job.model_io : job.result?.model_io;
+  const signature = `${job.job_id}:${(rounds || []).map(round =>
+    `${round.request_id}:${round.status}:${Boolean(round.input)}:${round.raw_output?.length || 0}:` +
+    `${round.execution?.status || ""}:${Boolean(round.execution?.normalized_plan)}:` +
+    `${round.execution?.executor_requests?.map(item => item.status).join(",") || ""}`
+  ).join("|")}`;
+  if (signature !== modelChatSignature) {
+    const nearBottom = elements.modelChat.scrollHeight - elements.modelChat.scrollTop - elements.modelChat.clientHeight < 80;
+    const oldScroll = elements.modelChat.scrollTop;
+    elements.modelChat.replaceChildren(makeModelChat(rounds));
+    elements.modelChat.scrollTop = nearBottom ? elements.modelChat.scrollHeight : oldScroll;
+    modelChatSignature = signature;
+  }
   document.querySelector("#job-latest-progress").textContent = job.logs?.at(-1) || "等待执行…";
   elements.narrationSubmit.textContent = job.defer_compilation
     ? "保存讲解和录制，稍后编译"
@@ -2448,6 +3552,7 @@ function renderJob(job) {
       const performanceTimeline = makePerformanceTimeline(
         job.result.performance,
         job.result.stage_timings || [],
+        job,
       );
       if (performanceTimeline) elements.jobPerformance.append(performanceTimeline);
     }
@@ -2574,54 +3679,21 @@ async function refreshState() {
   return state;
 }
 
-async function refreshWindows() {
-  clearRecordError();
-  elements.refreshWindows.disabled = true;
-  try {
-    const payload = await request("/api/windows");
-    localWindows = payload.windows || [];
-    elements.recordWindow.replaceChildren();
-    localWindows.forEach((windowInfo) => {
-      const option = document.createElement("option");
-      option.value = String(windowInfo.handle);
-      option.textContent = `${windowInfo.process_name} · ${windowInfo.title}`;
-      elements.recordWindow.append(option);
-    });
-    renderWindowMeta();
-  } catch (error) {
-    showRecordError(error.message);
-  } finally {
-    elements.refreshWindows.disabled = false;
-  }
-}
-
-function renderWindowMeta() {
-  const windowInfo = selectedWindow();
-  if (!windowInfo) {
-    elements.windowMeta.textContent = "没有找到可录制的可见窗口。";
-    elements.recordButton.disabled = elements.recordSource.value === "desktop" ? isBusy() : !usesWaaRecording() || !selectedWaaTask();
-    return;
-  }
-  elements.windowMeta.textContent = `${windowInfo.client_width} × ${windowInfo.client_height} · ${windowInfo.is_foreground ? "当前前台" : "录制时自动切换到前台"}`;
-  elements.recordButton.disabled = isBusy();
-}
-
 async function startRecording() {
   clearRecordError();
   if (dictationSession) {
     return showRecordError("请先结束语音输入并等待转写完成");
   }
   const waa = usesWaaRecording();
-  const windowInfo = selectedWindow();
   const taskId = elements.recordName.value.trim();
-  const desktop = elements.recordSource.value === "desktop";
-  if (!waa && !desktop && !windowInfo) return showRecordError("请选择一个本地目标窗口");
-  if (desktop && !window.confirm("将录制整个主显示器的画面和键鼠操作（可跨程序）。请关闭敏感窗口。F8 完成，F9 取消。继续？")) return;
+  const native = elements.recordSource.value === "opencua";
+  if (!waa && !native) return showRecordError("旧录制入口已停用，请选择 OpenCUA。");
+  if (native && !window.confirm("将录制整个主显示器的画面和键鼠操作（可跨程序）。请关闭敏感窗口。F8 完成，F9 取消。继续？")) return;
   if (!taskId) return showRecordError("请输入经验名称");
   if (waa && !elements.waaRoot.value.trim()) return showRecordError("请输入 WAA 根目录");
   if (waa && !selectedWaaTask()) return showRecordError("请选择一个 WAA 标准任务");
-  const narrated = elements.recordNarration.checked;
-  const deferCompilation = elements.recordDeferCompilation.checked;
+  const narrated = !native && elements.recordNarration.checked;
+  const deferCompilation = native || elements.recordDeferCompilation.checked;
   setBusy(true);
   try {
     if (!waa && narrated) await startNarrationCapture();
@@ -2636,8 +3708,8 @@ async function startRecording() {
         model: elements.recordModel.value,
         reasoning_effort: elements.recordReasoningEffort.value,
       } : {
-        handle: desktop ? 0 : windowInfo.handle,
-        execution_scope: desktop ? "desktop" : "window",
+        recording_backend: "opencua",
+        execution_scope: "desktop",
         task_id: taskId,
         narrated,
         defer_compilation: deferCompilation,
@@ -2791,7 +3863,7 @@ async function confirmTaskModelRevision(candidate) {
     return showError("当前任务图草稿仍有 Guidance 映射冲突，不能启用");
   }
   const confirmed = window.confirm(
-    `确认启用任务状态图 v${proposal.proposed_revision} 吗？\n\n只会替换派生的任务说明、状态图和结束条件；原始 Trace 与旧版本都会保留。`,
+    `确认启用任务状态图 v${proposal.proposed_revision} 吗？\n\n${proposal.guidance_review?.pending?.length || 0} 条关联语义变化的人工规则会暂停生效，等待人工复核；原始 Trace 与旧版本都会保留。`,
   );
   if (!confirmed) return;
   setBusy(true);
@@ -2905,51 +3977,6 @@ async function deleteLocalAsset(endpoint, payload) {
   }
 }
 
-let trainedPreviewBusy = false;
-
-async function previewTrainedModel() {
-  if (isBusy() || trainedPreviewBusy) return;
-  const task = elements.instruction.value.trim();
-  if (!task) return showError("请输入任务指令");
-  const status = document.querySelector("#trained-model-status");
-  const annotation = document.querySelector("#trained-model-annotation");
-  const output = document.querySelector("#trained-model-result");
-  trainedPreviewBusy = true;
-  setBusy(true);
-  annotation.hidden = true;
-  output.textContent = "";
-  status.textContent = "正在连接本地模型；加载完成后延时 3 秒截图。请切换到目标画面。未执行任何操作。";
-  try {
-    const body = {task, model: elements.localModel.value === "trained_d" ? "D-5970" : elements.localModel.value};
-    const file = document.querySelector("#trained-model-image").files[0];
-    if (file) {
-      if (file.size > 14 * 1024 * 1024) throw Error("请选择小于 14 MB 的图片");
-      body.image = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result.split(",")[1]);
-        reader.onerror = () => reject(Error("读取图片失败"));
-        reader.readAsDataURL(file);
-      });
-      status.textContent = "正在加载模型并预测所选图片；未执行操作。";
-    }
-    const value = await request("/api/trained-model/predict", {method: "POST", body: JSON.stringify(body)});
-    if (value.annotated_image) {
-      annotation.src = value.annotated_image;
-      annotation.hidden = false;
-      delete value.annotated_image;
-    }
-    output.textContent = JSON.stringify(value, null, 2);
-    status.textContent = value.status === "predicted"
-      ? "预测完成，未执行操作。下方显示动作、耗时、峰值显存和本地日志目录。"
-      : "预测失败，未执行操作。请查看下方错误信息。";
-  } catch (error) {
-    status.textContent = `预测失败：${error.message}（未执行操作）`;
-  } finally {
-    trainedPreviewBusy = false;
-    setBusy(isBusy());
-  }
-}
-
 let cuaCatalogEntries = [];
 
 function cuaTargetKey(target) {
@@ -2971,6 +3998,11 @@ function cuaTargetConfig(entries, selectedKeys, initialKey) {
     targets: selected.map((entry) => entry.target),
     initial_index: initialIndex >= 0 ? initialIndex : 0,
   };
+}
+
+function cuaCatalogMatches(entry, query) {
+  const needle = query.trim().toLocaleLowerCase();
+  return !needle || `${entry.label} ${entry.target.launch_path || ""}`.toLocaleLowerCase().includes(needle);
 }
 
 function selectedCuaKeys() {
@@ -2997,6 +4029,23 @@ function syncCuaInitialTarget(preferredKey = document.querySelector("#cua-target
   select.value = selected.some((entry) => entry.key === preferredKey) ? preferredKey : selected[0].key;
 }
 
+function filterCuaCatalog() {
+  const query = document.querySelector("#cua-target-search").value;
+  const entries = new Map(cuaCatalogEntries.map((entry) => [entry.key, entry]));
+  let visible = 0;
+  for (const row of document.querySelectorAll("#cua-target-list .cua-target-choice")) {
+    const checked = row.querySelector("input[type=checkbox]").checked;
+    const entry = entries.get(row.dataset.key);
+    row.hidden = !checked && (!entry || !cuaCatalogMatches(entry, query));
+    if (!row.hidden) visible += 1;
+  }
+  const selected = selectedCuaKeys().size;
+  const status = document.querySelector("#cua-target-search-status");
+  status.textContent = query.trim()
+    ? `${visible ? `显示 ${visible} / ${cuaCatalogEntries.length} 项` : "没有匹配项"}；已选 ${selected} 项（已选目标始终显示）。`
+    : `${cuaCatalogEntries.length} 项；已选 ${selected} 项。搜索只筛选列表，不改变授权。`;
+}
+
 function renderCuaCatalog(catalog) {
   const previousKeys = selectedCuaKeys();
   const previousInitial = document.querySelector("#cua-target").value;
@@ -3020,16 +4069,21 @@ function renderCuaCatalog(catalog) {
   if (!entries.length) {
     list.textContent = "未发现可授权的窗口或可启动应用。";
     syncCuaInitialTarget("");
+    filterCuaCatalog();
     return;
   }
   for (const entry of cuaCatalogEntries) {
     const label = document.createElement("label");
     label.className = "cua-target-choice";
+    label.dataset.key = entry.key;
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.value = entry.key;
     checkbox.checked = previousKeys.has(entry.key);
-    checkbox.addEventListener("change", () => syncCuaInitialTarget());
+    checkbox.addEventListener("change", () => {
+      syncCuaInitialTarget();
+      filterCuaCatalog();
+    });
     const text = document.createElement("span");
     text.textContent = entry.label;
     label.append(checkbox, text);
@@ -3038,6 +4092,7 @@ function renderCuaCatalog(catalog) {
   // A refresh retains only the same explicit identities. Newly discovered items
   // are never selected implicitly.
   syncCuaInitialTarget(previousInitial);
+  filterCuaCatalog();
 }
 
 function cuaTargetSelection() {
@@ -3045,9 +4100,16 @@ function cuaTargetSelection() {
   return {...config, labels: selectedCuaEntries().map((entry) => entry.label)};
 }
 
-document.querySelector("#local-executor").addEventListener("change", (event) => {
-  document.querySelector("#cua-target-settings").hidden = event.target.value !== "cua";
+elements.operationScope.addEventListener("change", () => {
+  syncProviderFields();
+  renderTaskMeta();
+  setBusy(isBusy());
 });
+document.querySelector("#local-executor").addEventListener("change", () => {
+  syncProviderFields();
+  renderTaskMeta();
+});
+document.querySelector("#cua-target-search").addEventListener("input", filterCuaCatalog);
 document.querySelector("#cua-refresh").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   button.disabled = true;
@@ -3061,34 +4123,46 @@ document.querySelector("#cua-refresh").addEventListener("click", async (event) =
 
 async function startJob(mode) {
   clearError();
+  if (!backendMatchesScope()) {
+    return showError(elements.operationScope.value === "selected_windows"
+      ? "指定窗口 / 应用目前只支持 Cua 后端，请在模型旁切换执行后端。"
+      : "全桌面目前只支持 Win32 后端，请在模型旁切换执行后端。");
+  }
   if (usesTrainedModel()) {
-    const executorBackend = document.querySelector("#local-executor").value;
-    const cuaSelection = executorBackend === "cua" ? cuaTargetSelection() : null;
-    if (executorBackend === "cua" && !cuaSelection.targets.length) return showError("请刷新并勾选至少一个 Cua 目标窗口或应用");
-    if (executorBackend === "cua" && cuaSelection.targets.length > 12) return showError("每次最多授权 12 个目标，请取消勾选无关项目");
-    if (mode !== "execute") {
-      if (executorBackend === "cua") return showError("Cua 窗口截图预览尚未开放。请用临时文档开始实验执行；Win32 的预览仍使用主屏截图。");
-      return previewTrainedModel();
+    if (promptDirty) return showError("提示词有未保存修改；请先保存或恢复默认后再开始任务");
+    if (editableLocalPromptKey() && (!promptLoaded || promptProfileKey !== editableLocalPromptKey())) {
+      return showError("本地模型提示词尚未加载完成，请稍候");
     }
+    const guidedTask = elements.useExperience.checked ? selectedTask() : null;
+    if (elements.useExperience.checked && (!guidedTask?.confirmed || !guidedTask?.semantic_experience)) {
+      return showError("请先选择已确认、已语义编译的经验");
+    }
+    const executorBackend = document.querySelector("#local-executor").value;
+    const cuaSelection = executorBackend === "cua" && elements.operationScope.value === "selected_windows" ? cuaTargetSelection() : null;
+    if (cuaSelection && !cuaSelection.targets.length) return showError("请刷新并勾选至少一个 Cua 目标窗口或应用");
+    if (cuaSelection && cuaSelection.targets.length > 12) return showError("每次最多授权 12 个目标，请取消勾选无关项目");
     const instruction = elements.instruction.value.trim();
     if (!instruction) return showError("请输入任务指令");
-    if (document.querySelector("#trained-model-image").files.length) return showError("真实执行请先清除所选图片，必须使用实时主屏截图");
     const continuous = true;
-    const scopeNotice = executorBackend === "cua"
-      ? `Cua 后台实验：仅授权 ${cuaSelection.labels.join("；")}。窗口授权精确到该窗口；启动项允许请求启动该应用（可能激活窗口），然后重新定位窗口。不自动转前台输入。停止需等待驱动调用返回。`
+    const scopeNotice = cuaSelection
+      ? `仅授权 ${cuaSelection.labels.join("；")}。后台优先；明确拒绝时会短暂切前台重试同一动作，此后该窗口改走前台，并尝试恢复原焦点。启动项允许请求启动该应用并重新定位窗口。停止需等待驱动调用返回。`
       : "将操作主屏桌面，连续执行。";
-    if (!window.confirm(`${elements.localModel.selectedOptions[0].textContent} ${scopeNotice} 最多 40 个动作，F9 停止。\n请先使用临时记事本测试。\n\n${instruction}`)) return;
+    if (!window.confirm(`${elements.localModel.selectedOptions[0].textContent} ${scopeNotice} ${guidedTask ? `指导经验：${guidedTask.task_id}。` : "无经验 Baseline。"} 最多 40 个动作，F9 停止。\n请先使用临时记事本测试。\n\n${instruction}`)) return;
     setBusy(true);
     try {
       const job = await request("/api/jobs", {method: "POST", body: JSON.stringify({
         provider: "trained_d", model: elements.localModel.value === "trained_d" ? "D-5970" : elements.localModel.value, mode: "execute", instruction, executor_backend: executorBackend,
-        execution_scope: "desktop", use_experience: false, orchestration: "legacy", continuous,
-        cua_target: executorBackend === "cua" ? {targets: cuaSelection.targets, initial_index: cuaSelection.initial_index} : null,
+        execution_scope: "desktop", use_experience: Boolean(guidedTask), task_path: guidedTask?.path || "", orchestration: "legacy", continuous,
+        cua_target: cuaJobTarget(cuaSelection),
       })});
       renderJob(job);
       pollTimer = setTimeout(pollJob, 250);
     } catch (error) { setBusy(false); showError(error.message); }
     return;
+  }
+  if (chatPromptDirty) return showError("执行提示词有未保存修改；请先保存或恢复默认");
+  if (editableChatPromptProvider() !== chatPromptProviderLoaded) {
+    return showError("执行提示词尚未加载完成，请稍候");
   }
   if (dictationSession) return showError("请先结束语音输入并等待转写完成");
   const desktop = elements.executionScope.value === "desktop";
@@ -3096,12 +4170,24 @@ async function startJob(mode) {
   if (desktop && elements.useExperience.checked && (!task || !task.semantic_experience)) {
     return showError("请手动选择已语义编译的经验，或关闭“使用经验”运行 Baseline。");
   }
+  if (!desktop && elements.useExperience.checked && !task) {
+    return showError("请手动选择任务经验；不再自动匹配。");
+  }
   if (!desktop && !elements.useExperience.checked && !task) {
     return showError("不使用经验时，请先手动选择任务以确定目标窗口和允许的操作。");
   }
   const instruction = elements.instruction.value.trim();
   const local = elements.modelProvider.value === "local";
   const provider = usesModelApi() ? "api" : "codex";
+  const executorBackend = document.querySelector("#local-executor").value;
+  const cuaSelection = executorBackend === "cua" && elements.operationScope.value === "selected_windows" ? cuaTargetSelection() : null;
+  if (executorBackend === "cua" && (!desktop || elements.desktopOrchestration.value !== "legacy"
+      || mode !== "execute")) {
+    return showError("指定窗口 / 应用当前仅支持独立任务执行；请关闭任务恢复后重试");
+  }
+  if (cuaSelection && (!cuaSelection.targets.length || cuaSelection.targets.length > 12)) {
+    return showError("请勾选 1–12 个 Cua 目标窗口或应用");
+  }
   if (usesModelApi() && !modelApiAvailable) {
     return showError("页面已更新，但后台仍是旧版本。请停止并重启本地 trace2task web，再刷新页面后使用模型 API。");
   }
@@ -3129,25 +4215,11 @@ async function startJob(mode) {
     return showError("请填写 API 地址，并将超时设为 1 到 600 秒");
   }
   if (desktop && mode === "execute" && !window.confirm(
-    `将控制整个主显示器（可跨程序），${elements.useExperience.checked ? `使用经验：${task.task_id}` : "不使用任何经验"}。主屏可见内容会发送给 ${model}。\n\n${instruction}\n\n请先关闭敏感内容，运行时不要操作鼠标键盘。F9 停止。确认继续？`
+    `${cuaSelection ? `仅操作已选窗口 / 应用：${cuaSelection.labels.join("；")}。优先后台，明确拒绝后该窗口改走前台` : "将控制整个主显示器（可跨程序，并占用键鼠）"}，${elements.useExperience.checked ? `使用经验：${task.task_id}` : "不使用任何经验"}。目标画面会发送给 ${model}。\n\n${instruction}\n\n请先关闭敏感内容；窗口切前台期间请勿同时操作键鼠。F9 停止。确认继续？`
   )) return;
   if (!desktop && mode === "execute") {
-    let executionTask = task;
-    let routeSummary = "手动选择经验";
-    if (!executionTask) {
-      try {
-        const route = await request("/api/experience-route", {
-          method: "POST",
-          body: JSON.stringify({ instruction }),
-        });
-        executionTask = route.task;
-        routeSummary = `自动选择“${route.task_id}”（置信度 ${Math.round(route.confidence * 100)}%）`;
-      } catch (error) {
-        return showError(error.message);
-      }
-    }
     const confirmed = window.confirm(
-      `${routeSummary}\n即将用 ${modelLabels[model] || model} / ${effortLabels[reasoningEffort] || reasoningEffort}，以${inputMode === "background" ? "后台" : "前台"}模式控制 ${executionTask.process_name || "目标窗口"} 并执行：\n\n${instruction}\n\n${inputMode === "background" ? "目标必须保持可见且不能最小化；不兼容后台消息或后台截图的应用会安全失败。\n\n" : ""}运行期间可按 F9 紧急停止。确认继续吗？`,
+      `手动选择经验：${task.task_id}\n即将用 ${modelLabels[model] || model} / ${effortLabels[reasoningEffort] || reasoningEffort}，以${inputMode === "background" ? "后台" : "前台"}模式控制 ${task.process_name || "目标窗口"} 并执行：\n\n${instruction}\n\n${inputMode === "background" ? "目标必须保持可见且不能最小化；不兼容后台消息或后台截图的应用会安全失败。\n\n" : ""}运行期间可按 F9 紧急停止。确认继续吗？`,
     );
     if (!confirmed) return;
   }
@@ -3161,6 +4233,8 @@ async function startJob(mode) {
         mode,
         model,
         provider,
+        executor_backend: executorBackend,
+        cua_target: cuaJobTarget(cuaSelection),
         api: apiOptions,
         reasoning_effort: reasoningEffort,
         input_mode: inputMode,
@@ -3228,6 +4302,7 @@ async function initialize() {
 
 elements.taskpack.addEventListener("change", () => {
   renderTaskMeta();
+  syncProviderFields();
   setBusy(isBusy());
 });
 let windowScopeOptions = null;
@@ -3246,6 +4321,7 @@ async function refreshDesktopCheckpoints() {
   } catch (error) { showError(error.message); }
 }
 elements.desktopOrchestration.addEventListener("change", () => {
+  syncProviderFields();
   setBusy(isBusy());
   refreshDesktopCheckpoints();
 });
@@ -3280,20 +4356,38 @@ elements.executionScope.addEventListener("change", () => {
   }
   populateTaskpacks(taskpacks);
   renderInputModeHelp();
+  syncProviderFields();
   setBusy(isBusy());
 });
 elements.inputMode.addEventListener("change", renderInputModeHelp);
 elements.instruction.addEventListener("input", () => {
   elements.charCount.textContent = `${elements.instruction.value.length} / 2000`;
 });
-elements.planButton.addEventListener("click", () => startJob("plan"));
 elements.modelProvider.addEventListener("change", syncProviderFields);
 elements.localModel.addEventListener("change", syncProviderFields);
+for (const field of [elements.localSystemPrompt, elements.localTurnTemplate]) {
+  field.addEventListener("input", () => {
+    promptDirty = true;
+    elements.localPromptsStatus.textContent = "有未保存的修改；保存后用于下一次任务。";
+  });
+}
+elements.localPromptsSave.addEventListener("click", () => saveLocalPrompts());
+elements.localPromptsReset.addEventListener("click", () => saveLocalPrompts(true));
+elements.chatPromptGuidance.addEventListener("input", () => {
+  chatPromptDirty = true;
+  elements.chatPromptsStatus.textContent = "有未保存的修改；保存后用于下一次任务。";
+});
+elements.chatPromptsSave.addEventListener("click", () => saveChatPrompts());
+elements.chatPromptsReset.addEventListener("click", () => saveChatPrompts(true));
 elements.apiBaseUrl.addEventListener("input", renderAPISettingsStatus);
 elements.apiSaveSettings.addEventListener("click", saveAPISettings);
 elements.apiClearSettings.addEventListener("click", clearAPISettings);
 elements.executeButton.addEventListener("click", () => startJob("execute"));
 elements.stopButton.addEventListener("click", stopJob);
+elements.rsiInstruction.addEventListener("input", rsiSetControls);
+elements.rsiStart.addEventListener("click", startRsiPractice);
+elements.rsiStop.addEventListener("click", stopRsiPractice);
+elements.rsiRefresh.addEventListener("click", () => refreshRsi());
 elements.taskDetailBack.addEventListener("click", () => {
   closeTaskDetail();
   switchView("library");
@@ -3302,7 +4396,6 @@ window.addEventListener("hashchange", renderTaskDetailRoute);
 elements.viewTabs.forEach((button) => {
   button.addEventListener("click", () => switchView(button.dataset.view));
 });
-elements.recordWindow.addEventListener("change", renderWindowMeta);
 elements.recordSource.addEventListener("change", () => {
   renderRecordingSource();
   if (usesWaaRecording()) refreshWaaTasks();
@@ -3324,7 +4417,6 @@ elements.compilerModel.addEventListener("change", () => {
 elements.compilerReasoningEffort.addEventListener("change", () => {
   syncCompilerSettings(elements.compilerModel.value, elements.compilerReasoningEffort.value);
 });
-elements.refreshWindows.addEventListener("click", refreshWindows);
 elements.recordButton.addEventListener("click", startRecording);
 elements.recordStopButton.addEventListener("click", stopJob);
 elements.narrationSubmit.addEventListener("click", submitNarration);
@@ -3353,12 +4445,15 @@ function arrangeExecutionLayout() {
     grid.append(group);
     return group;
   };
-  field("execution-scope");
+  field("operation-scope");
   field("taskpack");
   field("model-provider");
   const models = document.createElement("div");
   models.className = "task-primary-field";
   grid.append(models);
+  const backendSettings = document.querySelector("#execution-backend-settings");
+  backendSettings.classList.add("task-primary-field");
+  grid.append(backendSettings);
 
   const advanced = document.createElement("details");
   advanced.id = "execution-advanced";
@@ -3385,20 +4480,9 @@ function arrangeExecutionLayout() {
     panel.querySelector(".execution-options"), elements.inputModeHelp);
   const trainedAdvanced = section("trained-advanced");
   const trained = document.querySelector("#trained-model-settings");
-  trainedAdvanced.append(trained.querySelector('label[for="trained-model-image"]'),
-    document.querySelector("#trained-model-image"));
   trained.querySelectorAll("p.field-help").forEach(p => trainedAdvanced.append(p));
-  const output = document.createElement("div");
-  output.id = "trained-output";
-  output.className = "trained-output";
-  output.append(document.querySelector("#trained-model-status"), document.querySelector("#trained-model-annotation"),
-    document.querySelector("#trained-batch"));
-  const raw = document.createElement("details");
-  const rawLabel = document.createElement("summary");
-  rawLabel.textContent = "查看模型原始输出";
-  raw.append(rawLabel, document.querySelector("#trained-model-result"));
-  output.append(raw);
-  document.querySelector(".activity-card .card-heading").after(output);
+  trainedAdvanced.append(elements.localPromptSettings);
+  advanced.append(elements.chatPromptSettings);
   const logDetails = document.createElement("details");
   logDetails.className = "runtime-log-details";
   const logSummary = document.createElement("summary");

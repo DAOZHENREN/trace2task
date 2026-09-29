@@ -32,10 +32,26 @@
           <div class="version" id="version">v—</div>
         </section>
 
+        <details class="card" id="components-panel">
+          <summary>本地组件管理 · 无需自行安装 Python</summary>
+          <p>API 模式无需 GPU 组件。本地公开模型需 NVIDIA 驱动；环境和权重下载可能占用十余 GB。首次安装需要联网，截图不会上传。旧模型和数据不会删除。</p>
+          <label for="component-directory">新运行环境存储目录（可填 D 盘专用文件夹）</label>
+          <input id="component-directory" type="text" placeholder="正在读取默认目录">
+          <button id="component-runtime" type="button">安装 GPU 运行环境</button>
+          <select id="component-model"><option value="qwen3-vl-2b">Qwen3-VL-2B</option><option value="gui-owl-2b">GUI-Owl-2B</option><option value="mai-ui-2b">MAI-UI-2B</option></select>
+          <button id="component-download" type="button">下载选定模型</button>
+          <button id="component-cancel" type="button">取消安装 / 下载</button>
+          <p>私有 D-5970 模型不从网络下载：选择原模型包目录，校验后登记使用，不复制或删除原文件。</p>
+          <input id="component-d-bundle" type="text" placeholder="例如 D:/Models/Trace2Task-D-5970">
+          <button id="component-import-d" type="button">导入已有 D 模型包</button>
+          <p id="component-status" role="status" aria-live="polite"></p>
+          <pre id="component-log" style="max-height:240px;overflow:auto;white-space:pre-wrap"></pre>
+        </details>
         <nav class="view-tabs" aria-label="控制台功能">
           <button class="view-tab active" data-view="execute" type="button">执行任务</button>
           <button class="view-tab" data-view="record" type="button">录制经验</button>
           <button class="view-tab" data-view="library" type="button">本地经验</button>
+          <button class="view-tab" data-view="rsi" type="button">远程 RSI 练习</button>
         </nav>
 
         <div class="workspace">
@@ -48,13 +64,14 @@
               <span class="step">01</span>
             </div>
 
-            <label class="field-label" for="execution-scope">执行范围</label>
+            <label class="field-label" for="operation-scope">操作范围</label>
             <div class="select-wrap">
-              <select id="execution-scope">
-                <option value="window">单窗口</option>
-                <option value="desktop">整个桌面 · 主显示器</option>
+              <select id="operation-scope">
+                <option value="desktop">全桌面 · 可跨应用（占用键鼠）</option>
+                <option value="selected_windows">指定窗口 / 应用 · 后台优先</option>
               </select>
             </div>
+            <select id="execution-scope" hidden aria-hidden="true"><option value="desktop" selected>desktop</option></select>
             <div id="desktop-workflow-settings" hidden>
               <label class="field-label" for="desktop-orchestration">桌面任务管理</label>
               <div class="select-wrap"><select id="desktop-orchestration">
@@ -85,9 +102,8 @@
                 <label class="field-label" for="model">执行 Agent 模型</label>
                 <div class="select-wrap">
                   <select id="model">
-                    <option value="gpt-5.6-terra" selected>Terra · 平衡</option>
-                    <option value="gpt-5.6-sol">Sol · 最强</option>
-                    <option value="gpt-5.6-luna">Luna · 更快</option>
+                    <option value="gpt-6-sol" selected>GPT-6 Sol</option>
+                    <option value="gpt-6-luna">GPT-6 Luna</option>
                   </select>
                 </div>
               </div>
@@ -121,31 +137,31 @@
               </div>
               <p id="local-service-status" role="status" aria-live="polite"></p>
               <p class="field-help">启动会先清理旧本地模型服务，再加载所选模型。关闭会清理本项目的 Qwen、D 和 GUI 模型残留服务，释放显存；不会删除模型。任务运行期间不可操作。</p>
-              <p class="field-help">推荐启动配置：16K 上下文、Q8 KV 缓存、严格 JSON 输出。实际容量由本地服务启动参数决定；首次建议点击“只生成计划”，长经验仍可能超限。</p>
+              <p class="field-help">推荐启动配置：16K 上下文、Q8 KV 缓存、严格 JSON 输出。实际容量由本地服务启动参数决定；长经验仍可能超限。</p>
             </div>
-            <div id="trained-model-settings" class="hidden">
+            <div id="execution-backend-settings">
               <label class="field-label" for="local-executor">执行后端</label>
               <select id="local-executor">
-                <option value="win32">Win32 · 现有桌面执行</option>
-                <option value="cua">Cua Driver · 实验性后台窗口执行</option>
+                <option value="win32">Win32 · 前台输入（占用键鼠）</option>
+                <option value="cua">Cua · 窗口后台优先</option>
               </select>
-              <div id="cua-target-settings" hidden>
-                <p>Qwen 2B 可在本次明确授权的目标之间路由、滚动和拖动。D / GUI-Owl / MAI 仍受各自输出协议限制，不具备自动跨应用规划。独立按下/松开尚不支持。</p>
-                <button id="cua-refresh" type="button">刷新窗口 / 应用</button>
-                <p class="cua-target-help">勾选本次允许操作的窗口或允许启动的应用（最多 12 项）。窗口授权精确到该窗口，不会因为同一进程而授权其他窗口；启动应用后会重新定位窗口。模型只收到选中范围，执行器拒绝越界。</p>
-                <div id="cua-target-list" class="cua-target-list" aria-live="polite">请先刷新窗口 / 应用。</div>
-                <label for="cua-target">初始目标</label>
-                <select id="cua-target" disabled><option value="">请先勾选一个目标</option></select>
-              </div>
-              <p class="field-help">Cua：直接绑定所选窗口或启动所选应用，无需倒计时切换。后台点击、文本、按键和拖动取决于应用支持；不可用时停止，不自动抢焦点。每次动作后重新观察。F9 / 停止需等待当前驱动调用返回（最长约 20 秒）。</p>
+              <p class="field-help" id="execution-backend-help"></p>
+            </div>
+            <div id="cua-target-settings" hidden>
+              <button id="cua-refresh" type="button">刷新窗口 / 应用</button>
+              <p class="cua-target-help">勾选本次允许操作的窗口或应用（最多 12 项），并指定初始目标。“目标任务 / 经验”只提供参考，不授予窗口权限。优先后台；若驱动明确拒绝，该窗口改走前台输入，并在每次动作后尝试恢复原焦点。</p>
+              <label class="field-label" for="cua-target-search">搜索窗口 / 应用</label>
+              <input class="text-input" id="cua-target-search" type="search" placeholder="输入窗口标题或程序名" autocomplete="off" aria-controls="cua-target-list">
+              <p class="field-help" id="cua-target-search-status" role="status" aria-live="polite">搜索只筛选列表，不改变已授权目标。</p>
+              <div id="cua-target-list" class="cua-target-list" aria-live="polite">请先刷新窗口 / 应用。</div>
+              <label for="cua-target">初始执行目标</label>
+              <select id="cua-target" disabled><option value="">请先勾选一个目标</option></select>
+            </div>
+            <div id="trained-model-settings" class="hidden">
+              <p class="field-help">Qwen 2B 可在选定目标之间规划窗口切换；D / GUI-Owl / MAI 仍受各自输出协议限制。独立按下/松开尚不支持。</p>
+              <p class="field-help">指定窗口：只操作本次选定目标，后台优先；明确拒绝后台输入时，对同一动作切前台重试一次，此后该窗口改走前台。控件树不完整时，未指定坐标的文本会尝试输入当前焦点控件，效果需重新截图确认。F9 / 停止需等待当前驱动调用返回（最长约 20 秒）。</p>
               <p class="field-help">常驻本机模型。主屏任务原文 + 截图 + 最近四步真实执行历史；不注入经验或 LangGraph。连续执行，无需逐批确认，F9 / 程序停止，最多 40 个动作。done 仅为模型停止声明。三个 2B 基线共用 8768 服务，切换时换载；请先停止空闲的 D 或 Qwen 8B 服务以释放显存。MAI 为手机协议的桌面实验适配，不支持的动作会明确停止。</p>
               <p>连续执行 · 无需逐批确认 · F9 / 停止按钮中止</p>
-              <label class="field-label" for="trained-model-image">可选：使用图片代替主屏截图</label>
-              <input id="trained-model-image" type="file" accept="image/png,image/jpeg,image/webp">
-              <p class="field-help">未选择图片时，点击“只生成计划”后 3 秒截取主屏，请切换到目标画面。首次加载可能需要数十秒。</p>
-              <p id="trained-model-status" role="status"></p>
-              <img id="trained-model-annotation" alt="预测动作位置" style="max-width:100%" hidden>
-              <pre id="trained-model-result" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
               <div id="trained-batch" hidden>
                 <p>本批动作待确认。确认后请在 3 秒内切回截图中的目标窗口。</p>
                 <img id="trained-batch-image" alt="待确认动作" style="max-width:100%">
@@ -208,7 +224,7 @@
             <div class="agent-settings-help">只影响每次任务的规划与执行；不会改变已经编译的经验。</div>
 
             <div class="execution-options">
-              <div id="input-mode-field">
+              <div id="input-mode-field" hidden>
                 <label class="field-label" for="input-mode">输入模式</label>
                 <div class="select-wrap">
                   <select id="input-mode">
@@ -238,10 +254,6 @@
             <div class="form-error hidden" id="form-error" role="alert"></div>
 
             <div class="actions">
-              <button class="button secondary" id="plan-button" type="button">
-                <span class="button-icon">◎</span>
-                只生成计划
-              </button>
               <button class="button primary" id="execute-button" type="button">
                 <span class="button-icon">▶</span>
                 开始执行
@@ -269,22 +281,12 @@
             <label class="field-label" for="record-source">录制环境</label>
             <div class="select-wrap">
               <select id="record-source">
-                <option value="local">本机窗口</option>
-                <option value="desktop">本机桌面 · 主显示器跨程序录制</option>
-                <option value="waa">Windows Agent Arena 虚拟机</option>
+                <option value="opencua">本机录制 · OpenCUA（暂仅归档）</option>
+                <option value="waa">实验环境 · WAA Windows 虚拟机</option>
               </select>
             </div>
 
-            <div id="local-recording-fields">
-              <div class="field-row">
-                <label class="field-label" for="record-window">本地目标窗口</label>
-                <button class="text-button" id="refresh-windows" type="button">刷新窗口</button>
-              </div>
-              <div class="select-wrap">
-                <select id="record-window"></select>
-              </div>
-              <div class="task-meta" id="window-meta">选择要录制的应用窗口。</div>
-            </div>
+            <div class="task-meta">本机录制直接采集主屏幕、键鼠和控件信息，无需选择窗口，可跨应用操作。WAA 仅用于虚拟机中的标准任务实验，与本机录制无关。</div>
 
             <div class="hidden" id="waa-recording-fields">
               <label class="field-label instruction-label" for="waa-root">WAA 根目录</label>
@@ -394,7 +396,7 @@
             <details class="compiler-settings-panel compact-settings-panel">
               <summary>
                 <span>经验模型设置（教师 / 教练）</span>
-                <small id="experience-model-summary">Sol · 最强 / High · 深入</small>
+                <small id="experience-model-summary">GPT-6 Sol / High · 深入</small>
               </summary>
               <div class="compiler-settings-copy">
                 <p>同一套模型同时用于 Trace 编译、人工反馈融合和任务状态图修订；执行模型仍在“执行任务”页单独选择。</p>
@@ -434,6 +436,54 @@
             <div class="library-list compact" id="recording-list"></div>
           </section>
 
+          <section class="card rsi-card view-panel hidden" id="rsi-panel">
+            <div class="card-heading">
+              <div>
+                <p class="section-kicker">REMOTE PRACTICE</p>
+                <h2>远程 RSI 练习</h2>
+              </div>
+              <span class="status-pill idle" id="rsi-status">检查部署</span>
+            </div>
+            <p class="field-help" id="rsi-message" role="status" aria-live="polite">
+              此页只调度已配置的远程隔离虚拟机。服务器地址、SSH 命令和 Codex 登录不会发送到浏览器。
+            </p>
+            <div class="rsi-checks hidden" id="rsi-checks" aria-live="polite"></div>
+            <p class="field-help rsi-new-practice-help">以下方向、模型与预算仅用于新建隔离练习；选中下方历史运行后，请在“调用与清理账本”查看其实际累计消耗。默认预算覆盖虚拟机初始化、项目执行与回滚；30 分钟是最长上限，不是固定等待时间。</p>
+            <div class="rsi-start-grid">
+              <div class="rsi-direction-field">
+                <label class="field-label" for="rsi-instruction">练习方向</label>
+                <textarea id="rsi-instruction" maxlength="4000" rows="5"
+                  placeholder="例如：学习在文本编辑器中可靠地保存带标题的文档，并由独立 Verifier 检查结果。"></textarea>
+                <p class="field-help">这是有界的远程练习方向，不会执行本机桌面任务，也不会自动改写当前经验。</p>
+              </div>
+              <div class="rsi-budget-fields">
+                <label class="field-label" for="rsi-model">订阅模型</label>
+                <div class="select-wrap"><select id="rsi-model" disabled><option value="gpt-6-astra">gpt-6-astra</option></select></div>
+                <label class="field-label" for="rsi-reasoning-effort">思考强度</label>
+                <div class="select-wrap"><select id="rsi-reasoning-effort" disabled><option value="low">Low</option></select></div>
+                <label class="field-label" for="rsi-max-calls">最多模型调用</label>
+                <input id="rsi-max-calls" type="number" min="1" max="50" value="25" disabled>
+                <label class="field-label" for="rsi-wall-seconds">最长练习时间（秒）</label>
+                <input id="rsi-wall-seconds" type="number" min="1" max="3600" value="1800" disabled>
+                <label class="field-label" for="rsi-project-budget">最多项目轮次</label>
+                <input id="rsi-project-budget" type="number" min="1" max="10" value="1" disabled>
+              </div>
+            </div>
+            <div class="actions rsi-actions">
+              <button class="button primary" id="rsi-start" type="button" disabled>开始隔离练习</button>
+              <button class="button secondary" id="rsi-refresh" type="button">刷新状态</button>
+              <button class="button danger" id="rsi-stop" type="button" disabled>请求停止</button>
+            </div>
+            <p class="field-help rsi-stop-help">“请求停止”仅表示已写入停止意图；只有远端 VM 清理完成并记录为 cancelled，才表示真正停止。</p>
+
+            <div class="library-heading rsi-heading">
+              <h3>持久练习记录</h3>
+              <span id="rsi-run-count">0 项</span>
+            </div>
+            <div class="rsi-run-list" id="rsi-run-list"></div>
+            <section class="rsi-detail hidden" id="rsi-detail" aria-live="polite"></section>
+          </section>
+
           <section class="card activity-card">
             <div class="card-heading">
               <div>
@@ -442,6 +492,32 @@
               </div>
               <span class="status-pill idle" id="status-pill">空闲</span>
             </div>
+            <section id="local-prompt-settings" class="local-prompt-settings hidden" aria-label="本地 GUI 模型提示词">
+              <h3>本地 GUI 模型提示词</h3>
+              <p class="field-help">按模型与 Win32/Cua 模式分别保存在本机数据目录，请勿写入密钥。保存后用于新任务；运行中的任务不变。完成核验仍使用固定的只读提示词。</p>
+              <label class="field-label" for="local-system-prompt">系统提示词</label>
+              <textarea id="local-system-prompt" rows="12" spellcheck="false"></textarea>
+              <label class="field-label" for="local-turn-template">每轮任务提示模板</label>
+              <textarea id="local-turn-template" rows="8" spellcheck="false"></textarea>
+              <p class="field-help">必须保留 {{task}}、{{history}}、{{experience_block}}、{{execution_feedback_block}} 占位符。{{execution_context_block}} 可选，仅填充已授权目标；旧模板的 {{cua_context_block}} 仍可用。截图由程序附上，动作由统一协议与执行器校验。</p>
+              <div class="button-row">
+                <button type="button" class="button secondary" id="local-prompts-save">保存提示词</button>
+                <button type="button" class="button secondary" id="local-prompts-reset">恢复默认</button>
+              </div>
+              <p id="local-prompts-status" role="status" aria-live="polite"></p>
+            </section>
+            <section id="chat-prompt-settings" class="local-prompt-settings hidden" aria-label="Codex 和 API 执行提示词">
+              <h3>执行提示词</h3>
+              <p class="field-help" id="chat-prompt-help"></p>
+              <label class="field-label" for="chat-prompt-guidance">自定义执行指导</label>
+              <textarea id="chat-prompt-guidance" rows="8" maxlength="4000" spellcheck="false" placeholder="可留空，使用默认提示词"></textarea>
+              <p class="field-help">本机保存，下一次任务生效；固定的安全约束与动作 JSON 结构仍由程序提供。不要填入密钥。</p>
+              <div class="button-row">
+                <button type="button" class="button secondary" id="chat-prompts-save">保存提示词</button>
+                <button type="button" class="button secondary" id="chat-prompts-reset">恢复默认</button>
+              </div>
+              <p id="chat-prompts-status" role="status" aria-live="polite"></p>
+            </section>
             <div class="field-help">
               <label><input type="checkbox" id="task-sound" checked> 任务结束提示音</label>
               <button type="button" id="task-sound-test" class="mini-button">试听</button>
@@ -451,7 +527,7 @@
             <div class="empty-state" id="empty-state">
               <div class="pulse-rings" aria-hidden="true"><span></span></div>
               <h3>等待一条指令</h3>
-              <p>先用“只生成计划”检查 Agent 的理解，不会注入任何输入。</p>
+              <p>输入任务，选择模型与执行后端，再开始执行。模型回答和执行回执会按轮次显示。</p>
             </div>
 
             <div class="job-view hidden" id="job-view">
@@ -476,6 +552,11 @@
               </div>
               <div class="instruction-preview" id="job-instruction"></div>
               <p id="job-latest-progress" class="field-help" role="status"></p>
+
+              <section class="model-chat-section" aria-label="模型对话日志">
+                <div class="log-heading"><span>模型对话 · 每轮输入、回答与执行</span></div>
+                <div class="model-chat" id="model-chat" aria-live="polite"></div>
+              </section>
 
               <div class="log-heading">
                 <span>实时日志</span>
@@ -513,5 +594,6 @@
       </footer>
     </div>
     <script src="/app.js" defer></script>
+    <script src="/components.js" defer></script>
   </body>
 </html>

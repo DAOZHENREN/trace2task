@@ -1,7 +1,8 @@
 """Official GUI-Owl desktop cookbook prompt, X-PLUG/MobileAgent (MIT).
 
 Source: Mobile-Agent-v3.5/cookbook/end2end_usage_computer.ipynb
-Retrieved 2026-09-21. Host action limitations are appended separately.
+Retrieved 2026-09-21. The default system prompt is used unchanged; trusted
+task data and feedback are supplied in the user turn, not appended here.
 
 MIT License
 Copyright (c) 2022 mPLUG

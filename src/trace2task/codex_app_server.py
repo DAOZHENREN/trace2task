@@ -14,7 +14,9 @@ from typing import Any, Protocol, TextIO
 
 from trace2task import __version__
 
-CODEX_MODELS = (
+CODEX_SELECTABLE_MODELS = ("gpt-6-sol", "gpt-6-luna")
+# Accept explicitly pinned historical jobs without offering old models in new jobs.
+CODEX_MODELS = CODEX_SELECTABLE_MODELS + (
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -64,7 +66,7 @@ def is_codex_connectivity_error(error: BaseException) -> bool:
 
 
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_MODEL = "gpt-6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
 
 
@@ -93,11 +95,11 @@ class AppServerTransport(Protocol):
 class StdioJsonTransport:
     """Exchange newline-delimited JSON with one long-running App Server process."""
 
-    def __init__(self, codex_executable: str) -> None:
+    def __init__(self, codex_executable: str, *, command: list[str] | None = None) -> None:
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
             self._process = subprocess.Popen(
-                [codex_executable, "app-server"],
+                command if command is not None else [codex_executable, "app-server"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -226,6 +228,8 @@ class CodexAppServerSession:
         progress_timeout_seconds: float | None = None,
         hard_timeout_seconds: float | None = None,
         transport_factory: TransportFactory = StdioJsonTransport,
+        base_instructions: str | None = None,
+        thread_config: dict[str, Any] | None = None,
     ) -> None:
         if reasoning_effort not in CODEX_REASONING_EFFORTS:
             raise ValueError(
@@ -239,6 +243,8 @@ class CodexAppServerSession:
         if hard_timeout_seconds is not None and hard_timeout_seconds < timeout_seconds:
             raise ValueError("Codex hard timeout cannot be shorter than the initial timeout")
         self.model = model
+        self.base_instructions = base_instructions
+        self.thread_config = thread_config
         self.reasoning_effort = reasoning_effort
         self.cwd = cwd.resolve()
         self.timeout_seconds = timeout_seconds
@@ -282,6 +288,10 @@ class CodexAppServerSession:
         }
         if self.model:
             params["model"] = self.model
+        if self.base_instructions is not None:
+            params["baseInstructions"] = self.base_instructions
+        if self.thread_config is not None:
+            params["config"] = self.thread_config
         result = self._request("thread/start", params)
         thread = result.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
@@ -302,7 +312,7 @@ class CodexAppServerSession:
         *,
         prompt: str,
         image_path: Path | None,
-        output_schema: dict[str, Any],
+        output_schema: dict[str, Any] | None,
         additional_image_paths: tuple[Path, ...] = (),
         model: str | None = None,
         reasoning_effort: str | None = None,
@@ -345,8 +355,9 @@ class CodexAppServerSession:
             "summary": "none",
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-            "outputSchema": output_schema,
         }
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
         active_model = model or self.model
         if active_model:
             params["model"] = active_model

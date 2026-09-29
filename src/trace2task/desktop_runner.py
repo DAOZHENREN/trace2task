@@ -14,7 +14,10 @@ import pygame
 from trace2task.actions import ActionCall, parameterized_action_schema
 from trace2task.codex_agent import resolve_codex_binary
 from trace2task.codex_app_server import CodexAppServerSession
+from trace2task.desktop_execution_adapter import DesktopExecutionAdapter
+from trace2task.execution_protocol import ObservationStale
 from trace2task.execution_runtime import ExecutionRuntime, capture_with_timing
+from trace2task.experience_runtime import project_experience
 from trace2task.io_audit import IOAudit
 from trace2task.model_api import ModelAPISession
 from trace2task.windows_capture import GdiWindowCapture
@@ -144,6 +147,23 @@ def parse_plan(raw):
     return value, actions
 
 
+def build_desktop_experience_context(task_path, *, execute):
+    """Load reviewed task guidance as model context, never as an execution grant."""
+    if task_path is None:
+        raise ValueError("使用桌面经验时，请选择已编译的任务经验")
+    contract = load_windows_task(Path(task_path))
+    if execute and contract.task.requires_confirmation:
+        raise ValueError("请先审查并确认经验，再开始执行")
+    if contract.semantic_experience is None:
+        raise ValueError("这份经验尚未语义编译，请先编译为经验")
+    return {
+        "task_id": contract.task.task_id,
+        "semantic": contract.semantic_experience.stage_index_payload(),
+        "human_guidance": (contract.human_guidance.prompt_payload()
+                           if contract.human_guidance else None),
+    }
+
+
 def run_desktop_baseline(
     *,
     instruction,
@@ -169,24 +189,8 @@ def run_desktop_baseline(
         raise ValueError("Unknown desktop orchestration")
     if resume_from and orchestration != "langgraph":
         raise ValueError("恢复任务需要 LangGraph 模式")
-    experience_context = None
-    if use_experience:
-        if task_path is None:
-            raise ValueError("使用桌面经验时，请选择已编译的任务经验")
-        contract = load_windows_task(Path(task_path))
-        if execute and contract.task.requires_confirmation:
-            raise ValueError("请先审查并确认经验，再开始执行")
-        if contract.semantic_experience is None:
-            raise ValueError("这份经验尚未语义编译，请先编译为经验")
-        experience_context = {
-            "task_id": contract.task.task_id,
-            "source_scope": contract.execution_scope,
-            "applicability": {"process": contract.selector.process_name,
-                              "title": contract.selector.title_contains},
-            "semantic": contract.semantic_experience.stage_index_payload(),
-            "human_guidance": (contract.human_guidance.prompt_payload()
-                               if contract.human_guidance else None),
-        }
+    experience_context = (build_desktop_experience_context(task_path, execute=execute)
+                          if use_experience else None)
     root = Path(output_root) / (
         datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
         + ("-desktop-agent" if use_experience else "-desktop-baseline")
@@ -252,6 +256,10 @@ def run_desktop_baseline(
 
         desktop = DesktopSession(backend, size)
         motor = WindowsMotorExecutor(desktop, sleeper=emergency_stop.sleep)
+        action_adapter = DesktopExecutionAdapter(
+            motor, emergency_stop, foreground_handle=backend.foreground_handle,
+            screen_size=size,
+        )
         runtime = ExecutionRuntime(
             stop=emergency_stop, status_callback=status_callback, max_actions=max_actions
         )
@@ -287,6 +295,7 @@ def run_desktop_baseline(
         status_callback("桌面执行：3 秒后截图；主屏所有可见内容会发送给所选模型。F9 停止。")
         emergency_stop.sleep(3)
         history = list(workflow.state["recent_actions"]) if workflow else []
+        last_delivery = None
         stale_plans = 0
         recovery_note = ""
         progress_guard = NoProgressGuard()
@@ -341,10 +350,15 @@ def run_desktop_baseline(
                 + instruction
                 + "\nRecent executed actions: "
                 + json.dumps(history[-8:], ensure_ascii=False)
+                + "\nLast execution transport receipt (not task outcome): "
+                + json.dumps(last_delivery, ensure_ascii=False)
                 + "\nObservation update: "
                 + recovery_note
                 + "\nExperience guidance: "
-                + (json.dumps(experience_context, ensure_ascii=False) if use_experience else "None (baseline).")
+                + (json.dumps(project_experience(
+                       experience_context, "unknown" if history else None
+                   ), ensure_ascii=False)
+                   if use_experience else "None (baseline).")
                 + "\nUse experience only where its application, state and conditions match current pixels. "
                 "Human guidance refines the derived graph, but never overrides the user's task. "
                 "Do not interpret graph states as a fixed sequence. Do not reuse recorded coordinates, "
@@ -441,8 +455,8 @@ def run_desktop_baseline(
                 try:
                     if workflow:
                         workflow.before_action(action)
-                    outcome = runtime.execute(motor, action)
-                except DesktopObservationChanged:
+                    outcome = runtime.execute(action_adapter, action)
+                except (DesktopObservationChanged, ObservationStale):
                     recover_stale_plan()
                     break
                 if workflow:
@@ -456,6 +470,12 @@ def run_desktop_baseline(
                 round_timing[timing_key] += outcome.elapsed_ms
                 round_timing["executed_actions"] += 1
                 history.append(action.to_payload())
+                last_delivery = {
+                    "status": "delivered",
+                    "effect": outcome.effect,
+                    "mode": outcome.input_mode,
+                    "route": outcome.receipt.get("route"),
+                }
                 record("action", action=action.to_payload(), result=asdict(outcome))
                 if result["actions"] >= max_actions:
                     break

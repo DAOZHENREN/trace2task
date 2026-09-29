@@ -15,7 +15,7 @@ from trace2task.codex_agent import resolve_codex_binary
 from trace2task.codex_app_server import CodexAppServerSession
 from trace2task.windows_experience import SemanticExperience
 
-DEFAULT_REVISION_MODEL = "gpt-5.6-sol"
+DEFAULT_REVISION_MODEL = "gpt-6-sol"
 DEFAULT_REVISION_REASONING_EFFORT = "high"
 MAX_GUIDANCE_RULES = 12
 MAX_GUIDANCE_OPERATIONS = 12
@@ -573,11 +573,16 @@ def compile_guidance_revision(
         transition_ids={transition.transition_id for transition in experience.transitions},
         terminal_ids=set(experience.terminal_ids),
     )
-    active_guidance_path = task_path.with_name("guidance.yaml")
+    task_data = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
+    pointer = task_data.get("human_guidance")
+    active_guidance_path = (
+        task_path.with_name(_string(pointer.get("path"), "human_guidance.path"))
+        if isinstance(pointer, dict) else None
+    )
     base_revision = 0
     active_rules: tuple[GuidanceRule, ...] = ()
     active_summary = "No confirmed human guidance exists yet."
-    if active_guidance_path.is_file():
+    if active_guidance_path is not None and active_guidance_path.is_file():
         active = load_human_guidance(
             active_guidance_path,
             task_id=task_id,
@@ -588,6 +593,14 @@ def compile_guidance_revision(
         base_revision = active.revision
         active_rules = active.rules
         active_summary = active.summary
+    pending_rules = []
+    pending_name = task_data.get("guidance_review_pending")
+    if isinstance(pending_name, str) and Path(pending_name).name == pending_name:
+        pending_path = task_path.with_name(pending_name)
+        if pending_path.is_file():
+            pending_document = yaml.safe_load(pending_path.read_text(encoding="utf-8"))
+            if isinstance(pending_document, dict) and isinstance(pending_document.get("rules"), list):
+                pending_rules = pending_document["rules"]
     prompt = (
         "You are the Revision Agent for Trace2Task V0.14.1. Merge authoritative human feedback "
         "from one reviewed Agent run into the current confirmed guidance using incremental "
@@ -612,8 +625,11 @@ def compile_guidance_revision(
         "task-wide invariants, state for observations/actions inside one state, transition for a "
         "specific legal edge, or terminal for success/failure recognition. Use an ID from the "
         "supplied guidance scope catalog, and use {type: global, id: global} for global rules. Human "
-        "feedback is authoritative; the compiled semantic experience is derived context. Image 1 "
-        "is the reviewed human success reference. Later images sample the Agent run. Return only "
+        "feedback is authoritative; the compiled semantic experience is derived context. "
+        "Quarantined rules below are historical evidence, NOT current guidance. Only if the human "
+        "feedback explicitly re-confirms one for the revised graph may you add a fresh rule with "
+        "a valid current scope; never silently reactivate or use keep/update on a quarantined ID. "
+        "Image 1 is the reviewed human success reference. Later images sample the Agent run. Return only "
         "the supplied JSON schema.\n\n"
         f"Task: {task_id}\n"
         f"Run instruction: {candidate.get('runtime_instruction')}\n"
@@ -624,6 +640,8 @@ def compile_guidance_revision(
         f"Current confirmed guidance summary: {active_summary}\n"
         "Current confirmed guidance rules: "
         f"{json.dumps(_rules_payload(active_rules), ensure_ascii=False, separators=(',', ':'))}\n"
+        "Quarantined old rules awaiting human review: "
+        f"{json.dumps(pending_rules, ensure_ascii=False, separators=(',', ':'))}\n"
         "Current semantic experience: "
         f"{json.dumps(experience.prompt_payload(), ensure_ascii=False, separators=(',', ':'))}\n"
         "Guidance scope catalog: "
@@ -820,12 +838,17 @@ def activate_guidance_revision(
         candidate.get("source_task"),
         "candidate.source_task",
     )
-    active_path = task_path.with_name("guidance.yaml")
+    task_root = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
+    pointer = task_root.get("human_guidance")
+    current_path = (
+        task_path.with_name(_string(pointer.get("path"), "human_guidance.path"))
+        if isinstance(pointer, dict) else None
+    )
     current_revision = 0
     current_rules: tuple[GuidanceRule, ...] = ()
-    if active_path.is_file():
+    if current_path is not None and current_path.is_file():
         current_guidance = load_human_guidance(
-            active_path,
+            current_path,
             task_id=task_id,
             stage_ids=stage_ids,
             transition_ids=transition_ids,
@@ -873,10 +896,13 @@ def activate_guidance_revision(
     }
     active.pop("base_revision", None)
     active.pop("proposed_revision", None)
+    active["graph_revision"] = int(
+        _mapping(task_root.get("semantic_experience"), "task.semantic_experience").get("revision") or 0
+    )
+    active_path = task_path.with_name(f"guidance-v{revision:04d}.yaml")
     revision_path = task_path.parent / "guidance-revisions" / f"revision-{revision:04d}.yaml"
     _atomic_yaml(revision_path, active)
     _atomic_yaml(active_path, active)
-    task_root = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
     task_root["human_guidance"] = {
         "path": active_path.name,
         "revision": revision,

@@ -1,0 +1,9 @@
+{
+  "root": "/srv/trace2task-rsi",
+  "codex_home": "/srv/trace2task-rsi/auth/codex-home",
+  "codex_bin": "/opt/codex/0.156.1/bin",
+  "docker_gid": 999,
+  "instruction_corpus": "/srv/trace2task-rsi/results/explore/corpus_shingles.json",
+  "controller_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "models": ["gpt-6-astra"]
+}

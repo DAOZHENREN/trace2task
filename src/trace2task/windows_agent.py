@@ -350,7 +350,9 @@ class CodexWindowsAgent:
 
     def observe_transition(self, action: ActionCall, applied: bool) -> None:
         payload = json.dumps(action.to_payload(), ensure_ascii=False, separators=(",", ":"))
-        outcome = "applied" if applied else "blocked_or_failed"
+        # The motor's return is delivery evidence, not proof that the app
+        # changed. A raised call can also have sent partial input already.
+        outcome = "delivered_effect_unverified" if applied else "interrupted_or_unknown"
         self._history.append(f"{payload}: {outcome}")
         self._history = self._history[-8:]
         if not applied and self.adaptive_reasoning:
@@ -366,6 +368,8 @@ class CodexWindowsAgent:
         if not self.adaptive_reasoning or self._escalation_level <= 0:
             return self.model, self.reasoning_effort
         model_order = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
+        if self.model in {"gpt-6-luna", "gpt-6-sol"}:
+            model_order = ["gpt-6-luna", "gpt-6-sol"]
         effort_order = ["low", "medium", "high", "xhigh", "max"]
         active_model = self.model
         if active_model in model_order:
@@ -512,8 +516,9 @@ class CodexWindowsAgent:
                 "to return an empty incomplete decision. Stop only before a choice whose correct "
                 "target cannot be known from the current screenshot and reviewed Trace. State the "
                 "expected end state and observable abort "
-                "conditions. A blocked_or_failed history item means the previous batch was "
-                "discarded at that action; recover from the current pixels instead of continuing it. "
+                "conditions. An interrupted_or_unknown history item means the previous batch was "
+                "discarded at that action; input may have been partly delivered. Recover from "
+                "the current pixels instead of replaying it blindly. "
                 "The response must match the supplied JSON schema."
             )
 
@@ -776,10 +781,10 @@ class CodexWindowsAgent:
             f"{json.dumps(history, ensure_ascii=False, separators=(',', ':'))}\n\n"
             "Forbidden recovery behavior:\n"
             "- Do not return task_complete=false with an empty actions array again.\n"
-            "- Do not repeat an already applied interaction when its expected visible effect is "
+            "- Do not repeat a delivered interaction when its expected visible effect is "
             "already present, including clicking a visibly cooling-down or disabled control.\n"
-            "- Do not replay a blocked_or_failed action unchanged unless current pixels visibly "
-            "show that its precondition has changed.\n"
+            "- An interrupted_or_unknown action may have been partly delivered. Do not replay "
+            "it unchanged unless current pixels justify a fresh action.\n"
             "- Do not skip an unresolved choice, invent a target, or mark the task complete unless "
             "the declared success condition is visibly satisfied.\n\n"
             f"{self._system_planning_policy()}"

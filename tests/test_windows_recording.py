@@ -181,9 +181,12 @@ def test_desktop_recording_keeps_events_across_window_switch(tmp_path, monkeypat
     records = [json.loads(line) for line in Path(result.trace_path).read_text("utf-8").splitlines()]
     inputs = [record for record in records if record["type"] == "windows_input"]
     assert inputs[0]["details"]["raw_input"]["normalized_position"] == [0.5, 0.5]
-    assert inputs[1]["details"]["window"]["process_name"] == "second.exe"
+    assert all("window" not in record.get("details", {}) for record in records)
+    assert any(record["type"] == "window_changed" for record in records)
     metadata = json.loads(Path(result.trace_path).with_name("metadata.json").read_text("utf-8"))
     assert metadata["execution_scope"] == "desktop"
+    assert "initial_window" not in metadata
+    assert "window_selector" not in metadata
 
 
 def test_win32_monitor_falls_back_to_physical_f8_f9_edges() -> None:
@@ -390,7 +393,6 @@ def test_buffered_sampler_preserves_fast_click_while_frame_capture_is_slow(
     assert top_level_duration == 1100.0
     assert sampled_duration == 1.0
     assert [item["action"]["skill"] for item in demonstration["actions"]] == [
-        "focus_window",
         "click",
     ]
     assert inner.closed

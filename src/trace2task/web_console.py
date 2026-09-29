@@ -33,6 +33,7 @@ from trace2task.api_settings import APISettingsStore
 from trace2task.codex_app_server import (
     CODEX_MODELS,
     CODEX_REASONING_EFFORTS,
+    CODEX_SELECTABLE_MODELS,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
     classify_codex_failure,
@@ -50,6 +51,12 @@ from trace2task.narration import (
     NARRATION_AUDIO_EXTENSIONS,
     archive_narration,
     save_narration_audio,
+)
+from trace2task.rsi_remote import (
+    RSIRemoteClient,
+    RSIRemoteError,
+    RSIRemoteProfile,
+    RSIRemoteRequestError,
 )
 from trace2task.speech_transcription import TurboTranscriber
 from trace2task.waa_results import materialize_waa_feedback_candidates
@@ -99,6 +106,168 @@ RETRYABLE_CODEX_FAILURE_CATEGORIES = frozenset(
         "hard_timeout",
     }
 )
+
+# The control service may know more deployment details than belong in the
+# browser.  Keep this projection finite and user-facing; paths, credentials,
+# raw exception text, and future server-only checks stay server-side.
+_RSI_HEALTH_CHECK_LABELS = {
+    "git_runtime": "源码版本校验工具",
+    "kvm_acceleration": "KVM 硬件虚拟化",
+    "official_runtime": "官方 RSIAgent 运行时",
+    "docker_client": "Docker 客户端模块",
+    "instruction_corpus": "练习指令语料与清单",
+    "locked_vm_image": "已校验的隔离虚拟机镜像",
+    "model_transport_smoke": "Codex 模型传输验证",
+    "vm_runtime_image": "虚拟机容器运行镜像",
+    "docker_root_capacity": "Docker 存储空间容量门槛",
+    "guest_isolation_smoke": "真实隔离与回滚验收",
+}
+
+
+def _load_rsi_remote_client() -> tuple[RSIRemoteClient | None, str | None]:
+    """Load only a local deployment profile; browser input never reaches here."""
+    raw_path = os.environ.get("TRACE2TASK_RSI_PROFILE", "").strip()
+    if not raw_path:
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if not local_app_data:
+            return None, "未配置远程 RSI 部署（未找到本机部署配置）"
+        path = Path(local_app_data) / "Trace2Task" / "rsi-profile.json"
+        if not path.is_file():
+            return None, "未配置远程 RSI 部署（未找到本机部署配置）"
+    else:
+        path = Path(raw_path)
+    try:
+        path = path.expanduser().resolve()
+        if not path.is_file() or path.stat().st_size > 65_536:
+            raise ValueError("profile unavailable")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("profile is not an object")
+        # JSON has no tuple type, while the trusted profile deliberately uses
+        # tuples for command and allowlist fields.  Convert only these known
+        # array fields; every other field remains subject to dataclass checks.
+        payload = dict(payload)
+        for name in (
+            "control_launcher_argv",
+            "allowed_models",
+            "allowed_reasoning_efforts",
+        ):
+            if name in payload:
+                if not isinstance(payload[name], list):
+                    raise TypeError(f"profile {name} must be an array")
+                payload[name] = tuple(payload[name])
+        return RSIRemoteClient(RSIRemoteProfile(**payload)), None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # Do not expose a profile path or deployment fields through the local UI.
+        return None, "远程 RSI 部署配置无效；请由管理员检查本机配置"
+
+
+def _rsi_text(value: object, *, maximum: int = 4_000) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value[:maximum]
+
+
+def _rsi_health_checks(value: object) -> list[dict[str, Any]]:
+    """Project the remote health data through a fixed, non-sensitive schema."""
+    raw = value if isinstance(value, dict) else {}
+    return [
+        {"id": name, "label": label, "ready": raw.get(name) is True}
+        for name, label in _RSI_HEALTH_CHECK_LABELS.items()
+        if name in raw
+    ]
+
+
+def _rsi_remote_choices(value: object, allowed: tuple[str, ...]) -> list[str]:
+    """Return only choices approved by both remote deployment and local profile."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item in allowed]
+
+
+def _rsi_run_summary(value: object) -> dict[str, Any]:
+    """Expose a small, display-only subset of remote ledger records."""
+    if not isinstance(value, dict):
+        raise TypeError("远程 RSI 控制器返回了无效运行记录")
+    if not isinstance(value.get("id"), str) or not value["id"] or not value.get("state"):
+        raise ValueError("远程 RSI 运行记录缺少身份或状态")
+    spec = value.get("spec") if isinstance(value.get("spec"), dict) else {}
+    review = value.get("review") if isinstance(value.get("review"), dict) else None
+    result = value.get("result") if isinstance(value.get("result"), dict) else None
+    worker_result = (result.get("worker_result") if result else None)
+    if result and isinstance(worker_result, dict):
+        # The supervisor wraps the worker's diagnostic after confirming cleanup.
+        # Preserve that cause instead of displaying only "worker_exit".
+        result = {**result, **worker_result}
+    return {
+        "id": _rsi_text(value.get("id"), maximum=64),
+        "state": _rsi_text(value.get("state"), maximum=64),
+        "created": _rsi_text(value.get("created"), maximum=80),
+        "updated": _rsi_text(value.get("updated"), maximum=80),
+        "stop_requested": bool(value.get("stop_requested")),
+        "candidate_sha256": _rsi_text(value.get("candidate_sha256"), maximum=64),
+        "spec": {
+            "instruction": _rsi_text(spec.get("instruction")),
+            "model": _rsi_text(spec.get("model"), maximum=200),
+            "reasoning_effort": _rsi_text(spec.get("reasoning_effort"), maximum=64),
+            "max_model_calls": spec.get("max_model_calls") if type(spec.get("max_model_calls")) is int else None,
+            "wall_seconds": spec.get("wall_seconds") if type(spec.get("wall_seconds")) is int else None,
+            "project_budget": spec.get("project_budget") if type(spec.get("project_budget")) is int else None,
+        },
+        "review": ({
+            "decision": _rsi_text(review.get("decision"), maximum=32),
+            "note": _rsi_text(review.get("note")),
+            "sha256": _rsi_text(review.get("sha256"), maximum=64),
+            "time": _rsi_text(review.get("time"), maximum=80),
+        } if review else None),
+        "result": ({
+            "status": _rsi_text(result.get("status"), maximum=64),
+            "reason": _rsi_text(result.get("reason")),
+            "error_type": _rsi_text(result.get("error_type"), maximum=128),
+            "error": _rsi_text(result.get("error")),
+        } if result else None),
+    }
+
+
+def _rsi_recovery_summary(value: object) -> dict[str, Any]:
+    """Expose only the bounded recovery verdict, never remote state details."""
+    if not isinstance(value, dict) or type(value.get("eligible")) is not bool:
+        raise TypeError("远程 RSI 控制器返回了无效恢复检查")
+    result: dict[str, Any] = {
+        "eligible": value["eligible"],
+        "reason": _rsi_text(value.get("reason"), maximum=160),
+    }
+    for name in ("boundary_projects", "remaining_model_calls", "remaining_wall_ms"):
+        item = value.get(name)
+        if type(item) is int and item >= 0:
+            result[name] = item
+    return result
+
+
+def _rsi_event_summary(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError("远程 RSI 控制器返回了无效事件")
+    payload = value.get("payload") if isinstance(value.get("payload"), dict) else {}
+    visible: dict[str, Any] = {key: _rsi_text(payload.get(key), maximum=1_000) for key in (
+        "state", "from", "type", "status", "reason", "error_type", "error", "mode",
+    ) if isinstance(payload.get(key), str)}
+    # These ledger fields are deliberately scalar and allowlisted.  They let
+    # the local UI explain a selected run's charged budget and cleanup status
+    # without rendering arbitrary remote payloads or adding another protocol
+    # endpoint.  In particular, never pass container IDs, paths, role output,
+    # or nested worker diagnostics through this display projection.
+    for key in ("attempt_no", "model_calls_before", "model_calls_used",
+                "global_call_index", "active_elapsed_ms", "active_elapsed_ms_before"):
+        if type(payload.get(key)) is int and payload[key] >= 0:
+            visible[key] = payload[key]
+    if type(payload.get("cleanup_confirmed")) is bool:
+        visible["cleanup_confirmed"] = payload["cleanup_confirmed"]
+    return {
+        "seq": value.get("seq") if type(value.get("seq")) is int else 0,
+        "time": _rsi_text(value.get("time"), maximum=80),
+        "kind": _rsi_text(value.get("kind"), maximum=128),
+        "payload": visible,
+    }
 
 
 def _now() -> str:
@@ -386,6 +555,9 @@ class ConsoleJob:
     cua_target: dict | None = None
     approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
     pending_batch: dict[str, Any] | None = None
+    prompt_profile: dict[str, str] | None = field(default=None, repr=False)
+    prompt_guidance: str = field(default="", repr=False)
+    model_io: list[dict[str, Any]] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -399,6 +571,8 @@ class ConsoleJob:
             "provider": self.provider,
             "selection_mode": self.selection_mode,
             "execution_scope": self.execution_scope,
+            "operation_scope": ("selected_windows" if self.executor_backend == "cua"
+                                else self.execution_scope),
             "orchestration": self.orchestration,
             "resume_from": self.resume_from,
             "selection_confidence": self.selection_confidence,
@@ -406,7 +580,8 @@ class ConsoleJob:
             "kind": self.kind,
             "narrated": self.narrated,
             "defer_compilation": self.defer_compilation,
-            "input_mode": "background" if self.background else "foreground",
+            "input_mode": ("background_preferred" if self.executor_backend == "cua"
+                           else "background" if self.background else "foreground"),
             "adaptive_reasoning": self.adaptive_reasoning,
             "use_experience": self.use_experience,
             "status": self.status,
@@ -419,6 +594,7 @@ class ConsoleJob:
             "pending_batch": self.pending_batch,
             "executor_backend": self.executor_backend,
             "cua_target": self.cua_target,
+            "model_io": list(self.model_io),
         }
 
 
@@ -492,8 +668,11 @@ class WebConsoleController:
         runner: Runner = run_windows_agent,
         narration_transcriber: TurboTranscriber | None = None,
         api_settings_store: APISettingsStore | None = None,
+        rsi_client: RSIRemoteClient | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
+        from trace2task.components import ComponentManager
+        self.components = ComponentManager(self.project_root)
         self.api_settings = api_settings_store or APISettingsStore()
         self.task_root = (self.project_root / "taskpacks").resolve()
         self.candidate_root = (self.project_root / "runs" / "candidates").resolve()
@@ -504,6 +683,212 @@ class WebConsoleController:
         self._jobs: dict[str, ConsoleJob] = {}
         self._active_job_id: str | None = None
         self._waa_processes: dict[str, subprocess.Popen[str]] = {}
+        self._rsi_client, self._rsi_profile_error = (
+            (rsi_client, None) if rsi_client is not None else _load_rsi_remote_client()
+        )
+
+    def rsi_health(self) -> dict[str, Any]:
+        """Return display-safe deployment state without attempting any mutation."""
+        if self._rsi_client is None:
+            return {
+                "configured": False,
+                "ready": False,
+                "connection_state": "unconfigured",
+                "message": self._rsi_profile_error,
+                "checks": [],
+                "models": [],
+                "reasoning_efforts": [],
+            }
+        try:
+            remote = self._rsi_client.health()
+        except RSIRemoteError as error:
+            return {
+                "configured": True,
+                "ready": False,
+                "connection_state": "unreachable",
+                "message": str(error),
+                "checks": [],
+                "models": [],
+                "reasoning_efforts": [],
+            }
+        ready = remote.get("ready") is True
+        return {
+            "configured": True,
+            "ready": ready,
+            "connection_state": "ready" if ready else "unready",
+            "message": (
+                "远端隔离练习已就绪。练习结果仍须经独立 Verifier 才能成为候选。"
+                if ready else "远端控制器已连接，但练习资源尚未准备完成。"
+            ),
+            "checks": _rsi_health_checks(remote.get("checks")),
+            "models": _rsi_remote_choices(
+                remote.get("models"), self._rsi_client.profile.allowed_models
+            ),
+            "reasoning_efforts": _rsi_remote_choices(
+                remote.get("reasoning_efforts"),
+                self._rsi_client.profile.allowed_reasoning_efforts,
+            ),
+            "max_model_calls": self._rsi_client.profile.max_model_calls,
+            "max_wall_seconds": self._rsi_client.profile.max_wall_seconds,
+            "max_project_budget": self._rsi_client.profile.max_project_budget,
+        }
+
+    def _require_rsi_client(self) -> RSIRemoteClient:
+        if self._rsi_client is None:
+            raise RuntimeError(self._rsi_profile_error or "远程 RSI 部署未配置")
+        return self._rsi_client
+
+    def list_rsi_runs(self, limit: object = 50) -> dict[str, Any]:
+        if type(limit) is not int:
+            raise ValueError("limit 必须是整数")
+        response = self._require_rsi_client().list(limit=limit)
+        rows = response.get("runs")
+        if not isinstance(rows, list):
+            raise TypeError("远程 RSI 控制器未返回运行列表")
+        return {"runs": [_rsi_run_summary(row) for row in rows]}
+
+    def get_rsi_run(self, run_id: object) -> dict[str, Any]:
+        return {"run": _rsi_run_summary(self._require_rsi_client().get(str(run_id))["run"])}
+
+    def rsi_events(self, run_id: object, after: object = 0) -> dict[str, Any]:
+        if type(after) is not int:
+            raise ValueError("after 必须是非负整数")
+        response = self._require_rsi_client().events(str(run_id), after=after)
+        rows = response.get("events")
+        if not isinstance(rows, list):
+            raise TypeError("远程 RSI 控制器未返回事件列表")
+        return {"events": [_rsi_event_summary(row) for row in rows]}
+
+    def start_rsi_practice(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = self._require_rsi_client().start(
+                instruction=payload.get("instruction", ""),
+                model=payload.get("model", ""),
+                reasoning_effort=payload.get("reasoning_effort", ""),
+                max_model_calls=payload.get("max_model_calls"),
+                wall_seconds=payload.get("wall_seconds"),
+                project_budget=payload.get("project_budget", 1),
+            )
+        except RSIRemoteRequestError as error:
+            if error.code == "practice_already_active":
+                raise RuntimeError("已有远程练习正在运行，请刷新查看，不要重复启动") from error
+            raise
+        return {"run": _rsi_run_summary(result["run"])}
+
+    def stop_rsi_practice(self, run_id: object) -> dict[str, Any]:
+        return {"run": _rsi_run_summary(self._require_rsi_client().stop(str(run_id))["run"])}
+
+    def rsi_recovery(self, run_id: object) -> dict[str, Any]:
+        return {"recovery": _rsi_recovery_summary(
+            self._require_rsi_client().recovery(str(run_id))
+        )}
+
+    def recover_rsi_practice(self, run_id: object) -> dict[str, Any]:
+        return {"run": _rsi_run_summary(self._require_rsi_client().recover(str(run_id))["run"])}
+
+    def get_rsi_candidate(self, run_id: object, digest: object) -> dict[str, Any]:
+        payload = self._require_rsi_client().candidate(str(run_id), digest=str(digest))["candidate"]
+        # Candidate prose is untrusted model output. It is returned as data only;
+        # the browser renders it with textContent, never HTML.
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > 256_000:
+            raise ValueError("远程候选经验过大，拒绝加载到网页")
+        return {"candidate": payload}
+
+    def review_rsi_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"run": _rsi_run_summary(self._require_rsi_client().review(
+            str(payload.get("run_id", "")),
+            digest=str(payload.get("digest", "")),
+            decision=payload.get("decision", ""),
+            note=payload.get("note", ""),
+        )["run"])}
+
+    def local_prompt_profile(self, model: str, backend: str) -> dict[str, Any]:
+        from trace2task.local_gui_protocol import (
+            MODELS,
+            TURN_TEMPLATE,
+            prompt,
+            validate_prompt_profile,
+        )
+
+        if model not in MODELS or backend not in {"win32", "cua"}:
+            raise ValueError("仅本地 GUI 模型可编辑执行提示词")
+        default = {"system_prompt": prompt(model),
+                   "turn_template": TURN_TEMPLATE}
+        path = self.project_root / "runs/local-gui/prompt-profiles.json"
+        with self._lock:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(saved, dict):
+            raise ValueError("本地提示词配置文件格式无效")  # noqa: TRY004 - persisted format validation
+        key = f"{model}:{backend}"
+        effective = validate_prompt_profile(saved[key]) if key in saved else default
+        return {"model": model, "backend": backend, "default": default,
+                "effective": effective, "customized": key in saved}
+
+    def save_local_prompt_profile(self, model: str, backend: str,
+                                  profile: dict[str, str] | None) -> dict[str, Any]:
+        from trace2task.local_gui_protocol import validate_prompt_profile
+
+        self.local_prompt_profile(model, backend)  # Validate model/backend before touching disk.
+        if profile is not None:
+            profile = validate_prompt_profile(profile)
+        path = self.project_root / "runs/local-gui/prompt-profiles.json"
+        with self._lock:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            if not isinstance(saved, dict):
+                raise ValueError("本地提示词配置文件格式无效")  # noqa: TRY004 - persisted format validation
+            key = f"{model}:{backend}"
+            if profile is None:
+                saved.pop(key, None)
+            else:
+                saved[key] = profile
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             delete=False) as stream:
+                pending = Path(stream.name)
+                json.dump(saved, stream, ensure_ascii=False, indent=2)
+            try:
+                os.replace(pending, path)
+            finally:
+                pending.unlink(missing_ok=True)
+        return self.local_prompt_profile(model, backend)
+
+    def chat_prompt_profile(self, provider: str) -> dict[str, Any]:
+        if provider not in {"codex", "api"}:
+            raise ValueError("仅 Codex 和模型 API 可使用此提示词配置")
+        path = self.project_root / "runs/chat-prompt-profiles.json"
+        with self._lock:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(saved, dict):
+            raise ValueError("对话模型提示词配置文件格式无效")  # noqa: TRY004 -- HTTP validation contract
+        value = saved.get(provider, "")
+        if not isinstance(value, str) or len(value) > 4_000:
+            raise ValueError("对话模型提示词配置无效")
+        return {"provider": provider, "guidance": value, "customized": bool(value)}
+
+    def save_chat_prompt_profile(self, provider: str, guidance: str) -> dict[str, Any]:
+        self.chat_prompt_profile(provider)
+        if not isinstance(guidance, str) or len(guidance) > 4_000:
+            raise ValueError("自定义提示词不能超过 4000 个字符")
+        path = self.project_root / "runs/chat-prompt-profiles.json"
+        with self._lock:
+            saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            if not isinstance(saved, dict):
+                raise ValueError("对话模型提示词配置文件格式无效")  # noqa: TRY004 -- HTTP validation contract
+            if guidance.strip():
+                saved[provider] = guidance.strip()
+            else:
+                saved.pop(provider, None)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             delete=False) as stream:
+                pending = Path(stream.name)
+                json.dump(saved, stream, ensure_ascii=False, indent=2)
+            try:
+                os.replace(pending, path)
+            finally:
+                pending.unlink(missing_ok=True)
+        return self.chat_prompt_profile(provider)
 
     def _cleanup_pending_deletions(self) -> None:
         for root in (self.task_root, (self.project_root / "runs").resolve()):
@@ -549,6 +934,15 @@ class WebConsoleController:
             )
             semantic = contract.semantic_experience
             guidance = contract.human_guidance
+            task_document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            pending_name = task_document.get("guidance_review_pending")
+            pending_rules: list[dict[str, Any]] = []
+            if isinstance(pending_name, str) and Path(pending_name).name == pending_name:
+                pending_path = path.with_name(pending_name)
+                if pending_path.is_file():
+                    pending_document = yaml.safe_load(pending_path.read_text(encoding="utf-8"))
+                    if isinstance(pending_document, dict) and isinstance(pending_document.get("rules"), list):
+                        pending_rules = pending_document["rules"]
             records.append(
                 (
                     path.stat().st_mtime,
@@ -568,7 +962,6 @@ class WebConsoleController:
                         "max_actions": contract.task.max_actions,
                         "experience_intent": contract.task.experience_intent,
                         "experience_examples": list(contract.task.experience_examples),
-                        "experience_family_id": contract.task.experience_family_id,
                         "semantic_experience": (
                             {
                                 "status": semantic.review_status,
@@ -723,6 +1116,7 @@ class WebConsoleController:
                             if guidance is not None
                             else None
                         ),
+                        "guidance_review_pending": pending_rules,
                         "missing_message_capabilities": missing_capabilities,
                     },
                 )
@@ -731,11 +1125,7 @@ class WebConsoleController:
         return [record for _, record in records]
 
     def route_instruction(self, instruction: str) -> dict[str, Any]:
-        taskpacks = [task for task in self.list_taskpacks()
-                     if task.get("execution_scope", "window") == "window"]
-        match = route_experience(instruction, taskpacks)
-        selected = next(task for task in taskpacks if task["path"] == match.task_path)
-        return {**match.to_payload(), "task": selected}
+        raise ValueError("请手动选择任务经验；自动匹配经验已停用")
 
     def list_windows(self) -> list[dict[str, Any]]:
         return list_window_records(backend=Win32Backend())["windows"]
@@ -812,11 +1202,15 @@ class WebConsoleController:
                 continue
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                sidecar = metadata_path.with_name("trace2task.json")
+                if sidecar.is_file():
+                    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if metadata.get("source") != "windows_human":
+            if metadata.get("source") not in {"windows_human", "opencua_native"}:
                 continue
-            trace_path = metadata_path.with_name("trace.jsonl")
+            opencua = metadata.get("source") == "opencua_native"
+            trace_path = metadata_path.with_name("events.jsonl" if opencua else "trace.jsonl")
             if not trace_path.is_file():
                 continue
             created_at = metadata.get("started_at") or datetime.fromtimestamp(
@@ -845,6 +1239,9 @@ class WebConsoleController:
                         "success": bool(metadata.get("success")),
                         "stop_reason": metadata.get("stop_reason"),
                         "input_events": metadata.get("input_event_count", 0),
+                        "recording_backend": "opencua" if opencua else "legacy",
+                        **({"derivation": metadata.get("derivation")} if opencua else {}),
+                        "compilation_supported": not opencua,
                         "execution_scope": metadata.get("execution_scope", "window"),
                         "narrated": narration_path.is_file(),
                         "narration_chars": narration_chars,
@@ -962,11 +1359,19 @@ class WebConsoleController:
         cua_target: dict | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
-        if executor_backend not in {"win32", "cua"} or (executor_backend == "cua" and provider != "trained_d"):
-            raise ValueError("Cua 实验后端仅支持本地原生模型")
+        if executor_backend not in {"win32", "cua"}:
+            raise ValueError("不支持的执行后端")
+        if (executor_backend == "cua" and provider != "trained_d"
+                and (execution_scope != "desktop" or orchestration != "legacy"
+                     or not execute or resume_from)):
+            raise ValueError("Codex/API 的 Cua 只支持独立任务执行；检查点恢复仍走原有路径")
         if executor_backend == "cua":
+            from trace2task.cua_desktop import DESKTOP_TARGET
             from trace2task.cua_scope import normalize_scope
-            cua_target = normalize_scope(cua_target)
+            if cua_target != DESKTOP_TARGET:
+                cua_target = normalize_scope(cua_target)
+            elif execution_scope != "desktop":
+                raise ValueError("Cua 桌面目标需要全桌面范围")
         if orchestration not in {"legacy", "langgraph"}:
             raise ValueError("不支持的任务管理模式")
         if execution_scope != "desktop" and (orchestration != "legacy" or resume_from):
@@ -994,8 +1399,8 @@ class WebConsoleController:
         if len(normalized_instruction) > 2_000:
             raise ValueError("任务指令不能超过 2000 个字符")
         if provider == "trained_d":
-            if execution_scope != "desktop" or use_experience or orchestration != "legacy" or resume_from:
-                raise ValueError("D 模型仅支持主屏桌面、无经验、独立任务")
+            if execution_scope != "desktop" or orchestration != "legacy" or resume_from:
+                raise ValueError("本地 GPU 模型仅支持主屏桌面、独立任务")
             if type(continuous) is not bool:
                 raise ValueError("continuous 必须为布尔值")
             from trace2task.local_gui_protocol import MODELS
@@ -1003,9 +1408,15 @@ class WebConsoleController:
                 model = "D-5970"  # Legacy caller omitted the D model identifier.
             if model not in ("D-5970", *MODELS):
                 raise ValueError("不支持的本地 GPU 模型")
+            if use_experience and model == "D-5970":
+                raise ValueError("D-5970 冻结输入结构不支持经验指导，请选择 GUI 原生模型或关闭经验")
             reasoning_effort = "low"
+            prompt_profile = (self.local_prompt_profile(model, executor_backend)["effective"]
+                              if model != "D-5970" else None)
         if provider not in {"codex", "api", "trained_d"}:
             raise ValueError("执行模型来源必须是 codex 或 api")
+        prompt_guidance = (self.chat_prompt_profile(provider)["guidance"]
+                           if provider in {"codex", "api"} else "")
         if not isinstance(background, bool) or not isinstance(adaptive_reasoning, bool):
             raise TypeError("输入模式和自适应推理设置必须是布尔值")
         api_config = None
@@ -1040,13 +1451,7 @@ class WebConsoleController:
             selection_confidence = None
             selection_reason = "用户手动选择 Trace 经验"
         else:
-            if execution_scope == "desktop":
-                raise ValueError("桌面使用经验时，请手动选择已编译经验")
-            routed = self.route_instruction(normalized_instruction)
-            resolved_task = self._resolve_task_path(routed["task_path"])
-            selection_mode = "auto"
-            selection_confidence = float(routed["confidence"])
-            selection_reason = str(routed["reason"])
+            raise ValueError("使用经验时，请手动选择任务经验；不再自动匹配经验")
         if resolved_task is not None:
             contract = load_windows_task(resolved_task)
             task_id = contract.task.task_id
@@ -1086,6 +1491,8 @@ class WebConsoleController:
                 continuous=continuous,
                 executor_backend=executor_backend,
                 cua_target=cua_target,
+                prompt_profile=prompt_profile if provider == "trained_d" else None,
+                prompt_guidance=prompt_guidance,
             )
             if selection_mode == "auto":
                 job.logs.append(
@@ -1113,7 +1520,14 @@ class WebConsoleController:
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
         execution_scope: str = "window",
+        recording_backend: str = "legacy",
     ) -> dict[str, Any]:
+        if recording_backend not in {"legacy", "opencua"}:
+            raise ValueError("不支持的录制后端")
+        if recording_backend == "opencua":
+            if execution_scope != "desktop" or narrated:
+                raise ValueError("OpenCUA 本轮仅支持主屏幕录制，不支持语音")
+            defer_compilation = True
         normalized_task_id = " ".join(task_id.split())
         if not normalized_task_id:
             raise ValueError("请输入经验名称")
@@ -1156,8 +1570,8 @@ class WebConsoleController:
             self._jobs[job.job_id] = job
             self._active_job_id = job.job_id
         thread = threading.Thread(
-            target=self._run_recording,
-            args=(job, handle, selected),
+            target=self._run_opencua_recording if recording_backend == "opencua" else self._run_recording,
+            args=(job,) if recording_backend == "opencua" else (job, handle, selected),
             name=f"trace2task-record-{job.job_id[:8]}",
             daemon=True,
         )
@@ -1829,12 +2243,6 @@ class WebConsoleController:
         recording_task_id = recording_metadata.get("task_id")
         if not isinstance(recording_task_id, str) or not recording_task_id.strip():
             raise ValueError("原始录制缺少有效的经验名称")
-        family_source = self._select_family_source(recording_task_id, recording_metadata)
-        family_id = (
-            str(family_source.get("experience_family_id"))
-            if family_source is not None
-            else recording_task_id.strip()
-        )
         if existing_task is None:
             duplicate_task = next(
                 (
@@ -1861,15 +2269,11 @@ class WebConsoleController:
             )
             payload = _jsonable(result)
             semantic_task = Path(result.task_path)
-            if semantic_task.is_file():
-                self._set_experience_family(semantic_task, family_id)
             payload["reused_taskpack"] = False
         else:
             report("检测到同一原始 Trace 的任务包，将重新生成语义层，不再创建副本。")
             contract = load_windows_task(existing_task)
             semantic_task = existing_task
-            if family_source is not None:
-                self._set_experience_family(semantic_task, family_id)
             payload = {
                 "task_id": contract.task.task_id,
                 "task_path": str(existing_task),
@@ -1923,18 +2327,6 @@ class WebConsoleController:
                 "已冻结人工修改前的 Compiler 输出："
                 f"{automatic_snapshot['task_path']}。"
             )
-            if family_source is not None:
-                inherited = self._inherit_family_guidance(
-                    self._resolve_task_path(str(family_source["path"])),
-                    semantic_task,
-                    family_id=family_id,
-                )
-                if inherited is not None:
-                    payload["guidance_inheritance"] = inherited
-                    report(
-                        "已从同一经验族继承确认过的人工诀窍："
-                        f"{inherited['source_task_id']} v{inherited['revision']}。"
-                    )
         return payload
 
     def _compile_waa_narration_pair(
@@ -2011,7 +2403,6 @@ class WebConsoleController:
                     task_path = Path(compiled.task_path)
                     deterministic_compilation = _jsonable(compiled)
                     deterministic_compilation["reused_taskpack"] = False
-                    self._set_experience_family(task_path, base_task_id)
                 else:
                     report(f"检测到“{task_id}”的已有动作任务包，将只重试语义编译。")
                     deterministic_compilation = {
@@ -2726,6 +3117,21 @@ class WebConsoleController:
         }:
             raise RuntimeError("已有任务正在运行，请先等待或停止它")
 
+    def _run_opencua_recording(self, job: ConsoleJob) -> None:
+        from trace2task.opencua_recording import record_opencua
+        self._update(job, status="running", log="OpenCUA 原生录制准备中。视频和结构信息仅在本地保存。")
+        try:
+            result = record_opencua(
+                task_id=job.task_id, output_root=self.project_root / "runs",
+                stop_event=job.stop_event,
+                status_callback=lambda message: self._update(job, log=message),
+            )
+            self._update(job, status="completed" if result["success"] else "stopped", result=result,
+                         log="OpenCUA 录制已归档，可在原始录制中查看；本轮尚未启用关键帧编译。")
+        except Exception as error:  # noqa: BLE001 -- expose background job failure to the UI
+            self._update(job, status="failed", error=f"{type(error).__name__}: {error}",
+                         log=f"OpenCUA 录制失败：{error}")
+
     def _run_recording(
         self,
         job: ConsoleJob,
@@ -3284,7 +3690,7 @@ class WebConsoleController:
     ) -> None:
         desktop = job.execution_scope == "desktop"
         self._update(job, status="running", log=(
-            f"任务已启动 · {'桌面' if desktop else '单窗口'} · "
+            f"任务已启动 · {'指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
             f"{'使用经验' if job.use_experience else '无经验 Baseline'}。"
         ))
         try:
@@ -3307,6 +3713,7 @@ class WebConsoleController:
             run_failure: Exception | None = None
             try:
                 if job.provider == "trained_d":
+                    from trace2task.desktop_runner import build_desktop_experience_context
                     from trace2task.trained_model_runner import run_trained_desktop
 
                     if not execute:
@@ -3328,8 +3735,28 @@ class WebConsoleController:
                         approve=approve, continuous=job.continuous, model=job.model,
                         executor_backend=job.executor_backend,
                         cua_target=job.cua_target,
+                        experience_context=(build_desktop_experience_context(task_path, execute=True)
+                                             if job.use_experience else None),
+                        prompt_profile=job.prompt_profile,
+                        on_model_round=lambda entry: self._model_round_update(job, entry),
                     )
                     job.pending_batch = None
+                elif (desktop and execute and job.orchestration == "legacy"
+                      and (not job.use_experience or job.executor_backend == "cua")):
+                    from trace2task.chat_agent_runner import run_chat_agent
+
+                    result = run_chat_agent(
+                        instruction=job.instruction, model=job.model,
+                        reasoning_effort=job.reasoning_effort,
+                        output_root=self.project_root / "runs",
+                        emergency_stop=kwargs["emergency_stop"],
+                        status_callback=kwargs["status_callback"],
+                        executor_backend=job.executor_backend,
+                        cua_target=job.cua_target, api_config=api_config,
+                        task_path=task_path, use_experience=job.use_experience,
+                        prompt_guidance=job.prompt_guidance,
+                        on_model_round=lambda entry: self._model_round_update(job, entry),
+                    )
                 elif desktop:
                     from trace2task.desktop_runner import run_desktop_baseline
 
@@ -3345,7 +3772,26 @@ class WebConsoleController:
             if not isinstance(payload, dict):
                 payload = {"value": payload}
             payload["execution_scope"] = job.execution_scope
+            payload["operation_scope"] = ("selected_windows" if job.executor_backend == "cua"
+                                          else job.execution_scope)
             payload["use_experience"] = job.use_experience
+            payload["executor_backend"] = job.executor_backend
+            if (job.provider in {"codex", "api"} and not payload.get("model_io")
+                    and isinstance(payload.get("trace_path"), str)):
+                from trace2task.model_io_projection import project_model_io
+
+                run_dir = Path(payload["trace_path"]).resolve().parent
+                if run_dir.is_relative_to((self.project_root / "runs").resolve()):
+                    audit_path = run_dir / "io-audit" / "events.jsonl"
+                    if audit_path.is_file():
+                        payload["audit_path"] = str(audit_path)
+                        try:
+                            payload["model_io"] = project_model_io(run_dir)
+                        except (OSError, ValueError, TypeError) as error:
+                            self._update(job, log=f"对话式日志生成失败；原始 I/O 归档仍可查看：{error}")
+                        else:
+                            with self._lock:
+                                job.model_io = payload["model_io"]
             if execute and not desktop:
                 try:
                     candidate = self._save_candidate(job, payload)
@@ -3377,10 +3823,15 @@ class WebConsoleController:
                 )
                 return
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
-            if job.provider == "trained_d" and payload.get("stop_reason") in {
+            if payload.get("stop_reason") in {
                 "no_progress",
                 "model_done_unverified",
                 "effect_unverifiable",
+                "capability_rejection_limit",
+                "completion_unverifiable",
+                "completion_rejected",
+                "background_unavailable",
+                "foreground_unavailable",
             }:
                 final_status = "stopped"
             if payload.get("stop_reason") == "error" or (
@@ -3388,8 +3839,22 @@ class WebConsoleController:
             ):
                 final_status = "failed"
             completion_note = ""
-            if payload.get("stop_reason") == "effect_unverifiable":
+            if payload.get("stop_reason") == "background_unavailable":
+                completion_note = "驱动拒绝后台输入；前台重试未能确认交付，已停止。"
+            elif payload.get("stop_reason") == "foreground_unavailable":
+                completion_note = "驱动拒绝后台输入，Windows 又不允许安全切到目标前台；未发送全局输入，任务已停止。"
+            elif payload.get("stop_reason") == "completion_unverifiable":
+                completion_note = "完成证据不足；已停止等待人工检查，不自动重试。"
+            elif payload.get("stop_reason") == "completion_rejected":
+                completion_note = "完成声明连续未通过核验；任务未完成。"
+            elif payload.get("stop_reason") == "visual_completion_reviewed":
+                completion_note = "已通过本地模型只读视觉核验；尚未经独立应用验证。"
+            elif payload.get("stop_reason") == "no_progress":
+                completion_note = "重复操作无进展，纠正后仍未恢复；已停止。"
+            elif payload.get("stop_reason") == "effect_unverifiable":
                 completion_note = "动作已送达，但效果无法确认；任务已停止。"
+            elif payload.get("stop_reason") == "capability_rejection_limit":
+                completion_note = "连续三次操作能力预检未通过；这些动作未执行，任务已停止。"
             elif desktop:
                 completion_note = "模型完成声明未经独立验证。"
             self._update(
@@ -3520,6 +3985,16 @@ class WebConsoleController:
                 job.error = error
             job.updated_at = _now()
 
+    def _model_round_update(self, job: ConsoleJob, entry: dict[str, Any]) -> None:
+        with self._lock:
+            index = entry["step_index"]
+            item = deepcopy(entry)
+            if index == len(job.model_io):
+                job.model_io.append(item)
+            elif 0 <= index < len(job.model_io):
+                job.model_io[index] = item
+            job.updated_at = _now()
+
 
 class WebConsoleHandler(BaseHTTPRequestHandler):
     controller: WebConsoleController
@@ -3533,6 +4008,59 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/rsi/health":
+            self._json(self.controller.rsi_health())
+            return
+        if parsed.path == "/api/rsi/runs":
+            try:
+                values = parse_qs(parsed.query)
+                raw_limit = (values.get("limit") or ["50"])[0]
+                self._json(self.controller.list_rsi_runs(int(raw_limit)))
+            except (TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except RuntimeError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            return
+        if parsed.path == "/api/rsi/get":
+            try:
+                run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                self._json(self.controller.get_rsi_run(run_id))
+            except (TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except RuntimeError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            return
+        if parsed.path == "/api/rsi/events":
+            try:
+                values = parse_qs(parsed.query)
+                self._json(self.controller.rsi_events(
+                    (values.get("run_id") or [""])[0], int((values.get("after") or ["0"])[0])
+                ))
+            except (TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except RuntimeError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            return
+        if parsed.path == "/api/rsi/recovery":
+            try:
+                run_id = (parse_qs(parsed.query).get("run_id") or [""])[0]
+                self._json(self.controller.rsi_recovery(run_id))
+            except (TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except RuntimeError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            return
+        if parsed.path == "/api/rsi/candidate":
+            try:
+                values = parse_qs(parsed.query)
+                self._json(self.controller.get_rsi_candidate(
+                    (values.get("run_id") or [""])[0], (values.get("digest") or [""])[0]
+                ))
+            except (TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except RuntimeError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            return
         if parsed.path == "/api/desktop-checkpoints":
             runs = self.controller.project_root / "runs"
             items = []
@@ -3551,6 +4079,21 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 if len(items) >= 30:
                     break
             self._json({"runs": items})
+            return
+        if parsed.path == "/api/components":
+            self._json(self.controller.components.status())
+            return
+        if parsed.path == "/api/local-prompts":
+            values = parse_qs(parsed.query)
+            try:
+                self._json(self.controller.local_prompt_profile(
+                    (values.get("model") or [""])[0], (values.get("backend") or [""])[0]))
+            except (ValueError, OSError, json.JSONDecodeError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        if parsed.path == "/api/chat-prompts":
+            values = parse_qs(parsed.query)
+            self._json(self.controller.chat_prompt_profile((values.get("provider") or [""])[0]))
             return
         if parsed.path == "/api/state":
             self._json(
@@ -3586,7 +4129,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                             "reasoning_efforts": list(API_REASONING_EFFORTS),
                             "saved_settings": self.controller.api_settings.public_settings(),
                         },
-                        "models": list(CODEX_MODELS),
+                        "models": list(CODEX_SELECTABLE_MODELS),
                         "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
                         "defaults": {
                             "model": DEFAULT_CODEX_MODEL,
@@ -3659,7 +4202,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.NOT_FOUND, str(error))
             return
         asset = "index.html" if parsed.path == "/" else unquote(parsed.path).removeprefix("/")
-        if asset not in {"index.html", "app.js", "styles.css"}:
+        if asset not in {"index.html", "app.js", "components.js", "styles.css"}:
             self._error(HTTPStatus.NOT_FOUND, "Not found")
             return
         path = self.asset_root / asset
@@ -3696,12 +4239,45 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     else MAX_REQUEST_BYTES
                 )
             )
+            if parsed.path == "/api/components":
+                active = self.controller.active_job()
+                if active and active.get("status") in {"queued", "running", "stopping"}:
+                    raise RuntimeError("请先停止任务，再管理组件")
+                self._json(self.controller.components.start(
+                    payload.get("action"), payload.get("directory", ""), payload.get("model", "")))
+                return
+            if parsed.path == "/api/rsi/start":
+                self._json(self.controller.start_rsi_practice(payload), status=HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/rsi/stop":
+                self._json(self.controller.stop_rsi_practice(payload.get("run_id", "")))
+                return
+            if parsed.path == "/api/rsi/recover":
+                self._json(self.controller.recover_rsi_practice(payload.get("run_id", "")))
+                return
+            if parsed.path == "/api/rsi/review":
+                self._json(self.controller.review_rsi_candidate(payload))
+                return
             if parsed.path == "/api/local-model/service":
                 active = self.controller.active_job()
                 if active and active.get("status") not in {"completed", "failed", "cancelled", "stopped"}:
                     raise RuntimeError("请先停止当前任务，再管理本地模型服务")
                 from trace2task.local_model_service import control_service
                 self._json(control_service(payload.get("action"), payload.get("model"), self.controller.project_root))
+                return
+            if parsed.path == "/api/local-prompts":
+                active = self.controller.active_job()
+                if active and active.get("status") in {"queued", "running", "stopping"}:
+                    raise RuntimeError("请先停止当前任务，再修改本地模型提示词")
+                self._json(self.controller.save_local_prompt_profile(
+                    payload.get("model"), payload.get("backend"), payload.get("profile")))
+                return
+            if parsed.path == "/api/chat-prompts":
+                active = self.controller.active_job()
+                if active and active.get("status") in {"queued", "running", "stopping"}:
+                    raise RuntimeError("请先停止当前任务，再修改执行提示词")
+                self._json(self.controller.save_chat_prompt_profile(
+                    payload.get("provider"), payload.get("guidance", "")))
                 return
             if parsed.path == "/api/cua/windows":
                 import tempfile
@@ -3730,10 +4306,21 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     raise RuntimeError("请先结束当前任务，再使用 D 模型预览")
                 selected = payload.get("model", "D-5970")
                 if selected == "D-5970":
+                    if payload.get("task_path"):
+                        raise ValueError("D-5970 冻结输入结构不支持经验指导")
                     result = predict_local(payload.get("task", ""), image=payload.get("image"))
                 else:
+                    from trace2task.desktop_runner import build_desktop_experience_context
                     from trace2task.local_gui_client import predict_gui
-                    result = predict_gui(payload.get("task", ""), model=selected, image=payload.get("image"))
+                    chosen_task = payload.get("task_path")
+                    experience_context = (build_desktop_experience_context(
+                        self.controller._resolve_task_path(chosen_task), execute=True,
+                    ) if chosen_task else None)
+                    result = predict_gui(payload.get("task", ""), model=selected,
+                                          image=payload.get("image"),
+                                          experience_context=experience_context,
+                                          prompt_profile=self.controller.local_prompt_profile(
+                                              selected, "win32")["effective"])
                 self._json(result)
                 return
             if parsed.path in {"/api/model-settings/save", "/api/model-settings/clear"}:
@@ -3795,9 +4382,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/recordings":
+                if payload.get("recording_backend", "opencua") != "opencua":
+                    raise ValueError("旧本机录制入口已停用，请使用 OpenCUA")
                 result = self.controller.start_recording(
-                    handle=payload.get("handle"),
-                    execution_scope=payload.get("execution_scope", "window"),
+                    recording_backend="opencua",
+                    handle=0,
+                    execution_scope="desktop",
                     task_id=payload.get("task_id", ""),
                     narrated=payload.get("narrated", False),
                     defer_compilation=payload.get("defer_compilation", False),

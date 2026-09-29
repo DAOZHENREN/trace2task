@@ -2,9 +2,10 @@
 
 ## 独立安装版（Windows x64 试用）
 
-安装包位于 `dist/installer/Trace2Task-Setup-0.18.1-win64.exe`。
+安装包位于 `dist/installer/Trace2Task-Setup-0.18.8-win64.exe`。
 运行安装程序可改选 D 盘，不需要管理员权限。程序自带 Python 和应用依赖，
-不需要源码、uv 或系统 Python；使用系统 WebView2 Runtime。
+不需要源码、uv 或系统 Python；安装器检测 WebView2，缺少时从微软联网安装。
+WebView2 安装失败会明确中止，不把缺依赖的安装报告为成功。
 此包尚未签名，Windows 可能提示未知发布者，请核对来源，不要关闭系统安全保护。
 
 首次打开选择一个独立的数据目录，可直接选择 `D:\MyProject\trace2task` 复用旧数据。
@@ -18,7 +19,22 @@
 关闭本项目识别到的 D、Qwen 和 GUI 模型服务以释放显存；不会删除权重或日志。
 
 API 模式仍需用户配置密钥，Codex 模式仍需单独安装登录 Codex CLI，
-Qwen/D 模型及其推理环境是可选外部服务，不包含在安装包内。
+本地组件管理可安装独立 Python 3.11.13 和 CUDA 12.8 / PyTorch 2.7.1 环境，
+并下载固定版本的 Qwen3-VL-2B、GUI-Owl-2B、MAI-UI-2B。
+安装器自带组件管理工具，用户不需要安装 uv、Python 或手工执行命令。
+选择组件目录可将环境、缓存和权重放在 D 盘；建议留 20 GB 给环境及下载缓存，另留模型空间。
+现有 D-5970 私有模型包可校验并导入；其底座、冻结源码和处理器仍需完整提供。
+旧的 llama.cpp 8B 模型路径和 Codex CLI 暂不由此组件管理器安装。
+NVIDIA 驱动仍由系统提供，不自动修改驱动。API 模式无需 GPU 组件。
+
+组件安装为异步任务，支持进度日志、失败提示和取消；实际 GPU 张量运算通过后，
+才原子更新数据目录的 `components.json`。失败或取消不会替换原配置，
+不完整环境与下载缓存保留在所选组件目录供排查，不自动删除用户目录。
+安装期间请先取消再退出；完成后停止旧模型服务并重新启动以使用新配置。
+依赖安装日志位于 `runs/components/install.log`；Python 环境不注册到系统 PATH。
+如果私有 D 模型包中保留了官方 PyTorch 2.7.1 cu128 Windows wheel，组件管理器会先校验
+固定 SHA256 再复用，避免重复下载。也可将这个 wheel 放到所选组件目录的 `wheels/` 中。
+不要直接移动安装好的组件目录：虚拟环境指向同一组件目录内的独立 Python。
 打包不代表已验证所有云服务、录音、WAA 或真实桌面执行场景。
 
 构建：安装项目 desktop/dev 依赖及 `packaging/windows/requirements-build.txt`，

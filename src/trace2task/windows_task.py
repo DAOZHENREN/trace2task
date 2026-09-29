@@ -194,6 +194,13 @@ def load_windows_task(path: Path) -> WindowsTaskContract:
             guidance_mapping.get("path"),
             "human_guidance.path",
         )
+        guidance_document = _mapping(
+            yaml.safe_load(guidance_path.read_text(encoding="utf-8")),
+            "human_guidance document",
+        )
+        graph_revision = guidance_document.get("graph_revision")
+        if graph_revision is not None and graph_revision != semantic_mapping.get("revision", 0):
+            raise ValueError("Human guidance belongs to a different task graph revision")
         stage_ids = set(semantic_experience.state_ids)
         human_guidance = load_human_guidance(
             guidance_path,

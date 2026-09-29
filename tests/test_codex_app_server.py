@@ -173,6 +173,30 @@ def test_session_supports_a_text_only_connectivity_turn(tmp_path: Path) -> None:
     assert session.last_turn_metrics.image_count == 0
 
 
+def test_rsi_role_instructions_and_unconstrained_text_response(tmp_path: Path) -> None:
+    transport = ScriptedTransport([
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+        {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+        completed_turn("turn-1", "official role response"),
+    ])
+    config = {"features.shell_tool": False, "web_search": "disabled"}
+    session = CodexAppServerSession(
+        "codex", model=None, cwd=tmp_path,
+        base_instructions="Official verifier role instructions",
+        thread_config=config, transport_factory=lambda _: transport,
+    )
+    assert session.run_turn(prompt="verify", image_path=None, output_schema=None) == (
+        "official role response"
+    )
+    assert transport.sent[2]["params"]["baseInstructions"] == (
+        "Official verifier role instructions"
+    )
+    assert transport.sent[2]["params"]["config"] == config
+    assert "outputSchema" not in transport.sent[3]["params"]
+    session.close()
+
+
 def test_connectivity_error_detection_checks_exception_chain() -> None:
     try:
         try:

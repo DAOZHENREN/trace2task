@@ -52,8 +52,8 @@ def test_round_audit_preserves_actual_context_and_timings(tmp_path):
         'task',image,[],0,{'windows':[]})
     audit.finish(.5)
     entry = result['model_io'][0]
-    assert captured['cua_context'] == {'windows':[]}
-    assert json.loads(Path(entry['request_path']).read_text())['cua_context'] == {'windows':[]}
+    assert captured['execution_context'] == {'windows':[]}
+    assert json.loads(Path(entry['request_path']).read_text())['execution_context'] == {'windows':[]}
     assert entry['raw_output'] == output['raw_output']
     assert entry['timings']['generate_ms'] == 12
     assert result['performance']['total_elapsed_ms'] == 500

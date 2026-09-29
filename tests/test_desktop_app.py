@@ -8,13 +8,15 @@ from trace2task import desktop_app
 
 
 def test_close_refuses_running_task_even_when_dialog_confirmed():
-    controller = SimpleNamespace(active_job=lambda: {"status": "running"})
+    controller = SimpleNamespace(active_job=lambda: {"status": "running"},
+                                 components=SimpleNamespace(status=lambda: {'status': 'idle'}))
     window = SimpleNamespace(create_confirmation_dialog=lambda *args: True)
     assert desktop_app.can_close(controller, window) is False
 
 
 def test_idle_close_respects_confirmation():
-    controller = SimpleNamespace(active_job=lambda: {"status": "completed"})
+    controller = SimpleNamespace(active_job=lambda: {"status": "completed"},
+                                 components=SimpleNamespace(status=lambda: {'status': 'idle'}))
     for answer in (False, True):
         window = SimpleNamespace(create_confirmation_dialog=lambda *args, answer=answer: answer)
         assert desktop_app.can_close(controller, window) is answer

@@ -38,9 +38,9 @@ GENERALIZATION_VALUES = {"demonstrated_only", "runtime_agent_decides", "unknown"
 COMPLETION_MODES = {"state", "cycle"}
 NARRATION_CLAIM_TYPES = {"goal", "strategy", "observation", "recovery", "example_only"}
 NARRATION_CLAIM_VERDICTS = {"supported", "advisory", "rejected"}
-DEFAULT_COMPILER_MODEL = "gpt-5.6-sol"
+DEFAULT_COMPILER_MODEL = "gpt-6-sol"
 DEFAULT_COMPILER_REASONING_EFFORT = "high"
-COMPILER_PREFLIGHT_MODEL = "gpt-5.6-luna"
+COMPILER_PREFLIGHT_MODEL = "gpt-6-luna"
 COMPILER_PREFLIGHT_TIMEOUT_SECONDS = 45
 COMPILER_RESPONSE_IDLE_TIMEOUT_SECONDS = 90
 COMPILER_HARD_TIMEOUT_SECONDS = 600
@@ -1917,15 +1917,21 @@ def _prompt(
 
 def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     task_root = task_path.parent.resolve()
-    experience_path = task_root / "experience.yaml"
-    temporary = task_root / "experience.yaml.tmp"
+    task_data = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
+    previous_guidance = task_data.get("human_guidance")
+    # Never rewrite the graph file currently referenced by task.yaml.
+    experience_name = (
+        f"experience-compiler-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S-%f')}.yaml"
+        if task_data.get("semantic_experience") else "experience.yaml"
+    )
+    experience_path = task_root / experience_name
+    temporary = task_root / f"{experience_name}.tmp"
     temporary.write_text(
         yaml.safe_dump(dict(document), sort_keys=False, allow_unicode=True, width=100),
         encoding="utf-8",
     )
     temporary.replace(experience_path)
 
-    task_data = _mapping(yaml.safe_load(task_path.read_text(encoding="utf-8")), "task")
     task_data["instruction"] = document["canonical_instruction"]
     completion = _mapping(document.get("completion"), "experience completion")
     verifier = _mapping(task_data.get("verifier"), "task.verifier")
@@ -1936,7 +1942,7 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
         "reason": completion["reason"],
     }
     task_data["semantic_experience"] = {
-        "path": "experience.yaml",
+        "path": experience_name,
         "stage_count": len(document["stages"]),
         "state_count": len(document["state_graph"]["states"]),
         "transition_count": len(document["state_graph"]["transitions"]),
@@ -1944,50 +1950,10 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
         "revision": 0,
         "source": "human_trace",
     }
-    previous_guidance = task_data.get("human_guidance")
-    guidance_compatible = False
-    if isinstance(previous_guidance, dict):
-        guidance_relative = previous_guidance.get("path")
-        guidance_path = (
-            (task_root / guidance_relative).resolve()
-            if isinstance(guidance_relative, str) and guidance_relative
-            else None
-        )
-        if (
-            guidance_path is not None
-            and guidance_path.is_relative_to(task_root)
-            and guidance_path.is_file()
-        ):
-            guidance_data = yaml.safe_load(guidance_path.read_text(encoding="utf-8"))
-            raw_rules = guidance_data.get("rules", []) if isinstance(guidance_data, dict) else []
-            graph = document["state_graph"]
-            scope_ids = {
-                "state": {str(state["id"]) for state in graph["states"]},
-                "transition": {
-                    str(transition["id"]) for transition in graph["transitions"]
-                },
-                "terminal": {str(terminal["id"]) for terminal in graph["terminals"]},
-            }
-            guidance_compatible = True
-            for rule in raw_rules:
-                if not isinstance(rule, dict):
-                    guidance_compatible = False
-                    break
-                raw_scope = rule.get("scope")
-                if isinstance(raw_scope, dict):
-                    scope_type = str(raw_scope.get("type") or "")
-                    scope_id = str(raw_scope.get("id") or "")
-                else:
-                    legacy_stage = str(rule.get("stage_id") or "")
-                    scope_type = "global" if legacy_stage == "global" else "state"
-                    scope_id = "global" if legacy_stage == "global" else legacy_stage
-                if scope_type == "global" and scope_id == "global":
-                    continue
-                if scope_id not in scope_ids.get(scope_type, set()):
-                    guidance_compatible = False
-                    break
-    if previous_guidance is not None and not guidance_compatible:
-        task_data.pop("human_guidance", None)
+    # A new compilation is a new task model. Old rules remain archived on disk,
+    # but even matching state IDs do not prove their meaning is unchanged.
+    task_data.pop("human_guidance", None)
+    task_data.pop("guidance_review_pending", None)
     review = _mapping(task_data.get("review"), "task.review")
     review["status"] = "draft"
     review["requires_confirmation"] = True
@@ -2005,15 +1971,16 @@ def _attach_experience(task_path: Path, document: Mapping[str, Any]) -> Path:
     )
     if (
         previous_guidance is not None
-        and not guidance_compatible
         and isinstance(checklist, list)
         and guidance_check not in checklist
     ):
         checklist.append(guidance_check)
-    task_path.write_text(
+    task_temporary = task_path.with_name("task.yaml.tmp")
+    task_temporary.write_text(
         yaml.safe_dump(task_data, sort_keys=False, allow_unicode=True, width=100),
         encoding="utf-8",
     )
+    task_temporary.replace(task_path)
     return experience_path
 
 

@@ -87,16 +87,17 @@ def control_service(action, model, data_root):
         if action == 'start':
             root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[2]))
             logs = Path(data_root) / 'runs/local-gui'
-            bundle = Path(os.environ.get('TRACE2TASK_D_BUNDLE', 'D:/Models/Trace2Task-D-5970'))
-            python = Path(os.environ.get('TRACE2TASK_GUI_PYTHON', str(bundle / '.venv/Scripts/python.exe')))
+            from trace2task.components import gui_paths, trained_paths
+            trained_python, bundle = trained_paths(data_root)
+            python, models = gui_paths(data_root)
             required = []
             if model in MODELS:
                 token = logs / 'service.token'
-                args = [str(python), str(root / 'scripts/local_gui/server.py'), '--output', str(logs), '--token-file', str(token)]
-                required = [python, Path(args[1]), Path('D:/Models/Trace2Task-GUI') / model]
+                args = [str(python), str(root / 'scripts/local_gui/server.py'), '--output', str(logs), '--token-file', str(token), '--root', str(models)]
+                required = [python, Path(args[1]), models / model]
                 port = 8768
             elif model == 'trained_d':
-                args = [str(bundle / '.venv/Scripts/python.exe'), str(root / 'scripts/trained_model/preview.py'),
+                args = [str(trained_python), str(root / 'scripts/trained_model/preview.py'),
                         '--bundle', str(bundle), '--output', str(Path(data_root) / 'runs/trained-model-preview'), '--serve']
                 required = [Path(args[0]), Path(args[1]), bundle / 'frozen-launch.json',
                             bundle / 'step-00005970.pt', bundle / 'weights', bundle / 'processor']

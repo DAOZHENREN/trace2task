@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from PIL import Image
 
 from trace2task import __version__
 from trace2task.actions import ActionCall, runtime_text_placeholder
@@ -410,6 +411,8 @@ def _compile_mouse(intervals: list[_InputInterval]) -> list[_TimedAction]:
 
 def _classify_messaging_keyboard(
     intervals: list[_InputInterval],
+    *,
+    text_press_limit_ms: int | None = None,
 ) -> tuple[list[_InputInterval], list[_InputInterval], list[_InputInterval]]:
     command_modifiers = [
         item for item in intervals if item.name in COMMAND_MODIFIER_KEYS
@@ -418,6 +421,7 @@ def _classify_messaging_keyboard(
         item
         for item in intervals
         if item.name in MESSAGING_TEXT_KEYS
+        and (text_press_limit_ms is None or _duration(item) <= text_press_limit_ms)
         and not any(_overlap(item, modifier) for modifier in command_modifiers)
     ]
     text_ids = {id(item) for item in text_intervals}
@@ -571,12 +575,13 @@ def _compile_actions(
     raw_events: list[_RawInputEvent],
     *,
     capability_profile: str | None = None,
+    text_press_limit_ms: int | None = None,
 ) -> tuple[list[_TimedAction], list[_RawInputEvent]]:
     key_intervals, mouse_intervals, ignored_releases = _pair_input_intervals(raw_events)
     mouse_actions = _compile_mouse(mouse_intervals)
     if capability_profile in TEXT_ENTRY_CAPABILITY_PROFILES:
         text_intervals, text_shifts, control_intervals = _classify_messaging_keyboard(
-            key_intervals
+            key_intervals, text_press_limit_ms=text_press_limit_ms
         )
         _reject_unsupported_concurrency(
             key_intervals,
@@ -639,11 +644,12 @@ def compile_windows_trace(
     """Compile one successful Windows demonstration into deterministic motor skills."""
 
     frame_paths, raw_events = _validate_windows_trace(source_trace, metadata, events)
-    initial_window = metadata.get("initial_window")
+    initial_window = metadata.get("initial_window", {})
     if not isinstance(initial_window, dict):
         raise TypeError("Windows trace metadata has no initial_window object")
     process_hint = initial_window.get("process_name")
     capability_profile = metadata.get("capability_profile")
+    text_press_limit_ms = None
     if (
         capability_profile is None
         and isinstance(process_hint, str)
@@ -655,18 +661,25 @@ def compile_windows_trace(
         or isinstance(metadata.get("waa_task_id"), str)
     ):
         capability_profile = "text_entry"
-    if capability_profile is None and metadata.get("execution_scope") == "desktop":
+    if capability_profile is None and (
+        metadata.get("execution_scope") == "desktop" or not initial_window
+    ):
         key_intervals, _, _ = _pair_input_intervals(raw_events)
-        text_intervals, _, _ = _classify_messaging_keyboard(key_intervals)
-        if text_intervals and all(
-            _duration(interval) <= DESKTOP_TEXT_PRESS_LIMIT_MS for interval in text_intervals
-        ):
+        # A long press elsewhere must not disable short text rollover handling.
+        # Only short printable intervals are inferred as text; long holds remain
+        # controls and still undergo the strict concurrency checks.
+        text_press_limit_ms = DESKTOP_TEXT_PRESS_LIMIT_MS
+        text_intervals, _, _ = _classify_messaging_keyboard(
+            key_intervals, text_press_limit_ms=text_press_limit_ms
+        )
+        if text_intervals:
             capability_profile = "text_entry"
     if capability_profile not in {None, *TEXT_ENTRY_CAPABILITY_PROFILES}:
         raise ValueError(f"Unsupported Windows capability profile: {capability_profile!r}")
     inferred, ignored_releases = _compile_actions(
         raw_events,
         capability_profile=capability_profile,
+        text_press_limit_ms=text_press_limit_ms,
     )
     if not inferred:
         raise ValueError("Windows trace did not produce any supported motor actions")
@@ -674,14 +687,17 @@ def compile_windows_trace(
     if not task_id:
         raise ValueError("Compiled Windows task id must not be empty")
     success_hotkey = str(metadata.get("success_hotkey") or "f8").upper()
-    process_name = initial_window.get("process_name")
-    title = initial_window.get("title")
-    if not isinstance(process_name, str) or not process_name:
+    process_name = initial_window.get("process_name", "")
+    title = initial_window.get("title", "")
+    if initial_window and (not isinstance(process_name, str) or not process_name):
         raise ValueError("Windows trace has no target process name")
-    if not isinstance(title, str) or not title:
+    if initial_window and (not isinstance(title, str) or not title):
         raise ValueError("Windows trace has no target window title")
     width = initial_window.get("client_width")
     height = initial_window.get("client_height")
+    if not initial_window:
+        with Image.open(frame_paths[0]) as image:
+            width, height = image.size
     if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
         raise ValueError("Windows trace initial client dimensions are invalid")
 
@@ -700,8 +716,8 @@ def compile_windows_trace(
             "inference": "target_was_foreground_when_recording_started",
         },
     }
-    demonstration = [focus_action]
-    for index, action in enumerate(inferred, start=1):
+    demonstration = [focus_action] if initial_window else []
+    for index, action in enumerate(inferred, start=len(demonstration)):
         demonstration.append(
             {
                 "index": index,
@@ -818,6 +834,10 @@ def compile_windows_trace(
             ],
         },
     }
+    if not initial_window:
+        # New recordings contain image/input evidence, never a recorded target binding.
+        task_data["environment"]["target"] = {}
+        task_data["review"]["checklist"][3] = "Select authorized execution targets at runtime."
     task_path = output_dir / "task.yaml"
     task_path.write_text(
         yaml.safe_dump(task_data, sort_keys=False, allow_unicode=True, width=100),

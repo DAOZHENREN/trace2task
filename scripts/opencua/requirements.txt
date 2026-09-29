@@ -1,0 +1,24 @@
+# Windows Python 3.12; isolated optional recording runtime.
+pynput==1.7.7
+obsws-python==1.7.0
+PyQt6==6.7.1
+screeninfo==0.8.1
+numpy==2.1.0
+opencv-python==4.10.0.84
+# Match decoded presentation timestamps to the OBS timing sidecar.
+av==16.0.1
+psutil==6.0.0
+pywin32==306
+uiautomation==2.0.20
+pytz==2024.1
+cryptography==43.0.3
+loguru==0.7.2
+pyautogui==0.9.54
+mss==9.0.1
+pillow==10.4.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
+WMI==1.5.1
+# Imported by the official Reducer; its remote AI routines are not invoked.
+requests==2.32.3
+Flask==3.0.3

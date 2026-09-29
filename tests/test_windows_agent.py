@@ -744,6 +744,8 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert calls[0]["reference_paths"] == (contract.reference_frame,)
     assert calls[1]["reference_paths"] == ()
     assert "Continue the current semantic stage" in calls[1]["prompt"]
+    assert "delivered_effect_unverified" in calls[1]["prompt"]
+    assert ": applied" not in calls[1]["prompt"]
     assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
     assert calls[0]["schema"]["properties"]["actions"]["items"]["anyOf"]
     assert "Image 1" in calls[0]["prompt"] and "Image 2" in calls[0]["prompt"]
@@ -754,6 +756,8 @@ def test_codex_windows_agent_uses_current_and_reference_with_strict_actions(
     assert sessions[0].model == "gpt-5.6-sol"
     assert sessions[0].reasoning_effort == "high"
     assert sessions[0].timeout_seconds == WINDOWS_DECISION_TIMEOUT_SECONDS
+    agent.observe_transition(plan.actions[0], False)
+    assert agent._history[-1].endswith("interrupted_or_unknown")
     agent.close()
     assert sessions[0].closed
 
@@ -1026,7 +1030,7 @@ def test_codex_windows_agent_repairs_empty_stage_boundary_in_same_session(
     assert "coding-agent test failure" in calls[2]["prompt"]
     assert "System multi-action planning policy" in calls[2]["prompt"]
     assert "No action from that invalid decision was executed" in calls[2]["prompt"]
-    assert "Do not repeat an already applied interaction" in calls[2]["prompt"]
+    assert "Do not repeat a delivered interaction" in calls[2]["prompt"]
     assert "cooling-down or disabled control" in calls[2]["prompt"]
     assert "Candidate recovery stage: complete_target" in calls[2]["prompt"]
     assert "Complete the visible target" in calls[2]["prompt"]
@@ -1498,7 +1502,7 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     assert backend.events == []
     assert agent.closed
     assert result.input_mode == "foreground"
-    assert result.model == "gpt-5.6-terra"
+    assert result.model == "gpt-6-sol"
     assert result.reasoning_effort == "low"
     assert result.planning_ms >= 0
 
@@ -1608,7 +1612,12 @@ def test_confirmed_windows_agent_executes_guarded_action_then_verifies(
         for status in statuses
     )
     assert any("Received in" in status for status in statuses)
-    assert any("click 完成" in status and "ms" in status for status in statuses)
+    assert any("click 已送达，效果待观察" in status and "ms" in status for status in statuses)
+    trace_events = [json.loads(line) for line in Path(result.trace_path).read_text(encoding="utf-8").splitlines()]
+    delivery = next(event["details"]["motor_result"] for event in trace_events
+                    if event["type"] == "windows_action")
+    assert delivery["effect"] == "unverifiable"
+    assert delivery["receipt"]["delivery"]["mode"] == "foreground"
 
 
 def test_pixel_reference_verifier_owns_the_final_success_decision(tmp_path: Path) -> None:

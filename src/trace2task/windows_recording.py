@@ -7,7 +7,7 @@ import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -383,7 +383,6 @@ class WindowRecorder:
                 "start",
                 self.capture.capture(initial_window),
                 details={
-                    "window": asdict(initial_window),
                     "capture": "primary_desktop" if self.execution_scope == "desktop" else "target_client_area",
                     "execution_scope": self.execution_scope,
                     "coordinate_space": "physical_pixels",
@@ -420,7 +419,7 @@ class WindowRecorder:
                         writer.record(
                             "success_marker",
                             self.capture.capture(window),
-                            details={"window": asdict(window), "control_hotkey": success_key},
+                            details={"control_hotkey": success_key},
                         )
                         success = True
                         stop_reason = "success_marked"
@@ -449,11 +448,6 @@ class WindowRecorder:
                     writer.record(
                         "window_changed",
                         self.capture.capture(window),
-                        details={
-                            "window": asdict(window),
-                            "previous_geometry": list(previous_geometry),
-                            "current_geometry": list(geometry),
-                        },
                     )
                     previous_geometry = geometry
                     previous_handle = window.handle
@@ -469,7 +463,7 @@ class WindowRecorder:
                         writer.record(
                             "windows_input",
                             self.capture.capture(window),
-                            details={"raw_input": raw_input, "window": asdict(window)},
+                            details={"raw_input": raw_input},
                         )
                         input_events += 1
                 previous = snapshot
@@ -489,8 +483,6 @@ class WindowRecorder:
                 "input_event_count": input_events,
                 "focus_losses": focus_losses,
                 "stop_reason": stop_reason,
-                "window_selector": asdict(self.session.selector),
-                "initial_window": asdict(initial_window),
                 "capture_method": "primary_desktop" if self.execution_scope == "desktop" else "target_client_area",
                 "execution_scope": self.execution_scope,
                 "input_sampling": (

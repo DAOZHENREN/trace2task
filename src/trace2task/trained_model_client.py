@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from trace2task.execution_protocol import ActionPlan
 from trace2task.local_process import stop_started_process
 
 _lock = threading.Lock()
@@ -43,8 +44,8 @@ def predict_local(task: str, *, image: str | None = None, history=None, step_ind
         except OSError:
             root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
             data_root = Path(os.environ.get("TRACE2TASK_DATA_ROOT", str(root)))
-            bundle = Path(os.environ.get("TRACE2TASK_D_BUNDLE", "D:/Models/Trace2Task-D-5970"))
-            python = bundle / ".venv/Scripts/python.exe"
+            from trace2task.components import trained_paths
+            python, bundle = trained_paths(data_root)
             if not python.is_file():
                 raise RuntimeError("未找到 D 模型环境；请设置 TRACE2TASK_D_BUNDLE") from None
             logs = data_root / "runs/trained-model-preview"
@@ -99,7 +100,10 @@ def predict_local(task: str, *, image: str | None = None, history=None, step_ind
         })
         try:
             with opener.open(request, timeout=180) as response:
-                return json.load(response)
+                output = json.load(response)
+                if output.get('status') == 'predicted' and 'prediction' in output:
+                    output['prediction'] = ActionPlan.from_prediction(output['prediction']).to_payload()
+                return output
         except (URLError, TimeoutError, OSError) as error:
             raise RuntimeError("D 模型预测未返回；没有执行任何操作，请查看本地服务日志") from error
     finally:

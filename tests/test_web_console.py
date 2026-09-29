@@ -34,6 +34,39 @@ def _csrf_headers(opener: Any, base: str) -> dict[str, str]:
     return {"Origin": base, "X-Trace2Task-CSRF": match.group(1)}
 
 
+def test_chat_prompt_profiles_persist_separately_and_validate_size(tmp_path):
+    controller = WebConsoleController(tmp_path)
+    assert controller.chat_prompt_profile("codex")["guidance"] == ""
+    assert controller.save_chat_prompt_profile("codex", "Use the current screenshot.")["customized"]
+    assert controller.save_chat_prompt_profile("api", "Check the task result.")["guidance"] == "Check the task result."
+    reopened = WebConsoleController(tmp_path)
+    assert reopened.chat_prompt_profile("codex")["guidance"] == "Use the current screenshot."
+    assert reopened.chat_prompt_profile("api")["guidance"] == "Check the task result."
+    with pytest.raises(ValueError, match="4000"):
+        reopened.save_chat_prompt_profile("api", "x" * 4_001)
+    assert reopened.save_chat_prompt_profile("codex", "")["guidance"] == ""
+
+
+def test_chat_prompt_http_round_trip(tmp_path):
+    server = create_web_server(tmp_path, port=0, controller=WebConsoleController(tmp_path))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    opener = build_opener(ProxyHandler({}))
+    try:
+        headers = {"Content-Type": "application/json", **_csrf_headers(opener, base)}
+        request = Request(base + "/api/chat-prompts", data=json.dumps({
+            "provider": "api", "guidance": "Inspect the visible result.",
+        }).encode(), headers=headers)
+        with opener.open(request) as response:
+            assert json.loads(response.read())["guidance"] == "Inspect the visible result."
+        with opener.open(base + "/api/chat-prompts?provider=api") as response:
+            assert json.loads(response.read())["customized"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypatch):
     controller = WebConsoleController(tmp_path)
     calls = []
@@ -91,6 +124,85 @@ def test_desktop_experience_uses_shared_worker_and_manual_task(tmp_path, monkeyp
     assert calls[0]["use_experience"] is True
 
 
+def test_local_gui_model_receives_selected_experience_without_changing_executor(tmp_path, monkeypatch):
+    from trace2task import trained_model_runner
+
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    calls = []
+    monkeypatch.setattr(trained_model_runner, "run_trained_desktop", lambda **kwargs: (
+        calls.append(kwargs) or {"stop_reason": "completion_unverifiable", "task_complete": False}
+    ))
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(
+        task_path=str(task), instruction="finish the task", execute=True,
+        provider="trained_d", model="gui-owl-2b", execution_scope="desktop",
+        use_experience=True, continuous=True, executor_backend="win32",
+    )
+    completed = controller.wait(job["job_id"])
+
+    assert completed["status"] == "stopped"
+    assert calls[0]["executor_backend"] == "win32"
+    assert calls[0]["experience_context"]["task_id"] == job["task_id"]
+    assert "state_graph" in calls[0]["experience_context"]["semantic"]
+    assert calls[0]["experience_context"]["human_guidance"] is not None
+
+
+def test_frozen_d_model_rejects_experience_without_silent_task_prompt_merging(tmp_path):
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match="冻结输入结构不支持经验指导"):
+        controller.start_job(
+            task_path="", instruction="test", execute=True, provider="trained_d",
+            model="D-5970", execution_scope="desktop", use_experience=True,
+        )
+
+
+def test_local_gui_preview_uses_selected_experience(tmp_path, monkeypatch):
+    from urllib.error import HTTPError
+
+    from trace2task import local_gui_client, local_model_service
+
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    calls = []
+    monkeypatch.setattr(local_model_service, "service_busy", lambda: False)
+    monkeypatch.setattr(local_gui_client, "predict_gui", lambda *args, **kwargs: (
+        calls.append(kwargs) or {"status": "predicted", "prediction": {"actions": []}}
+    ))
+    server = create_web_server(tmp_path, port=0, controller=WebConsoleController(tmp_path))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    opener = build_opener(ProxyHandler({}))
+    try:
+        headers = {"Content-Type": "application/json", **_csrf_headers(opener, base)}
+        request = Request(base + "/api/trained-model/predict", data=json.dumps({
+            "task": "test", "model": "gui-owl-2b",
+            "task_path": task.relative_to(tmp_path).as_posix(),
+        }).encode(), headers=headers)
+        with opener.open(request) as response:
+            assert json.loads(response.read())["status"] == "predicted"
+        assert calls[0]["experience_context"]["task_id"] == "wechat-example"
+        rejected = Request(base + "/api/trained-model/predict", data=json.dumps({
+            "task": "test", "model": "D-5970",
+            "task_path": task.relative_to(tmp_path).as_posix(),
+        }).encode(), headers=headers)
+        with pytest.raises(HTTPError) as error:
+            opener.open(rejected)
+        assert error.value.code == 400
+        error.value.close()
+        draft = yaml.safe_load(task.read_text(encoding="utf-8"))
+        draft["review"] = {"status": "draft", "requires_confirmation": True}
+        task.write_text(yaml.safe_dump(draft), encoding="utf-8")
+        with pytest.raises(HTTPError) as error:
+            opener.open(request)
+        assert error.value.code == 400
+        error.value.close()
+        assert len(calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_desktop_recording_does_not_require_window_selection(tmp_path, monkeypatch):
     controller = WebConsoleController(tmp_path)
     calls = []
@@ -118,7 +230,7 @@ def test_desktop_task_rejected_by_window_entry(tmp_path):
     ("emergency_stop", "stopped"), ("action_limit", "failed"),
 ])
 def test_shared_web_worker_handles_desktop_results(tmp_path, monkeypatch, reason, expected):
-    from trace2task import desktop_runner
+    from trace2task import chat_agent_runner
 
     calls = []
 
@@ -128,7 +240,7 @@ def test_shared_web_worker_handles_desktop_results(tmp_path, monkeypatch, reason
                 "task_complete": reason == "model_reported_complete", "verified": False,
                 "performance": {"model_roundtrip_ms": 123}}
 
-    monkeypatch.setattr(desktop_runner, "run_desktop_baseline", runner)
+    monkeypatch.setattr(chat_agent_runner, "run_chat_agent", runner)
     controller = WebConsoleController(tmp_path)
     monkeypatch.setattr(controller, "_save_candidate", lambda *args: pytest.fail("no experience"))
     job = controller.start_job(task_path="", instruction="test", execute=True,
@@ -141,8 +253,84 @@ def test_shared_web_worker_handles_desktop_results(tmp_path, monkeypatch, reason
     assert calls[0]["emergency_stop"].stop_event is controller._jobs[job["job_id"]].stop_event
 
 
+@pytest.mark.parametrize("provider", ("codex", "api"))
+def test_chat_cua_desktop_reaches_shared_runner_with_live_rounds(tmp_path, monkeypatch, provider):
+    from trace2task import chat_agent_runner
+
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        kwargs["on_model_round"]({"step_index": 0, "status": "completed",
+                                   "input": {"messages": [{"role": "user", "content": "test"}]},
+                                   "raw_output": '{"actions":[]}'})
+        return {"stop_reason": "visual_completion_reviewed", "task_complete": True,
+                "verified": False, "model_io": [{"step_index": 0, "status": "completed"}]}
+
+    monkeypatch.setattr(chat_agent_runner, "run_chat_agent", runner)
+    controller = WebConsoleController(tmp_path)
+    provider_kwargs = ({"provider": "api", "model": "local-vision", "reasoning_effort": "default",
+                        "api_options": {"base_url": "http://127.0.0.1:8081/v1", "api_key": "test-key"}}
+                       if provider == "api" else {})
+    job = controller.start_job(task_path="", instruction="test", execute=True,
+                               execution_scope="desktop", use_experience=False,
+                               executor_backend="cua", cua_target={"pid": 10, "window_id": 20},
+                               **provider_kwargs)
+    result = controller.wait(job["job_id"])
+    assert result["status"] == "completed"
+    assert result["operation_scope"] == "selected_windows"
+    assert result["input_mode"] == "background_preferred"
+    assert result["model_io"][0]["input"]["messages"][0]["content"] == "test"
+    assert calls[0]["executor_backend"] == "cua"
+    assert (calls[0]["api_config"] is not None) == (provider == "api")
+    assert calls[0]["cua_target"] == {"targets": [{"pid": 10, "window_id": 20}], "initial_index": 0}
+    assert result["result"]["model_io"][0]["status"] == "completed"
+
+
+def test_chat_cua_window_experience_is_not_silently_downgraded(tmp_path):
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match="只支持独立任务执行"):
+        controller.start_job(task_path="", instruction="test", execute=True,
+                             execution_scope="window", use_experience=False,
+                             executor_backend="cua", cua_target={"pid": 10, "window_id": 20})
+
+
+def test_experienced_desktop_keeps_cycle_aware_legacy_runner(tmp_path, monkeypatch):
+    from trace2task import chat_agent_runner, desktop_runner
+
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    calls = []
+    monkeypatch.setattr(chat_agent_runner, "run_chat_agent",
+                        lambda **kwargs: pytest.fail("experience lost its legacy completion policy"))
+    monkeypatch.setattr(desktop_runner, "run_desktop_baseline",
+                        lambda **kwargs: (calls.append(kwargs) or {
+                            "stop_reason": "model_reported_complete", "task_complete": True}))
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(task_path=str(task), instruction="do it", execute=True,
+                               execution_scope="desktop", use_experience=True)
+    assert controller.wait(job["job_id"])["status"] == "completed"
+    assert calls[0]["use_experience"] is True
+    cua_calls = []
+    monkeypatch.setattr(chat_agent_runner, "run_chat_agent",
+                        lambda **kwargs: (cua_calls.append(kwargs) or {
+                            "stop_reason": "visual_completion_reviewed", "task_complete": True}))
+    cua_job = controller.start_job(task_path=str(task), instruction="do it", execute=True,
+                                   execution_scope="desktop", use_experience=True,
+                                   executor_backend="cua", cua_target={"pid": 10, "window_id": 20})
+    assert controller.wait(cua_job["job_id"])["status"] == "completed"
+    assert cua_calls[0]["use_experience"] is True
+    assert cua_calls[0]["task_path"] == task
+
+
+@pytest.mark.parametrize('reason, expected, note', [
+    ('effect_unverifiable', 'stopped', '效果无法确认；任务已停止'),
+    ('completion_unverifiable', 'stopped', '完成证据不足'),
+    ('completion_rejected', 'stopped', '任务未完成'),
+    ('no_progress', 'stopped', '重复操作无进展'),
+    ('visual_completion_reviewed', 'completed', '尚未经独立应用验证'),
+])
 def test_trained_model_effect_unverifiable_stops_without_completion_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason, expected, note,
 ) -> None:
     from trace2task import trained_model_runner
 
@@ -150,7 +338,7 @@ def test_trained_model_effect_unverifiable_stops_without_completion_claim(
         trained_model_runner,
         "run_trained_desktop",
         lambda **kwargs: {
-            "stop_reason": "effect_unverifiable",
+            "stop_reason": reason,
             "task_complete": False,
             "executed_actions": 1,
         },
@@ -169,11 +357,43 @@ def test_trained_model_effect_unverifiable_stops_without_completion_claim(
     )
     completed = controller.wait(job["job_id"])
 
+    assert completed["status"] == expected
+    assert completed["result"]["task_complete"] is False
+    assert completed["result"]["stop_reason"] == reason
+    assert note in completed["logs"][-1]
+
+
+def test_cua_focus_denial_is_stopped_and_reports_no_global_input(tmp_path, monkeypatch):
+    from trace2task import trained_model_runner
+
+    monkeypatch.setattr(
+        trained_model_runner,
+        "run_trained_desktop",
+        lambda **kwargs: {
+            "stop_reason": "foreground_unavailable",
+            "task_complete": False,
+            "executed_actions": 0,
+        },
+    )
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(
+        task_path="",
+        instruction="在测试页输入文本",
+        execute=True,
+        provider="trained_d",
+        model="gui-owl-2b",
+        executor_backend="cua",
+        cua_target={"pid": 10, "window_id": 20},
+        execution_scope="desktop",
+        use_experience=False,
+        continuous=True,
+    )
+    completed = controller.wait(job["job_id"])
+
     assert completed["status"] == "stopped"
     assert completed["result"]["task_complete"] is False
-    assert completed["result"]["stop_reason"] == "effect_unverifiable"
-    assert "效果无法确认；任务已停止" in completed["logs"][-1]
-    assert "完成声明" not in completed["logs"][-1]
+    assert completed["result"]["stop_reason"] == "foreground_unavailable"
+    assert "未发送全局输入" in completed["logs"][-1]
 
 
 @pytest.fixture(autouse=True)
@@ -620,8 +840,10 @@ def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Pa
                 ],
             },
         )
-        with opener.open(localhost_request, timeout=5) as response:
-            assert json.loads(response.read())["task_id"] == "wechat-example"
+        with pytest.raises(HTTPError) as error:
+            opener.open(localhost_request, timeout=5)
+        assert error.value.code == 400
+        error.value.close()
         request = Request(base + "/api/jobs", data=body, headers={
             "Content-Type": "application/json", **_csrf_headers(opener, base),
         })
@@ -796,7 +1018,7 @@ def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path
     assert calls[0][1]["reasoning_effort"] == "high"
 
 
-def test_web_controller_can_auto_select_a_trace_from_one_instruction(tmp_path: Path) -> None:
+def test_web_controller_requires_explicit_experience_selection(tmp_path: Path) -> None:
     task_path = _write_windows_task(tmp_path)
     calls: list[Path] = []
 
@@ -805,23 +1027,17 @@ def test_web_controller_can_auto_select_a_trace_from_one_instruction(tmp_path: P
         return FakeResult()
 
     controller = WebConsoleController(tmp_path, runner=runner)
-    route = controller.route_instruction("给文件传输助手发消息：自动路由测试")
-    job = controller.start_job(
-        task_path="",
-        instruction="给文件传输助手发消息：自动路由测试",
-        execute=False,
-    )
-    completed = controller.wait(job["job_id"])
-
-    assert route["task_id"] == "wechat-example"
-    assert route["confidence"] >= 0.8
-    assert completed["selection_mode"] == "auto"
-    assert completed["selection_confidence"] == route["confidence"]
-    assert calls == [task_path]
-    assert completed["logs"][0].startswith("自动选择经验：wechat-example")
-
-    with pytest.raises(ValueError, match="足够匹配"):
+    with pytest.raises(ValueError, match="手动选择"):
         controller.route_instruction("整理桌面财务表格")
+    with pytest.raises(ValueError, match="手动选择"):
+        controller.start_job(task_path="", instruction="给文件传输助手发消息", execute=False)
+    assert not calls
+    job = controller.start_job(
+        task_path=task_path.relative_to(tmp_path).as_posix(),
+        instruction="给文件传输助手发消息", execute=False,
+    )
+    assert controller.wait(job["job_id"])["selection_mode"] == "manual"
+    assert calls == [task_path]
 
 
 def test_web_controller_forwards_background_and_adaptive_execution_settings(
@@ -1077,7 +1293,7 @@ def test_web_revision_job_uses_separate_revision_agent_defaults(
 
     assert completed["status"] == "completed"
     assert completed["kind"] == "revision"
-    assert completed["model"] == "gpt-5.6-sol"
+    assert completed["model"] == "gpt-6-sol"
     assert completed["reasoning_effort"] == "high"
     assert calls[0]["feedback"] == "发送后不要立即重新规划，先等待消息出现。"
 
@@ -1129,6 +1345,8 @@ def test_web_controller_lists_recordings_and_upgrades_then_confirms_taskpack(
         {
             "task_id": "wechat-send-example",
             "success": True,
+            "recording_backend": "legacy",
+            "compilation_supported": True,
             "stop_reason": "success_key",
             "input_events": 7,
             "execution_scope": "window",
@@ -2228,8 +2446,8 @@ def test_waa_narration_pair_preserves_trace_and_compiler_variants(
     assert semantic_calls == [(compiled_path, False), (narrated_path, True)]
     assert compiled_trace.read_bytes() == narrated_trace.read_bytes() == trace_path.read_bytes()
     assert compiled_task["id"] != narrated_task["id"]
-    assert compiled_task["experience"]["family_id"] == result["family_id"]
-    assert narrated_task["experience"]["family_id"] == result["family_id"]
+    assert "family_id" not in compiled_task.get("experience", {})
+    assert "family_id" not in narrated_task.get("experience", {})
     for variant in ("compiled", "narrated_compiled"):
         snapshot = result["variants"][variant]["automatic_snapshot"]
         snapshot_task = Path(snapshot["task_path"])
@@ -2423,7 +2641,7 @@ def test_web_compilation_job_gives_immediate_feedback_and_rejects_duplicates(
         status_callback: object,
     ) -> dict[str, object]:
         assert source == trace_path
-        assert model == "gpt-5.6-sol"
+        assert model == "gpt-6-sol"
         assert reasoning_effort == "high"
         assert callable(status_callback)
         status_callback("Compiler Agent 正在分析。")
@@ -2699,6 +2917,7 @@ def test_web_server_serves_console_state_and_job_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from urllib.error import HTTPError
     _write_windows_task(tmp_path, semantic=True)
     controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
     summary_updates: list[tuple[str, str]] = []
@@ -2744,8 +2963,10 @@ def test_web_server_serves_console_state_and_job_api(
             headers={"Content-Type": "application/json", **csrf_headers},
             method="POST",
         )
-        with opener.open(route_request, timeout=5) as response:
-            route = json.loads(response.read())
+        with pytest.raises(HTTPError) as error:
+            opener.open(route_request, timeout=5)
+        assert error.value.code == 400
+        error.value.close()
         payload = json.dumps(
             {
                 "task_path": state["taskpacks"][0]["path"],
@@ -2849,26 +3070,78 @@ def test_web_server_serves_console_state_and_job_api(
     assert waa_tasks["tasks"] == [
         {"id": "waa-task", "example_path": "example.json"}
     ]
-    assert route["task_id"] == "wechat-example"
     assert summary_result["summary"] == "人工微调后的摘要"
     assert summary_updates == [("runs/candidates/example", "人工微调后的摘要")]
     assert state["agent_options"]["models"] == [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
+        "gpt-6-sol",
+        "gpt-6-luna",
     ]
     assert state["agent_options"]["defaults"] == {
-        "model": "gpt-5.6-terra",
+        "model": "gpt-6-sol",
         "reasoning_effort": "low",
     }
     assert state["agent_options"]["compiler_defaults"] == {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-6-sol",
         "reasoning_effort": "high",
     }
     assert state["agent_options"]["revision_defaults"] == {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-6-sol",
         "reasoning_effort": "high",
     }
     assert completed["status"] == "completed"
     assert completed["model"] == "gpt-5.6-luna"
     assert completed["reasoning_effort"] == "medium"
+def test_local_gui_prompt_profiles_are_saved_per_model_and_backend(tmp_path):
+    from trace2task.local_gui_protocol import TURN_TEMPLATE
+    from trace2task.web_console import WebConsoleController
+
+    controller = WebConsoleController(tmp_path)
+    default = controller.local_prompt_profile('gui-owl-2b', 'cua')
+    assert default['customized'] is False
+    assert default['default']['system_prompt'] == (
+        controller.local_prompt_profile('gui-owl-2b', 'win32')['default']['system_prompt']
+    )
+    profile = {'system_prompt': 'Custom Cua system', 'turn_template': TURN_TEMPLATE}
+    saved = controller.save_local_prompt_profile('gui-owl-2b', 'cua', profile)
+    assert saved['effective'] == profile
+    assert WebConsoleController(tmp_path).local_prompt_profile('gui-owl-2b', 'cua')['effective'] == profile
+    assert controller.local_prompt_profile('gui-owl-2b', 'win32')['customized'] is False
+    assert controller.local_prompt_profile('mai-ui-2b', 'cua')['customized'] is False
+    restored = controller.save_local_prompt_profile('gui-owl-2b', 'cua', None)
+    assert restored['customized'] is False
+    assert restored['effective'] == default['effective']
+
+
+def test_local_prompt_api_saves_profile_and_run_freezes_it(tmp_path, monkeypatch):
+    from trace2task import trained_model_runner
+    from trace2task.local_gui_protocol import TURN_TEMPLATE
+
+    controller = WebConsoleController(tmp_path)
+    server = create_web_server(tmp_path, port=0, controller=controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    opener = build_opener(ProxyHandler({}))
+    profile = {'system_prompt': 'Custom GUI-Owl system', 'turn_template': TURN_TEMPLATE}
+    try:
+        headers = {'Content-Type': 'application/json', **_csrf_headers(opener, base)}
+        body = json.dumps({'model': 'gui-owl-2b', 'backend': 'cua', 'profile': profile}).encode()
+        with opener.open(Request(base + '/api/local-prompts', data=body, headers=headers)) as response:
+            saved = json.load(response)
+        assert saved['customized'] is True
+        with opener.open(base + '/api/local-prompts?model=gui-owl-2b&backend=cua') as response:
+            assert json.load(response)['effective'] == profile
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    calls = []
+    monkeypatch.setattr(trained_model_runner, 'run_trained_desktop', lambda **kwargs: (
+        calls.append(kwargs) or {'stop_reason': 'completion_unverifiable', 'task_complete': False}))
+    job = controller.start_job(task_path='', instruction='test', execute=True,
+                               provider='trained_d', model='gui-owl-2b', execution_scope='desktop',
+                               use_experience=False, continuous=True, executor_backend='cua',
+                               cua_target={'targets': [{'pid': 123, 'window_id': 456}], 'initial_index': 0})
+    controller.wait(job['job_id'])
+    assert calls[0]['prompt_profile'] == profile

@@ -16,6 +16,23 @@ def _keyboard(event: str, key: str) -> dict[str, Any]:
     return {"device": "keyboard", "event": event, "key": key}
 
 
+@pytest.mark.parametrize("scope", ["window", "desktop"])
+def test_compile_recording_without_window_metadata(tmp_path: Path, scope: str) -> None:
+    trace_path, events, metadata = _write_windows_trace(tmp_path)
+    metadata.pop("initial_window", None)
+    metadata.pop("window_selector", None)
+    metadata["execution_scope"] = scope
+    for event in events:
+        event.get("details", {}).pop("window", None)
+    _rewrite_bundle(trace_path, events, metadata)
+    result = compile_trace(trace_path, tmp_path / "compiled")
+    task = yaml.safe_load(Path(result.task_path).read_text(encoding="utf-8"))
+    assert task["environment"]["target"] == {}
+    assert task["observation"]["width"] > 0
+    assert task["observation"]["height"] > 0
+    assert "focus_window" not in task["actions"]
+
+
 def _mouse(
     event: str,
     *,
@@ -402,8 +419,11 @@ def test_windows_compiler_rejects_concurrent_non_modifier_holds(tmp_path: Path, 
         compile_trace(trace_path, tmp_path / "compiled")
 
 
-@pytest.mark.parametrize("duration", [413, 501])
-def test_desktop_text_rollover_uses_sampled_timestamps(tmp_path: Path, duration: int) -> None:
+@pytest.mark.parametrize("duration", [18, 413, 501])
+@pytest.mark.parametrize("unrelated_long_press", [False, True])
+def test_desktop_text_rollover_uses_sampled_timestamps(
+    tmp_path: Path, duration: int, unrelated_long_press: bool,
+) -> None:
     trace_path, events, metadata = _write_windows_trace(tmp_path)
     metadata["execution_scope"] = "desktop"
     # Reproduce the QQ Music typing overlap; slow screenshots must not extend
@@ -414,12 +434,14 @@ def test_desktop_text_rollover_uses_sampled_timestamps(tmp_path: Path, duration:
         (180, "up", "c"),
         (200, "up", "ctrl"),
         (10252, "down", "i"),
-        (10325, "down", "n"),
+        (10252 + min(73, duration // 2), "down", "n"),
         (10252 + duration, "up", "i"),
         (10252 + duration, "up", "n"),
         (11500, "down", "enter"),
         (11560, "up", "enter"),
     ]
+    if unrelated_long_press:
+        inputs[4:4] = [(1000, "down", "t"), (1827, "up", "t")]
     new_events = [events[0]]
     for seq, (sampled, edge, key) in enumerate(inputs, 1):
         new_events.append(
@@ -427,11 +449,11 @@ def test_desktop_text_rollover_uses_sampled_timestamps(tmp_path: Path, duration:
                 "seq": seq,
                 "elapsed_ms": seq * 1500,
                 "type": "windows_input",
-                "frame": events[seq]["frame"],
+                "frame": events[min(seq, len(events) - 1)]["frame"],
                 "details": {"raw_input": {**_keyboard(edge, key), "sampled_elapsed_ms": sampled}},
             }
         )
-    new_events.append({**events[-1], "seq": 11, "elapsed_ms": 20000})
+    new_events.append({**events[-1], "seq": len(inputs) + 1, "elapsed_ms": 25000})
     metadata["event_count"] = len(new_events)
     metadata["input_event_count"] = len(inputs)
     _rewrite_bundle(trace_path, new_events, metadata)
@@ -449,3 +471,5 @@ def test_desktop_text_rollover_uses_sampled_timestamps(tmp_path: Path, duration:
     assert {"skill": "type_text", "args": {"text": "<runtime-text-1>"}} in actions
     assert {"skill": "hotkey", "args": {"keys": ["ctrl", "c"]}} in actions
     assert {"skill": "press_key", "args": {"key": "enter"}} in actions
+    if unrelated_long_press:
+        assert {"skill": "hold_key", "args": {"key": "t", "duration_ms": 827}} in actions

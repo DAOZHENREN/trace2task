@@ -524,7 +524,7 @@ def test_human_feedback_creates_reviewable_revision_then_activates_it(tmp_path: 
     candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
     assert candidate["status"] == "feedback_applied"
     active = yaml.safe_load(
-        (task_path.parent / "guidance.yaml").read_text(encoding="utf-8")
+        (task_path.parent / "guidance-v0001.yaml").read_text(encoding="utf-8")
     )
     assert active["model_summary"] == "Avoid redundant replanning after a stable click."
     assert active["review"]["summary_edited"] is True
@@ -820,7 +820,7 @@ def test_human_feedback_revises_task_structure_without_rewriting_trace(
     assert (task_path.parent / "demonstration.json").read_bytes() == original_demonstration
 
 
-def test_task_model_revision_blocks_removed_guidance_state_without_mapping(
+def test_task_model_revision_quarantines_removed_guidance_state_without_mapping(
     tmp_path: Path,
 ) -> None:
     task_path = _write_semantic_task(tmp_path)
@@ -883,13 +883,15 @@ def test_task_model_revision_blocks_removed_guidance_state_without_mapping(
         binary_resolver=lambda requested: requested,
     )
 
-    assert proposal.blocking_issue_count == 1
-    with pytest.raises(ValueError, match="mapping conflicts"):
-        activate_task_model_revision(tmp_path, candidate_path, task_path)
-    assert not (task_path.parent / "experience-revisions").exists()
+    assert proposal.blocking_issue_count == 0
+    activated = activate_task_model_revision(tmp_path, candidate_path, task_path)
+    assert activated["pending_guidance_rules"] == 1
+    assert not load_windows_task(task_path).human_guidance.rules
+    assert (task_path.parent / "guidance-review-graph-v0001.yaml").exists()
+    assert yaml.safe_load((task_path.parent / "guidance.yaml").read_text(encoding="utf-8"))["rules"]
 
 
-def test_task_model_revision_migrates_transition_scoped_guidance(
+def test_task_model_revision_quarantines_transition_scoped_guidance(
     tmp_path: Path,
 ) -> None:
     task_path = _write_semantic_task(tmp_path)
@@ -961,5 +963,6 @@ def test_task_model_revision_migrates_transition_scoped_guidance(
     loaded = load_windows_task(task_path)
     assert activated["guidance_revision"] == 2
     assert loaded.human_guidance is not None
-    assert loaded.human_guidance.rules[0].scope_type == "transition"
-    assert loaded.human_guidance.rules[0].scope_id == "open_to_verify"
+    assert loaded.human_guidance.rules == ()
+    pending = yaml.safe_load((task_path.parent / "guidance-review-graph-v0001.yaml").read_text(encoding="utf-8"))
+    assert pending["rules"][0]["suggested_scope"]["id"] == "open_to_verify"

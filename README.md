@@ -8,7 +8,7 @@ Record a workflow, optionally explain it aloud, compile it into a task model, an
 
 Trace2Task combines a **Windows desktop application**, a local web console, multiple model backends, and a research workflow for measuring whether demonstrations and experience actually help.
 
-> **Status:** actively developed research software. This README describes the September 2026 source tree; package metadata remains `0.18.1`. An older installer does not necessarily contain every feature on `main`. Native model adapters and Cua are experimental. A valid action or model-reported completion is not proof of task success.
+> **Status:** actively developed research software. This README describes the September 2026 source tree (`0.18.8`). An older installer does not necessarily contain every feature on `main`. Native model adapters and Cua are experimental. A valid action or model-reported completion is not proof of task success.
 
 [Get started](#get-started) · [Capabilities](#current-capabilities) · [Models](#model-support) · [Evaluation](#evaluate-trace-and-experience) · [Docs](#documentation)
 
@@ -57,12 +57,12 @@ Open Notepad, type "hello", and save it as greeting.txt in Documents.
 ```
 
 - Choose a target window or the primary desktop, with experience guidance or no-experience **Baseline**.
-- General-agent workflows support manual experience selection and compatible automatic routing. Desktop experience mode needs an appropriate reviewed task model.
-- Preview plans before input. General agents can return bounded multi-action batches; visual checkpoints, focus changes, or failures can discard remaining actions and trigger a new observation.
+- Select a reviewed, semantically compiled experience explicitly, or use Baseline. Experience support depends on the model and execution route.
+- Confirm the target before starting. Agents can return bounded multi-action batches; target changes or failures can discard remaining actions. The execution page no longer has a separate **Plan only** button.
 - Inspect progress, stop reasons, no-progress protection, and **F9 / Stop** controls. Cancellation latency depends on the backend.
 - Optionally enable **LangGraph subgoal memory and SQLite checkpoints** on the general desktop path. Resume re-observes the desktop; it does not replay old coordinates or blindly retry uncertain effects.
 
-Native 2B and D adapters currently run without compiled experience or LangGraph. They are not feature-equivalent to the general agent path.
+Native 2B adapters support optional compiled experience; D retains its frozen input schema. Neither uses LangGraph checkpoint recovery. These routes are not feature-equivalent to the legacy general-agent path. See the [unified execution contract](docs/unified-execution-core.md).
 
 ### Desktop software and browser console
 
@@ -72,6 +72,8 @@ Both frontends use the same Python backend and task data.
 - **Installer tooling:** PyInstaller + Inno Setup produce a per-user Windows x64 application with bundled Python, shortcuts, and an uninstaller. Program files, data, and weights stay separate.
 - **Local model controls:** start/stop recognized Trace2Task services, inspect loading/error state, and reuse loaded models across tasks.
 - **Console:** recording, task/experience details, review, feedback, model selection, execution status, and per-round model I/O.
+- **Optional OpenCUA recording:** video, input events and approximate reference-frame extraction. Requires separate components; this archive is not yet connected to the Compiler. See [recording boundaries](docs/opencua-recording.md).
+- **Remote RSI practice:** control the official RSIAgent engine in a separately configured, isolated Linux VM; inspect budgets, stop/recovery, independent verification and candidate memory. Candidates do not automatically replace active experience. See [deployment and acceptance boundaries](docs/rsi-integration.md).
 
 The installer does **not** provision model weights, Codex CLI, Cua Driver, or a benchmark VM. Closing the application does not automatically unload independent model services.
 
@@ -147,7 +149,7 @@ Replace the example with your data directory. Do not run desktop-control tasks f
 1. Open **Execute task**, choose the scope, and start with blank Notepad or a disposable test page.
 2. Select **Codex**, **Model API**, or **Local model**. Local runtimes and weights require separate setup; selection is not an automatic download.
 3. Choose **Baseline / no experience**, or an experience supported by that backend.
-4. Enter one instruction and inspect **Plan only**.
+4. Enter one harmless instruction and check the selected model, backend and target.
 5. Confirm execution after checking the scope; use **Stop / F9** when needed.
 
 For Codex-backed work, authenticate separately with `codex login`. A ChatGPT subscription does not supply credits for arbitrary API endpoints.
@@ -191,7 +193,7 @@ The [Windows Agent Arena integration](integrations/windows_agent_arena/) separat
 
 Declare conditions and compatible frozen artifacts in the experiment specification. Human confirmation alone is **not** another method called “Reviewed compile”; only material edits justify a separate comparison. Not every task has all conditions or completed measurements.
 
-Study tooling includes held-out variants, hashes, repetitions, and latency/action/model-call reports. A remote WAA VM's **task reset is not a full VM snapshot restore**. WAA/VM setup is separate from the app. OSWorld is a design reference, not a shipped integration.
+Study tooling includes held-out variants, hashes, repetitions, and latency/action/model-call reports. A remote WAA VM's **task reset is not a full VM snapshot restore**. WAA/VM setup is separate from the app. The separate [RSIAgent integration](docs/rsi-integration.md) uses a pinned OSWorld-V2 guest for offline practice, not an OSWorld benchmark result or an automatically installed VM.
 
 Configured window-task Effect Verifiers can produce independent receipts. Screenshot/model-only completion is unverified; desktop/native runs must not be reported as independently successful merely because the model returns `done`.
 
@@ -216,6 +218,7 @@ Configured window-task Effect Verifiers can produce independent receipts. Screen
 | Qwen 2B, GUI-Owl, MAI and services | [Native GUI models](docs/local-gui-models.md) |
 | Structured-action D model | [D integration](docs/trained-model-local.md) |
 | Subgoals and recovery | [LangGraph](docs/langgraph-desktop.md) |
+| Remote isolated practice and candidate review | [RSIAgent integration](docs/rsi-integration.md) |
 | Authorized background targets | [Cua backend](docs/cua-experimental-backend.md) |
 | Model/executor logs | [I/O audit](docs/model-io-audit.md) · [Local runtime measurements](docs/local-model-runtime-validation.md) |
 | Release review and remaining limits | [2026-09-22 audit](docs/release-audit-2026-09-22.md) |

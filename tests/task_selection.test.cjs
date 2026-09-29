@@ -24,6 +24,6 @@ test('task selector integrates baseline and preserves its target across refreshe
   selector.value = 'baseline:task.yaml';
   context.populateTaskpacks(records);
   assert.equal(selector.value, 'baseline:task.yaml');
-  vm.runInContext('function selectedTask' + source.split('function selectedTask')[1].split('function selectedWindow')[0], context);
+  vm.runInContext('function selectedTask' + source.split('function selectedTask')[1].split('function usesWaaRecording')[0], context);
   assert.equal(context.selectedTask().path, 'task.yaml');
 });

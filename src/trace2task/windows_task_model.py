@@ -28,7 +28,7 @@ from trace2task.windows_guidance import (
     guidance_scope_payload,
 )
 
-DEFAULT_TASK_MODEL_REVISION_MODEL = "gpt-5.6-sol"
+DEFAULT_TASK_MODEL_REVISION_MODEL = "gpt-6-sol"
 DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT = "high"
 
 
@@ -386,30 +386,95 @@ def _guidance_analysis(
             }
         )
 
-    guidance_path = task_path.with_name("guidance.yaml")
-    if not guidance_path.is_file():
-        return mappings, issues
-    guidance = _mapping(
-        yaml.safe_load(guidance_path.read_text(encoding="utf-8")),
-        "guidance",
-    )
-    referenced: set[tuple[str, str]] = set()
-    for rule in guidance.get("rules", []):
-        if not isinstance(rule, dict):
-            continue
-        scope = guidance_scope_payload(rule)
-        if scope["type"] != "global":
-            referenced.add((scope["type"], scope["id"]))
-    for removed in sorted(referenced):
-        if new_catalog.contains(*removed):
-            continue
-        if removed not in mapping_by_source:
-            scope_type, scope_id = removed
-            issues.append(
-                "Confirmed guidance still references removed "
-                f"{scope_type} {scope_id!r}; add a scope mapping"
-            )
+    # Removed or changed scopes are quarantined at activation, not silently
+    # migrated and not allowed to block a corrected task graph.
     return mappings, issues
+
+
+def _guidance_disposition(
+    task_path: Path,
+    task_data: dict[str, Any],
+    *,
+    old_graph: dict[str, Any],
+    new_graph: dict[str, Any],
+    old_instruction: str,
+    new_instruction: str,
+    old_goal: str,
+    new_goal: str,
+    old_completion: dict[str, Any],
+    new_completion: dict[str, Any],
+    mappings: list[dict[str, str]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    pointer = task_data.get("human_guidance")
+    if not isinstance(pointer, dict):
+        return None, [], []
+    relative = _string(pointer.get("path"), "human_guidance.path")
+    path = (task_path.parent / relative).resolve()
+    if not path.is_relative_to(task_path.parent.resolve()):
+        raise ValueError("Guidance path escapes the selected task")
+    guidance = _mapping(yaml.safe_load(path.read_text(encoding="utf-8")), "guidance")
+    old_items = {
+        kind: {item["id"]: item for item in old_graph[key]}
+        for kind, key in (("state", "states"), ("transition", "transitions"),
+                          ("terminal", "terminals"))
+    }
+    new_items = {
+        kind: {item["id"]: item for item in new_graph[key]}
+        for kind, key in (("state", "states"), ("transition", "transitions"),
+                          ("terminal", "terminals"))
+    }
+    proposed_targets = {
+        (mapping["from_type"], mapping["from_id"]):
+        {"type": mapping["to_type"], "id": mapping["to_id"]}
+        for mapping in mappings
+    }
+    goal_changed = (old_instruction != new_instruction or old_goal != new_goal
+                    or old_completion != new_completion)
+    def related_edges(graph: dict[str, Any], kind: str, item_id: str) -> list[dict[str, Any]]:
+        if kind == "state":
+            return [edge for edge in graph["transitions"]
+                    if edge["source_state_id"] == item_id]
+        if kind == "terminal":
+            return [edge for edge in graph["transitions"]
+                    if edge["target_type"] == "terminal" and edge["target_id"] == item_id]
+        return []
+
+    def transition_endpoints(graph: dict[str, Any], edge: dict[str, Any] | None) -> tuple[Any, Any]:
+        if edge is None:
+            return None, None
+        states = {item["id"]: item for item in graph["states"]}
+        targets = {item["id"]: item for item in graph[
+            "states" if edge["target_type"] == "state" else "terminals"
+        ]}
+        return states.get(edge["source_state_id"]), targets.get(edge["target_id"])
+
+    carried: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for raw_rule in guidance.get("rules", []):
+        rule = _mapping(raw_rule, "guidance rule")
+        scope = guidance_scope_payload(rule)
+        kind, item_id = scope["type"], scope["id"]
+        target = proposed_targets.get((kind, item_id), scope)
+        if goal_changed:
+            reason = "任务目标或完成条件已改变"
+        elif target != scope:
+            reason = "规则位置已重绑，需要人工确认语义仍适用"
+        elif kind == "global" and old_graph != new_graph:
+            reason = "任务状态图已改变，全局规则需要重新确认"
+        elif kind != "global" and old_items[kind].get(item_id) != new_items[kind].get(item_id):
+            reason = "关联状态或转移的含义已改变或被删除"
+        elif kind in {"state", "terminal"} and related_edges(old_graph, kind, item_id) != related_edges(new_graph, kind, item_id):
+            reason = "关联状态的可走转移已改变"
+        elif kind == "transition" and transition_endpoints(old_graph, old_items[kind].get(item_id)) != transition_endpoints(new_graph, new_items[kind].get(item_id)):
+            reason = "转移两端的状态含义已改变"
+        else:
+            reason = ""
+        if reason:
+            pending.append({"rule": deepcopy(rule), "reason": reason,
+                            "suggested_scope": target})
+        else:
+            carried.append(deepcopy(rule))
+    return guidance, carried, pending
 
 
 def compile_task_model_revision(
@@ -463,9 +528,9 @@ def compile_task_model_revision(
         "order merely because the human demonstration was linear. Every state and transition must "
         "cite one or more existing Trace episode IDs. Never add fixed coordinates or motor replay. "
         "Keep unchanged state and transition IDs stable. Guidance may be attached to a state, a "
-        "specific transition, or a terminal outcome. If any referenced graph location is removed "
-        "or renamed, provide exactly one guidance_scope_mappings entry to a valid proposed graph "
-        "location; otherwise omit mappings. Human feedback is authoritative, current pixels and run "
+        "specific transition, or a terminal outcome. If a referenced location is removed or renamed, "
+        "you may suggest a guidance_scope_mappings entry, but it will remain pending human review; "
+        "unchanged IDs do not prove unchanged meaning. Human feedback is authoritative, current pixels and run "
         "evidence are observations, and the existing Compiler output is replaceable derived context. "
         "Image 1 is the reviewed human success reference; later images sample this Agent run. Return "
         "only the supplied JSON schema.\n\n"
@@ -552,6 +617,21 @@ def compile_task_model_revision(
             else payload.get("guidance_mappings")
         ),
     )
+    _, carried_rules, pending_rules = _guidance_disposition(
+        task_path,
+        task_data,
+        old_graph=current_graph,
+        new_graph=graph,
+        old_instruction=experience.canonical_instruction,
+        new_instruction=canonical_instruction,
+        old_goal=experience.goal,
+        new_goal=goal,
+        old_completion={"mode": experience.completion_mode,
+                        "success_condition": experience.completion_success_condition,
+                        "reason": experience.completion_reason},
+        new_completion=normalized_completion,
+        mappings=mappings,
+    )
     proposed_revision = base_revision + 1
     created_at = datetime.now(UTC).isoformat()
     proposal = {
@@ -567,6 +647,8 @@ def compile_task_model_revision(
         "state_graph": graph,
         "operations": operations,
         "guidance_scope_mappings": mappings,
+        "guidance_review": {"carried_rule_ids": [rule["id"] for rule in carried_rules],
+                            "pending": pending_rules},
         "blocking_issues": blocking_issues,
         "source": {
             "type": "human_structural_feedback",
@@ -596,6 +678,8 @@ def compile_task_model_revision(
             for operation in operations
         ],
         "blocking_issues": blocking_issues,
+        "guidance_review": {"carried_rule_ids": [rule["id"] for rule in carried_rules],
+                            "pending": pending_rules},
         "model": model,
         "reasoning_effort": reasoning_effort,
     }
@@ -613,60 +697,44 @@ def compile_task_model_revision(
     )
 
 
-def _migrate_guidance(
+def _activate_reconciled_guidance(
     task_path: Path,
     *,
-    mappings: list[dict[str, str]],
-    new_catalog: GuidanceScopeCatalog,
-) -> int | None:
-    guidance_path = task_path.with_name("guidance.yaml")
-    if not guidance_path.is_file():
-        return None
-    guidance = _mapping(
-        yaml.safe_load(guidance_path.read_text(encoding="utf-8")),
-        "guidance",
+    source: dict[str, Any] | None,
+    carried: list[dict[str, Any]],
+    pending: list[dict[str, Any]],
+    graph_revision: int,
+) -> tuple[int | None, str | None]:
+    if source is None:
+        return None, None
+    old_revision = int(source["revision"])
+    new_revision = old_revision + 1
+    guidance = deepcopy(source)
+    guidance["revision"] = new_revision
+    guidance["parent_revision"] = old_revision
+    guidance["rules"] = carried
+    guidance["summary"] = (
+        f"任务图 v{graph_revision}：仅保留关联语义未变化的 {len(carried)} 条人工规则；"
+        f"{len(pending)} 条规则待重新审查。"
     )
-    mapping_by_source = {
-        (mapping["from_type"], mapping["from_id"]): (
-            mapping["to_type"],
-            mapping["to_id"],
-        )
-        for mapping in mappings
-    }
-    changed = False
-    for rule in guidance.get("rules", []):
-        if not isinstance(rule, dict):
-            continue
-        scope = guidance_scope_payload(rule)
-        current = (scope["type"], scope["id"])
-        if current in mapping_by_source:
-            current = mapping_by_source[current]
-            changed = True
-        if not new_catalog.contains(*current):
-            raise ValueError(
-                "Guidance rule still references missing graph scope "
-                f"{current[0]}:{current[1]!r}"
-            )
-        canonical_scope = {"type": current[0], "id": current[1]}
-        if rule.get("scope") != canonical_scope or "stage_id" in rule:
-            rule["scope"] = canonical_scope
-            rule.pop("stage_id", None)
-            changed = True
-    if not changed:
-        return int(guidance.get("revision") or 0)
-    current_revision = int(guidance.get("revision") or 0)
-    revision = current_revision + 1
-    guidance["revision"] = revision
-    guidance["parent_revision"] = current_revision
-    guidance["source"] = {
-        "type": "task_model_scope_migration",
-        "mappings": mappings,
-        "migrated_at": datetime.now(UTC).isoformat(),
-    }
-    revision_path = task_path.parent / "guidance-revisions" / f"revision-{revision:04d}.yaml"
-    _atomic_yaml(revision_path, guidance)
-    _atomic_yaml(guidance_path, guidance)
-    return revision
+    guidance["graph_revision"] = graph_revision
+    guidance["source"] = {"type": "task_model_rule_reconciliation",
+                          "pending_rule_ids": [item["rule"]["id"] for item in pending]}
+    active_name = f"guidance-v{new_revision:04d}.yaml"
+    _atomic_yaml(task_path.parent / "guidance-revisions" / f"revision-{new_revision:04d}.yaml",
+                 guidance)
+    _atomic_yaml(task_path.parent / active_name, guidance)
+    pending_name = None
+    if pending:
+        pending_name = f"guidance-review-graph-v{graph_revision:04d}.yaml"
+        _atomic_yaml(task_path.parent / pending_name, {
+            "task_id": source["task_id"],
+            "graph_revision": graph_revision,
+            "source_guidance_revision": old_revision,
+            "status": "pending_human_review",
+            "rules": pending,
+        })
+    return new_revision, pending_name
 
 
 def activate_task_model_revision(
@@ -770,10 +838,25 @@ def activate_task_model_revision(
     )
     if proposal.get("operations") != proposed_operations:
         raise ValueError("Task model proposal diff does not match the current active model")
+    guidance_source, carried_rules, pending_rules = _guidance_disposition(
+        task_path, task_data,
+        old_graph=experience.state_graph_payload(), new_graph=graph,
+        old_instruction=experience.canonical_instruction,
+        new_instruction=_string(proposal.get("canonical_instruction"), "proposal.canonical_instruction"),
+        old_goal=experience.goal, new_goal=_string(proposal.get("goal"), "proposal.goal"),
+        old_completion={"mode": experience.completion_mode,
+                        "success_condition": experience.completion_success_condition,
+                        "reason": experience.completion_reason},
+        new_completion=normalized_completion, mappings=normalized_mappings,
+    )
+    if proposal.get("guidance_review") != {
+        "carried_rule_ids": [rule["id"] for rule in carried_rules], "pending": pending_rules
+    }:
+        raise ValueError("Guidance changed since this task model proposal; generate it again")
     revision = current_revision + 1
     history_dir = task_path.parent / "experience-revisions"
     baseline_path = history_dir / "revision-0000.yaml"
-    if current_revision == 0 and not baseline_path.exists():
+    if current_revision == 0:
         _atomic_yaml(baseline_path, deepcopy(active_document))
     updated = deepcopy(active_document)
     updated["schema_version"] = "0.4"
@@ -798,12 +881,12 @@ def activate_task_model_revision(
     updated["review"] = review
     revision_path = history_dir / f"revision-{revision:04d}.yaml"
     _atomic_yaml(revision_path, updated)
-    _atomic_yaml(experience_path, updated)
+    active_experience_path = task_path.with_name(f"experience-v{revision:04d}.yaml")
+    _atomic_yaml(active_experience_path, updated)
 
-    guidance_revision = _migrate_guidance(
-        task_path,
-        mappings=normalized_mappings,
-        new_catalog=new_catalog,
+    guidance_revision, pending_name = _activate_reconciled_guidance(
+        task_path, source=guidance_source, carried=carried_rules,
+        pending=pending_rules, graph_revision=revision,
     )
     task_data["instruction"] = updated["canonical_instruction"]
     verifier = _mapping(task_data.get("verifier"), "task.verifier")
@@ -816,6 +899,7 @@ def activate_task_model_revision(
     task_data["verifier"] = verifier
     semantic_pointer.update(
         {
+            "path": active_experience_path.name,
             "revision": revision,
             "state_count": len(graph["states"]),
             "transition_count": len(graph["transitions"]),
@@ -825,6 +909,12 @@ def activate_task_model_revision(
     task_data["semantic_experience"] = semantic_pointer
     if guidance_revision is not None and isinstance(task_data.get("human_guidance"), dict):
         task_data["human_guidance"]["revision"] = guidance_revision
+        task_data["human_guidance"]["path"] = f"guidance-v{guidance_revision:04d}.yaml"
+        task_data["human_guidance"]["rule_count"] = len(carried_rules)
+    if pending_name:
+        task_data["guidance_review_pending"] = pending_name
+    else:
+        task_data.pop("guidance_review_pending", None)
     _atomic_yaml(task_path, task_data)
     proposal["status"] = "confirmed"
     proposal["confirmed_revision"] = revision
@@ -841,18 +931,19 @@ def activate_task_model_revision(
     candidate["task_model_revision"] = task_model
     _atomic_yaml(candidate_path, candidate)
     load_semantic_experience(
-        experience_path,
+        active_experience_path,
         task_id=str(task_data["id"]),
         action_count=_demonstration_action_count(task_path),
     )
     return {
         "task_path": task_path.relative_to(project_root).as_posix(),
-        "experience_path": experience_path.relative_to(project_root).as_posix(),
+        "experience_path": active_experience_path.relative_to(project_root).as_posix(),
         "revision_path": revision_path.relative_to(project_root).as_posix(),
         "revision": revision,
         "state_count": len(graph["states"]),
         "transition_count": len(graph["transitions"]),
         "terminal_count": len(graph["terminals"]),
         "guidance_revision": guidance_revision,
+        "pending_guidance_rules": len(pending_rules),
         "status": "confirmed",
     }

@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+/components/
+/components.json
+/components.pending
 dist/
 build/
 .cache/
@@ -22,3 +25,13 @@ models/
 *.gguf
 *.pt
 *.pth
+
+# Server-specific RSI deployment state. Keep the portable example above.
+/scripts/rsi/deployment.json
+/rsi-profile.json
+/rsi-deployment.json
+/auth/
+/logs/rsi/
+/logs/rsi-*.jsonl
+/observation-*.png
+/runtime.log

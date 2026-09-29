@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trace2task"
-version = "0.18.1"
+version = "0.18.8"
 description = "Record a workflow and turn it into a resettable, verifiable agent task."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,7 @@ packages = ["src/trace2task"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

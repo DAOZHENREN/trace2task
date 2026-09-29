@@ -16,6 +16,9 @@ from trace2task.actions import ActionCall, is_runtime_text_placeholder, normaliz
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
+MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x1000
+WHEEL_DELTA = 120
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_EXTENDEDKEY = 0x0001
@@ -212,6 +215,8 @@ class WindowsBackend(Protocol):
     def set_cursor_position(self, x: int, y: int) -> None: ...
 
     def send_mouse_button(self, button: str, is_down: bool) -> None: ...
+
+    def send_mouse_wheel(self, direction: str, amount: int, by: str) -> None: ...
 
     def send_key(self, virtual_key: int, is_down: bool) -> None: ...
 
@@ -448,6 +453,16 @@ class Win32Backend:
         flags = MOUSE_FLAGS[button][0 if is_down else 1]
         item = _Input(type=INPUT_MOUSE)
         item.mi = _MouseInput(0, 0, 0, flags, 0, 0)
+        self._send_input(item)
+
+    def send_mouse_wheel(self, direction: str, amount: int, by: str) -> None:
+        if direction not in {"up", "down", "left", "right"} or by != "line" or type(amount) is not int or not 1 <= amount <= 50:
+            raise ValueError("Win32 wheel requires 1-50 line units and a direction")
+        horizontal = direction in {"left", "right"}
+        delta = WHEEL_DELTA * amount * (-1 if direction in {"down", "left"} else 1)
+        item = _Input(type=INPUT_MOUSE)
+        item.mi = _MouseInput(0, 0, delta & 0xFFFFFFFF,
+                              MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL, 0, 0)
         self._send_input(item)
 
     def send_key(self, virtual_key: int, is_down: bool) -> None:

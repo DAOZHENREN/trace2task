@@ -224,12 +224,15 @@ class ModelAPISession:
         self._generation = 1
         self.last_turn_metrics: CodexTurnMetrics | None = None
         self.audit = None
+        self.system_guidance = ""
+        self.last_request_messages: list[dict[str, Any]] | None = None
 
     def reset_thread(self) -> None:
         if self._closed.is_set():
             raise RuntimeError("Cannot reset a closed model API session")
         self._history.clear()
         self._generation += 1
+        self.last_request_messages = None
 
     def close(self) -> None:
         self._closed.set()
@@ -269,6 +272,8 @@ class ModelAPISession:
             "call tools or execute code. The local executor validates every proposed action.\n"
             + json.dumps(output_schema, ensure_ascii=False, separators=(",", ":"))
         )
+        if self.system_guidance:
+            contract += "\nAdditional operator guidance:\n" + self.system_guidance
         payload: dict[str, Any] = {
             "model": active_model,
             "messages": [
@@ -279,6 +284,15 @@ class ModelAPISession:
             "stream": False,
             "response_format": {"type": self.config.response_format},
         }
+        # Preserve the actual text roles for the live UI without copying base64 images.
+        self.last_request_messages = [
+            {"role": message["role"], "content": (
+                [{"type": "text", "text": part["text"]} if part.get("type") == "text"
+                 else {"type": "image", "text": "[截图见本轮图片 / I/O 归档]"}
+                 for part in message["content"]]
+                if isinstance(message["content"], list) else message["content"])}
+            for message in payload["messages"]
+        ]
         if self.config.response_format == "json_schema":
             payload["response_format"]["json_schema"] = {
                 "name": "trace2task_plan",

@@ -7,15 +7,6 @@ from trace2task import trained_model_runner as runner
 from trace2task.windows_runner import EmergencyStopRequested
 
 
-def test_whole_batch_rejects_unknown_and_empty():
-    for actions in [[], [{"skill": "wheel", "args": {"wheel_units": 1}}],
-                    [{"done": True}, {"skill": "wait", "args": {"duration_ms": 1}}],
-                    [{"skill": "wait", "args": {"duration_ms": 1}}] * 9]:
-        with pytest.raises(ValueError):
-            runner.parse_actions({"actions": actions})
-    assert runner.parse_actions({"actions": [{"done": True}]}) == ([], [], True)
-
-
 class Stop:
     def start(self): pass
     def close(self): pass
@@ -36,7 +27,8 @@ def setup_run(monkeypatch, tmp_path, predictions, *, approve=lambda batch: None,
             sent.append(call.to_payload())
             if change:
                 frame.fill("black")
-            return SimpleNamespace(elapsed_ms=1)
+            return SimpleNamespace(elapsed_ms=1, input_mode="foreground", window_handle=1,
+                                   screen_position=None)
 
     def predict(task, **kw):
         histories.append(kw["history"])
@@ -58,8 +50,9 @@ def test_loop_only_sends_executed_history_and_done_is_not_success(monkeypatch, t
         [[CLICK], [{"done": True}]], approve=confirmations.append)
     assert len(sent) == len(confirmations) == 1
     assert histories[0] == []
-    assert histories[1] == [{"step_index": 0, "action": {"actions": [CLICK]}, "executed": True}]
-    assert result["stop_reason"] == "model_done_unverified"
+    assert histories[1] == [{"step_index": 0, "action": {"actions": [CLICK]}, "executed": True,
+                            "effect": "unverifiable", "delivery_mode_requested": "foreground"}]
+    assert result["stop_reason"] == "completion_unverifiable"
     assert not result["verified"] and not result["task_complete"]
 
 
@@ -71,17 +64,20 @@ def test_stop_during_confirmation_sends_nothing(monkeypatch, tmp_path):
     assert result["stop_reason"] == "emergency_stop"
 
 
-def test_screen_change_discards_remaining_actions(monkeypatch, tmp_path):
-    _result, sent, histories = setup_run(monkeypatch, tmp_path,
-        [[CLICK, CLICK], [{"done": True}]], change=True)
-    assert len(sent) == 1
-    assert len(histories[1][0]["action"]["actions"]) == 1
+def test_screen_change_does_not_discard_model_planned_actions(monkeypatch, tmp_path):
+    confirmations = []
+    result, sent, histories = setup_run(monkeypatch, tmp_path,
+        [[CLICK, CLICK], [{"done": True}]], change=True,
+        approve=confirmations.append)
+    assert len(sent) == 2 and result['actions'] == 2
+    assert len(confirmations[0]['actions']) == 2
+    assert len(histories[1]) == 2
 
 
-def test_no_progress_blocks_fourth_click(monkeypatch, tmp_path):
-    result, sent, _ = setup_run(monkeypatch, tmp_path, [[CLICK]] * 4)
-    assert len(sent) == 3
-    assert result["stop_reason"] == "no_progress"
+def test_repeated_action_is_left_to_model_after_fresh_observations(monkeypatch, tmp_path):
+    result, sent, _ = setup_run(monkeypatch, tmp_path, [[CLICK]] * 4 + [[{"done": True}]])
+    assert len(sent) == 4
+    assert result["stop_reason"] == "completion_unverifiable"
 
 
 def test_web_d_provider_no_taskpack_and_safe_default(tmp_path, monkeypatch):

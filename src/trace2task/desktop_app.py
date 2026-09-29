@@ -19,6 +19,9 @@ BUSY_STATUSES = {
 
 
 def can_close(controller, window) -> bool:
+    if controller.components.status()['status'] == 'running':
+        window.create_confirmation_dialog('组件正在安装', '请先取消组件安装，再退出程序。')
+        return False
     job = controller.active_job()
     if job and job.get("status") in BUSY_STATUSES:
         window.create_confirmation_dialog(
@@ -66,7 +69,10 @@ def run_desktop(project_root: Path, *, webview_module=None, smoke_test=False) ->
             def verify_page():
                 result = window.evaluate_js(
                     "JSON.stringify({ready:document.readyState,"
-                    "console:!!document.querySelector('#model-provider')})"
+                    "console:!!document.querySelector('#model-provider'),"
+                    "components:!!document.querySelector('#component-runtime'),"
+                    "rsi:!!document.querySelector('#rsi-panel'),"
+                    "componentsHeight:document.querySelector('#components-panel').getBoundingClientRect().height})"
                 )
                 (root / "desktop-smoke.json").write_text(result, encoding="utf-8")
                 window.destroy()

@@ -9,8 +9,9 @@ from trace2task.windows_runner import EmergencyStopRequested
 
 
 class LocalRunAudit:
-    def __init__(self, root, result, record, status):
+    def __init__(self, root, result, record, status, on_round=None):
         self.root, self.result, self.record, self.status = Path(root), result, record, status
+        self.on_round = on_round
         result['model_io'] = []
         result['performance'] = {'model_roundtrip_ms': 0, 'planning_ms': 0,
             'model_completion_wait_ms': 0, 'capture_ms': 0, 'action_ms': 0, 'explicit_wait_ms': 0}
@@ -22,7 +23,9 @@ class LocalRunAudit:
         perf[field] = round(perf.get(field, 0)+elapsed, 2)
         return elapsed
 
-    def predict(self, predictor, stop, model, task, screenshot, history, step, context=None):
+    def predict(self, predictor, stop, model, task, screenshot, history, step, context=None,
+                previous_screenshot=None, execution_feedback=None, experience_context=None,
+                prompt_profile=None, cursor_position=None):
         from trace2task.local_gui_client import cancel_gui
         from trace2task.trained_model_runner import interruptible_prediction
         request_id = uuid.uuid4().hex
@@ -30,19 +33,33 @@ class LocalRunAudit:
         folder.mkdir(parents=True)
         kwargs = {'image': base64.b64encode(Path(screenshot).read_bytes()).decode(),
                       'history': history, 'step_index': step}
+        if previous_screenshot is not None:
+            kwargs['previous_image'] = base64.b64encode(Path(previous_screenshot).read_bytes()).decode()
         entry = {'step_index': step, 'request_id': request_id, 'status': 'pending',
+            'purpose': (context or {}).get('purpose', 'plan'),
+            'previous_screenshot': str(previous_screenshot) if previous_screenshot else None,
+            'experience_context': experience_context,
             'output_directory': str(folder), 'screenshot': str(screenshot),
             'request_path': str(folder/'request.json'), 'response_path': str(folder/'response.json')}
         self.result['model_io'].append(entry)
+        self.publish(entry)
         (folder/'request.json').write_text(json.dumps(dict(model=model, task=task,
-            cua_context=context, **kwargs), ensure_ascii=False, indent=2), encoding='utf-8')
+            execution_context=context, execution_feedback=execution_feedback,
+            experience_context=experience_context, prompt_profile=prompt_profile,
+            cursor_position=cursor_position, **kwargs),
+            ensure_ascii=False, indent=2), encoding='utf-8')
         self.record('model_input', task=task, screenshot=str(screenshot), history=history,
-                    step_index=step, request_id=request_id, cua_context=context,
+                    previous_screenshot=entry['previous_screenshot'],
+                    step_index=step, request_id=request_id, execution_context=context,
+                    execution_feedback=execution_feedback, experience_context=experience_context,
                     request_path=entry['request_path'])
         self.status(f'[plan {step+1}] {model} 预测中；日志：{folder}')
         cancel = None
         if model != 'D-5970':
-            kwargs.update(request_id=request_id, audit_dir=str(folder), cua_context=context)
+            kwargs.update(request_id=request_id, audit_dir=str(folder), execution_context=context,
+                          execution_feedback=execution_feedback,
+                          experience_context=experience_context, prompt_profile=prompt_profile,
+                          cursor_position=cursor_position)
             def cancel():
                 self.status('已停止发送动作，正在取消本次模型生成；等待当前 GPU 计算段结束…')
                 reply = cancel_gui(request_id)
@@ -84,7 +101,15 @@ class LocalRunAudit:
                 if not (folder/'response.json').exists():
                     (folder/'response.json').write_text(json.dumps(safe,ensure_ascii=False,indent=2),encoding='utf-8')
                 metrics = output.get('metrics', {})
-                entry.update(raw_output=output.get('raw_output'), prediction=output.get('prediction'),
+                raw_output = output.get('raw_output')
+                if raw_output is None and output.get('emitted_actions') is not None:
+                    # D-5970 emits native structured actions, not generated prose.
+                    raw_output = json.dumps(output['emitted_actions'], ensure_ascii=False)
+                    entry['raw_output_kind'] = 'native_structured_actions'
+                entry.update(raw_output=raw_output, prediction=output.get('prediction'),
+                    verification=output.get('verification'),
+                    control=output.get('control'), control_text=output.get('text'),
+                    protocol_normalizations=output.get('protocol_normalizations', []),
                     timings=metrics.get('phase_ms', {}), memory=metrics.get('memory', {}),
                     tokens=metrics.get('tokens', {}), service_output_directory=output.get('output_directory'))
                 if output.get('error'):
@@ -101,6 +126,7 @@ class LocalRunAudit:
                 entry['input'] = json.loads((folder/'input.json').read_text(encoding='utf-8'))
             (folder/'round.json').write_text(json.dumps(entry,ensure_ascii=False,indent=2),encoding='utf-8')
             self.save()
+            self.publish(entry)
             self.status(f"[plan {step+1}] {entry['status']} · 往返 {entry['model_roundtrip_ms']/1000:.2f} 秒"
                         + (f" · 生成 {entry['timings'].get('generate_ms',0)/1000:.2f} 秒" if entry.get('timings') else ''))
             if entry.get('raw_output'):
@@ -109,6 +135,23 @@ class LocalRunAudit:
     def save(self):
         Path(self.result['audit_path']).write_text(json.dumps(self.result['model_io'],
             ensure_ascii=False,indent=2),encoding='utf-8')
+
+    def publish(self, entry):
+        if self.on_round is not None:
+            self.on_round(entry)
+
+    def execution(self, value):
+        """Keep executor receipts separate from the model-service prediction reply."""
+        if not self.result['model_io']:
+            return
+        entry = self.result['model_io'][-1]
+        entry['execution'] = {'phase': 'execution', **value}
+        path = Path(entry['output_directory'])/'execution.json'
+        entry['execution_path'] = str(path)
+        path.write_text(json.dumps(entry['execution'], ensure_ascii=False, indent=2), encoding='utf-8')
+        (path.parent/'round.json').write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding='utf-8')
+        self.save()
+        self.publish(entry)
 
     def finish(self, seconds):
         self.result['performance']['total_elapsed_ms'] = round(seconds*1000,2)
