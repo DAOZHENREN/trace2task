@@ -43,8 +43,11 @@ class ModelAPIConfig:
     thinking_mode: str = "default"
     response_format: str = "json_schema"
     timeout_seconds: float = 120
+    context_window_tokens: int = 32768
 
     def __post_init__(self) -> None:
+        if type(self.context_window_tokens) is not int or self.context_window_tokens < 2048:
+            raise ValueError("API 上下文预算必须是至少 2048 的整数")
         if not isinstance(self.base_url, str):
             raise TypeError("API Base URL 必须是字符串")
         try:
@@ -226,6 +229,7 @@ class ModelAPISession:
         self.audit = None
         self.system_guidance = ""
         self.last_request_messages: list[dict[str, Any]] | None = None
+        self.context_near_limit = False
 
     def reset_thread(self) -> None:
         if self._closed.is_set():
@@ -233,10 +237,24 @@ class ModelAPISession:
         self._history.clear()
         self._generation += 1
         self.last_request_messages = None
+        self.context_near_limit = False
 
     def close(self) -> None:
         self._closed.set()
         self._history.clear()
+
+    def discard_history_images(self) -> int:
+        """Drop only previously submitted image parts, preserving every text role."""
+        removed = 0
+        for message in self._history:
+            if not isinstance(message.get('content'), list):
+                continue
+            content = message['content']
+            kept = [part for part in content if part.get('type') != 'image_url']
+            removed += len(content) - len(kept)
+            message['content'] = kept
+        self.context_near_limit = False
+        return removed
 
     def run_turn(
         self,
@@ -355,6 +373,16 @@ class ModelAPISession:
         if self.stop_check is not None:
             self.stop_check()
         self._history.extend([user_message, {"role": "assistant", "content": output}])
+        usage = result.get("usage") or {}
+        self.last_token_usage = usage
+        used = usage.get("total_tokens")
+        if not isinstance(used, int):
+            # Conservative fallback when the Chat Completions endpoint omits usage.
+            used = sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+                       if not isinstance(item.get("content"), list) else
+                       sum(len(part.get("text", "").encode("utf-8")) if part.get("type") == "text"
+                           else 4096 for part in item["content"]) for item in self._history)
+        self.context_near_limit = used >= self.config.context_window_tokens * .8
         self.last_turn_metrics = CodexTurnMetrics(
             total_ms=(time.perf_counter() - started) * 1000,
             thread_start_ms=0,

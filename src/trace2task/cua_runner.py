@@ -19,7 +19,7 @@ from trace2task.windows_runner import EmergencyStopRequested
 
 
 def run_cua_local(*, instruction, output_root, emergency_stop, status_callback, model, cua_target=None,
-                  experience_context=None, prompt_profile=None, on_model_round=None):
+                  experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None):
     if model == 'D-5970' and experience_context is not None:
         raise ValueError('D-5970 冻结输入结构不支持经验指导')
     root = Path(output_root)/(datetime.now(UTC).strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:8]+'-cua')
@@ -42,7 +42,7 @@ def run_cua_local(*, instruction, output_root, emergency_stop, status_callback, 
     predictor = predict_local
     if model != 'D-5970':
         from trace2task.local_gui_client import predict_gui
-        predictor = partial(predict_gui, model=model)
+        predictor = partial(predict_gui, model=model, expected_backend=inference_backend)
     started = time.perf_counter()
     emergency_stop.start()
     try:

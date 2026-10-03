@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from trace2task.web_console import WebConsoleController, create_web_server
@@ -37,7 +38,7 @@ def can_close(controller, window) -> bool:
     )
 
 
-def run_desktop(project_root: Path, *, webview_module=None, smoke_test=False) -> None:
+def run_desktop(project_root: Path, *, webview_module=None, smoke_test=False, development=False) -> None:
     root = project_root.expanduser().resolve(strict=True)
     if not root.is_dir():
         raise ValueError("Project root must be a directory")
@@ -55,25 +56,30 @@ def run_desktop(project_root: Path, *, webview_module=None, smoke_test=False) ->
         url = f"http://127.0.0.1:{server.server_address[1]}/"
         logger.info("Desktop console %s; data root %s", url, root)
         window = webview_module.create_window(
-            f"Trace2Task — {root.name}", url, width=1440, height=960,
+            f"Trace2Task{' 开发版' if development else ''} — {root.name}", url, width=1440, height=960,
             min_size=(960, 640), text_select=True,
         )
         window.events.closing += lambda: True if smoke_test else can_close(controller, window)
         window.events.loaded += lambda: logger.info(
             "Desktop page loaded: %s", window.evaluate_js(
                 "JSON.stringify({title:document.title,ready:document.readyState,"
+                "workbench:!!document.querySelector('#root'),"
                 "console:!!document.querySelector('#model-provider')})"
             ),
         )
         if smoke_test:
             def verify_page():
-                result = window.evaluate_js(
-                    "JSON.stringify({ready:document.readyState,"
-                    "console:!!document.querySelector('#model-provider'),"
-                    "components:!!document.querySelector('#component-runtime'),"
-                    "rsi:!!document.querySelector('#rsi-panel'),"
-                    "componentsHeight:document.querySelector('#components-panel').getBoundingClientRect().height})"
-                )
+                deadline = time.monotonic() + 20
+                while True:
+                    result = window.evaluate_js(
+                        "JSON.stringify({ready:document.readyState,"
+                        "workbench:!!document.querySelector('.composer'),"
+                        "navigation:document.querySelectorAll('.sidebar nav button').length,"
+                        "console:!!document.querySelector('#model-provider')})"
+                    )
+                    if json.loads(result).get('workbench') or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.1)
                 (root / "desktop-smoke.json").write_text(result, encoding="utf-8")
                 window.destroy()
             window.events.loaded += verify_page
@@ -149,7 +155,9 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path)
+    parser.add_argument("--development", action="store_true", help="Label the source-code desktop window")
     parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--elevated-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     mutex = None
     handler = None
@@ -157,6 +165,10 @@ def main(argv: list[str] | None = None) -> None:
     old_level = root_logger.level
     logs = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "Trace2Task/logs"
     try:
+        from trace2task.desktop_elevation import ensure_admin
+        child_exit = ensure_admin(list(sys.argv[1:] if argv is None else argv))
+        if child_exit is not None:
+            raise SystemExit(child_exit)
         root = choose_data_root(args.project_root)
         if root is None:
             return
@@ -182,7 +194,11 @@ def main(argv: list[str] | None = None) -> None:
         root_logger.addHandler(handler)
         root_logger.setLevel(logging.INFO)
         os.environ["TRACE2TASK_DATA_ROOT"] = str(root)
-        run_desktop(root, smoke_test=args.smoke_test)
+        logger.info("Source entry: %s; development=%s", __file__, args.development)
+        if args.development:
+            run_desktop(root, smoke_test=args.smoke_test, development=True)
+        else:
+            run_desktop(root, smoke_test=args.smoke_test)
     except Exception:
         error = traceback.format_exc()
         # Configuration errors can occur before the user-data logger is available.

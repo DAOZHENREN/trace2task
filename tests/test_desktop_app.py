@@ -7,6 +7,22 @@ import pytest
 from trace2task import desktop_app
 
 
+def test_installer_exports_a_evidence_dependencies_to_external_model_runtime():
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    spec = ast.parse((root / 'packaging/windows/Trace2Task.spec').read_text(encoding='utf-8'))
+    runtime_sources = next(
+        [node.value for node in item.generators[0].iter.elts]
+        for item in ast.walk(spec) if isinstance(item, ast.ListComp)
+        and isinstance(item.generators[0].iter, ast.List)
+        and any(isinstance(node, ast.Constant) and node.value == 'local_gui_client.py'
+                for node in item.generators[0].iter.elts)
+    )
+    assert {'trace_evidence.py', 'trace_projection.py'} <= set(runtime_sources)
+    assert all((root / 'src/trace2task' / name).is_file() for name in runtime_sources)
+
+
 def test_close_refuses_running_task_even_when_dialog_confirmed():
     controller = SimpleNamespace(active_job=lambda: {"status": "running"},
                                  components=SimpleNamespace(status=lambda: {'status': 'idle'}))
@@ -23,7 +39,8 @@ def test_idle_close_respects_confirmation():
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_native_shell_owns_server_and_cleans_up(tmp_path, monkeypatch, fail):
+@pytest.mark.parametrize("development", [False, True])
+def test_native_shell_owns_server_and_cleans_up(tmp_path, monkeypatch, fail, development):
     calls = []
 
     class Event:
@@ -43,6 +60,7 @@ def test_native_shell_owns_server_and_cleans_up(tmp_path, monkeypatch, fail):
         return server
 
     def create_window(title, url, **kwargs):
+        assert ("开发版" in title) is development
         assert url == "http://127.0.0.1:12345/"
         assert "js_api" not in kwargs
         return SimpleNamespace(events=SimpleNamespace(closing=Event(), loaded=Event()))
@@ -57,9 +75,9 @@ def test_native_shell_owns_server_and_cleans_up(tmp_path, monkeypatch, fail):
     viewer = SimpleNamespace(create_window=create_window, start=start)
     if fail:
         with pytest.raises(RuntimeError, match="WebView2"):
-            desktop_app.run_desktop(tmp_path, webview_module=viewer)
+            desktop_app.run_desktop(tmp_path, webview_module=viewer, development=development)
     else:
-        desktop_app.run_desktop(tmp_path, webview_module=viewer)
+        desktop_app.run_desktop(tmp_path, webview_module=viewer, development=development)
     assert calls[-2:] == ["shutdown", "close"]
 
 
@@ -117,6 +135,7 @@ def _mock_win32(monkeypatch):
     import ctypes
 
     api = SimpleNamespace(
+        shell32=SimpleNamespace(IsUserAnAdmin=Mock(return_value=1)),
         kernel32=SimpleNamespace(CreateMutexW=Mock(return_value=123),
                                  GetLastError=Mock(return_value=0), CloseHandle=Mock()),
         user32=SimpleNamespace(MessageBoxW=Mock()),

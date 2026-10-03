@@ -16,6 +16,8 @@ def project_experience(
 ) -> dict[str, Any] | None:
     if source is None:
         return None
+    if source.get("kind") == "trace_sequence":
+        return dict(source)
     semantic = source["semantic"]
     graph = semantic["state_graph"]
     states = {state["id"]: state for state in graph["states"]}
@@ -74,7 +76,7 @@ def project_experience(
 
 
 def known_state_ids(source: Mapping[str, Any] | None) -> set[str]:
-    if source is None:
+    if source is None or source.get("kind") == "trace_sequence":
         return set()
     return {
         state["id"] for state in source["semantic"]["state_graph"]["states"]

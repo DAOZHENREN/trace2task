@@ -9,8 +9,8 @@ import math
 import re
 
 from trace2task.execution_protocol import ActionPlan, ActionUnavailable, UnifiedAction
-
-MODELS = ('qwen3-vl-2b', 'gui-owl-2b', 'mai-ui-2b')
+from trace2task.model_registry import GUI_MODELS as MODELS
+from trace2task.model_registry import profile_for
 
 # Native model formats, not backend permissions. A backend reports its own
 # routes; the adapter exposes only the intersection to the model.
@@ -23,6 +23,7 @@ MODEL_ACTION_SKILLS = {
     'mai-ui-2b': frozenset({'click', 'double_click', 'type_text', 'press_key',
                             'hotkey', 'wait', 'scroll', 'drag'}),
 }
+MODEL_ACTION_SKILLS['qwen3-vl-8b-instruct'] = MODEL_ACTION_SKILLS['qwen3-vl-2b']
 
 
 def adapt_capabilities(model, executor_capabilities):
@@ -55,7 +56,7 @@ def adapt_execution_context(model, context):
     return projected
 
 TURN_TEMPLATE = ("Please generate the next move according to the UI screenshot, instruction and previous actions.\n\n"
-                 "Instruction: {{task}}\n\nPrevious actions:\n{{history}}"
+                 "Instruction: {{task}}\n\nPrevious model output (latest turn):\n{{history}}"
                  "{{experience_block}}{{execution_feedback_block}}{{execution_context_block}}")
 TURN_FIELDS = ('task', 'history', 'experience_block', 'execution_feedback_block')
 CONTEXT_FIELDS = ('execution_context_block', 'cua_context_block')
@@ -202,7 +203,7 @@ def prompt(model, cua=False):
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
-    if model == 'qwen3-vl-2b':
+    if profile_for(model).adapter == 'qwen-normalized-actions':
         return '''You control a Windows desktop using its current screenshot and actual executed history.
 Return ONLY JSON {"actions":[{"skill":"click","args":{"x":0.5,"y":0.5,"button":"left"}}]}.
 Coordinates are normalized 0..1. The JSON action format can express click,
@@ -261,7 +262,7 @@ def decode(model, text, cua=False, *, generation_complete=False, normalizations=
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
-    if model == 'qwen3-vl-2b':
+    if profile_for(model).adapter == 'qwen-normalized-actions':
         cleaned = text.strip()
         if cleaned.startswith('```json') and cleaned.endswith('```'):
             cleaned = cleaned[7:-3].strip()

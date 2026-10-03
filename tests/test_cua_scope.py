@@ -204,7 +204,10 @@ def run_cua_with_predictions(tmp_path, monkeypatch, driver, predictions, model='
                 return reviews.pop(0)
             return {'status': 'reviewed', 'verification': {
                 'verdict': 'unknown', 'evidence': 'test screenshot', 'missing': 'cannot confirm'}}
-        return {'status': 'predicted', 'prediction': {'actions': predictions.pop(0)}}
+        actions = predictions.pop(0)
+        return {'status': 'predicted', 'prediction': {'actions': actions},
+                'raw_output': json.dumps({'native_test_actions': actions}),
+                'conversation_id': kwargs['conversation_id']}
 
     monkeypatch.setattr(cua_runner, 'CuaBackend', lambda *args: driver)
     # Runner defaults to the real Win32 helper.  Tests use a deterministic
@@ -233,7 +236,7 @@ def test_false_completion_is_reviewed_then_replanned(tmp_path, monkeypatch):
     assert result['task_complete'] is True and result['verified'] is False
     assert len(driver.input_calls) == 1  # neither verification ever dispatches input
     assert calls[2]['execution_context']['execution_feedback']['status'] == 'completion_rejected'
-    assert calls[2]['history'] == []
+    assert calls[2]['history'][0]['input_call_status'] == 'not_sent'
     assert driver.observed_steps == [0, 1, 2, 3, 4]
     assert len({r['output_directory'] for r in result['model_io']}) == 5
     assert result['model_io'][1]['purpose'] == 'verify_completion'
@@ -277,7 +280,10 @@ def test_unverifiable_delivery_reobserves_then_replans_without_replaying_click(t
     assert driver.observed_steps == [0, 1, 2]  # Extra read-only completion review frame.
     assert len(predictions) == 3
     assert predictions[0]['image'] != predictions[1]['image']
-    assert predictions[1]['history'][-1]['effect'] == 'unverifiable'
+    assert predictions[1]['history'] == [{
+        'step_index': 0, 'model_output': result['model_io'][0]['raw_output'], 'input_call_status': 'returned'}]
+    assert predictions[1]['conversation_id'] == predictions[0]['conversation_id']
+    assert predictions[1]['conversation_start'] is False
     assert [name for name, _ in driver.input_calls] == ['click']
     assert result['actions'] == 1
     assert result['task_complete'] is False
@@ -290,7 +296,7 @@ def test_unverifiable_delivery_reobserves_then_replans_without_replaying_click(t
     pending = trace_events.index('effect_pending')
     second_capture = trace_events.index('capture', delivered + 1)
     reobservation = trace_events.index('effect_reobservation')
-    second_model_input = trace_events.index('model_input', delivered + 1)
+    second_model_input = trace_events.index('model_input_prepared', delivered + 1)
     assert delivered < pending < second_capture < reobservation < second_model_input
 
 
@@ -316,7 +322,8 @@ def test_explicit_background_refusal_uses_one_foreground_submission_then_reobser
         'step_index': 0, 'action': {'actions': [CLICK]},
         'executed': True, 'effect': 'unverifiable', 'delivery_mode_requested': 'foreground',
     }]
-    assert predictions[1]['history'][-1]['effect'] == 'unverifiable'
+    assert predictions[1]['history'][0]['input_call_status'] == 'returned'
+    assert predictions[1]['history'][0]['model_output'] == result['model_io'][0]['raw_output']
     trace_events = [json.loads(line)['type'] for line in Path(result['trace_path']).read_text(encoding='utf-8').splitlines()]
     assert trace_events.count('foreground_retry') == 1
     assert 'effect_pending' in trace_events
@@ -347,7 +354,7 @@ def test_foreground_focus_denial_is_known_no_input_not_transport_unknown(tmp_pat
 
 
 @pytest.mark.parametrize('effect', ['confirmed', 'unverifiable'])
-def test_repeated_action_is_allowed_with_fresh_comparison_images(tmp_path, monkeypatch, effect):
+def test_repeated_action_uses_fresh_frames_in_the_same_conversation(tmp_path, monkeypatch, effect):
     driver = RunnerDriver(tmp_path, effect=effect)
     result, predictions = run_cua_with_predictions(
         tmp_path, monkeypatch, driver, [[CLICK], [CLICK], [CLICK], [CLICK], [{'done': True}]],
@@ -356,10 +363,14 @@ def test_repeated_action_is_allowed_with_fresh_comparison_images(tmp_path, monke
     assert len(driver.input_calls) == 4
     assert result['actions'] == 4
     assert result['stop_reason'] == 'completion_unverifiable'
-    assert 'previous_image' not in predictions[0]
-    assert predictions[1]['previous_image'] == predictions[0]['image']
-    assert predictions[2]['previous_image'] == predictions[1]['image']
-    assert 'previous_image' not in predictions[-1]  # read-only completion review
+    # Previous frames live in the resident conversation, not duplicate request attachments.
+    assert all('previous_image' not in call for call in predictions)
+    assert len({call['image'] for call in predictions}) == len(predictions)
+    assert len({call['conversation_id'] for call in predictions}) == 1
+    assert predictions[0]['conversation_start'] is True
+    assert all(call['conversation_start'] is False for call in predictions[1:])
+    assert all(call['history'][0]['input_call_status'] == 'returned' for call in predictions[1:-1])
+    assert predictions[-1]['history'][0]['input_call_status'] == 'not_sent'  # done sent no input
 
 
 def test_background_refusal_foreground_failure_is_unknown_and_stops(tmp_path, monkeypatch):
@@ -420,7 +431,8 @@ def test_rejected_text_is_feedback_not_executed_history(tmp_path, monkeypatch, m
         [[{'skill': 'type_text', 'args': {'text': '123*456='}}], [CLICK], [{'done': True}]], model)
     assert result['actions'] == 1
     assert [tool for tool, _ in driver.input_calls] == ['click']
-    assert predictions[1]['history'] == []
+    assert predictions[1]['history'][0]['input_call_status'] == 'not_sent'
+    assert predictions[1]['history'][0]['model_output'] == result['model_io'][0]['raw_output']
     context = predictions[1]['execution_context']
     assert context['execution_feedback']['executed'] is False
     assert context['execution_feedback']['action']['skill'] == 'type_text'
@@ -451,5 +463,6 @@ def test_incomplete_tree_bare_text_is_dispatched_as_focused_control_route(tmp_pa
     assert payload['text'] == '123*456=' and payload['delivery_mode'] == 'background'
     assert not {'x', 'y', 'element_token'} & payload.keys()
     assert result['actions'] == 1 and result['history'][0]['effect'] == 'unverifiable'
-    assert predictions[1]['history'][0]['executed'] is True
+    assert predictions[1]['history'][0]['input_call_status'] == 'returned'
+    assert predictions[1]['history'][0]['model_output'] == result['model_io'][0]['raw_output']
     assert 'capabilities' not in predictions[1]['execution_context']

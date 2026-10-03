@@ -257,6 +257,8 @@ class CodexAppServerSession:
         self._initialized = False
         self._pending_messages: deque[dict[str, Any]] = deque()
         self.last_turn_metrics: CodexTurnMetrics | None = None
+        self.context_near_limit = False
+        self.last_token_usage = {}
         self._closed = False
 
     @property
@@ -306,6 +308,7 @@ class CodexAppServerSession:
         if self._closed:
             raise RuntimeError("Cannot reset a closed Codex App Server session")
         self._thread_id = None
+        self.context_near_limit = False
 
     def run_turn(
         self,
@@ -318,6 +321,7 @@ class CodexAppServerSession:
         reasoning_effort: str | None = None,
     ) -> str:
         total_started = time.perf_counter()
+        self.last_token_usage = {}
         active_effort = reasoning_effort or self.reasoning_effort
         if active_effort not in CODEX_REASONING_EFFORTS:
             raise ValueError(
@@ -399,6 +403,14 @@ class CodexAppServerSession:
             if self._handle_server_request(message):
                 continue
             method = message.get("method")
+            if method == "thread/tokenUsage/updated":
+                params = message.get("params", {})
+                usage = params.get("tokenUsage", {})
+                limit = usage.get("modelContextWindow")
+                used = usage.get("last", {}).get("totalTokens")
+                if params.get("threadId") == thread_id and limit and isinstance(used, int):
+                    self.context_near_limit = used >= limit * .8
+                    self.last_token_usage = usage.get('last', {})
             if isinstance(method, str) and method.startswith("item/"):
                 response_progress_seen = True
                 if self.progress_timeout_seconds is not None:

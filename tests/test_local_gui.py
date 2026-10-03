@@ -248,9 +248,11 @@ def test_download_never_uses_proxy(monkeypatch):
 def test_controller_keeps_selected_model(tmp_path,monkeypatch,model):
     from trace2task.web_console import WebConsoleController
     controller=WebConsoleController(tmp_path)
+    monkeypatch.setattr('trace2task.local_gui_llama.read_backend', lambda _: 'transformers')
     monkeypatch.setattr(controller,'_run_job',lambda *args:None)
     job=controller.start_job(task_path='',instruction='test',execute=True,model=model,
-        provider='trained_d',execution_scope='desktop',use_experience=False,continuous=True)
+        provider='trained_d',execution_scope='desktop',use_experience=False,continuous=True,
+        inference_backend='transformers')
     assert job['model']==model
 
 @pytest.mark.parametrize('model',['qwen3-vl-2b','gui-owl-2b','mai-ui-2b'])

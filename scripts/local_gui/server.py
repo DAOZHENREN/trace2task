@@ -19,8 +19,10 @@ from pathlib import Path
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+from trace2task import local_gui_memory
 from trace2task.execution_protocol import ActionUnavailable
 from trace2task.local_gui_client import validate_experience_context
+from trace2task.local_gui_prefix_cache import TextPrefixCache
 from trace2task.local_gui_protocol import (
     MODELS,
     TURN_TEMPLATE,
@@ -29,6 +31,7 @@ from trace2task.local_gui_protocol import (
     render_turn_template,
     validate_prompt_profile,
 )
+from trace2task.model_registry import GUI_CONTEXT_TOKENS, INFERENCE_BACKENDS, profile_for
 
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,127}\Z")
 _CANCEL_TTL_SECONDS = 120
@@ -43,9 +46,17 @@ class _CancelGeneration:
         return self.event.is_set()
 
 class Engine:
-    def __init__(self, root, output):
+    def __init__(self, root, output, backend='transformers'):
         self.root, self.output = root, output
+        from trace2task.local_gui_llama import BACKENDS, LlamaRuntime
+        if backend not in BACKENDS:
+            raise ValueError('Unknown GUI inference backend')
+        self.backend = backend
+        self.llama = LlamaRuntime(root, output) if backend == 'llama-server' else None
         self.model = self.processor = self.key = None
+        self.prefix_cache = TextPrefixCache()
+        self.conversation = None
+        self.observed_bytes_per_token = 0
         # Loading/prediction must serialize GPU access. Cancellation deliberately does
         # not take this lock: it has to work while generate() is in progress.
         self.lock = threading.Lock()
@@ -133,10 +144,18 @@ class Engine:
         }
 
     def load(self, key):
+        from trace2task.model_registry import profile_for
+        profile_for(key, self.backend)
+        if self.llama is not None:
+            self.llama.load(key)
+            self.key = key
+            return
         import torch
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
         if key == self.key:
             return
+        self.prefix_cache.clear()
+        self.observed_bytes_per_token = 0
         self.model = self.processor = self.key = None
         gc.collect()
         torch.cuda.empty_cache()
@@ -158,32 +177,265 @@ class Engine:
             trust_remote_code=False, min_pixels=65536, max_pixels=1048576)
         self.key = key
 
+    def _decode_prediction(self, key, raw, image, request, folder, review,
+                           conversation, content, current_images):
+        from PIL import ImageDraw
+        if conversation is not None:
+            conversation.commit(content, raw, current_images, request.get('step_index'))
+        normalizations = []
+        if review:
+            from trace2task.local_gui_protocol import decode_completion_review
+            verdict = decode_completion_review(raw)
+            outcome = {'status': 'reviewed', 'phase': 'verification',
+                       'verification': verdict, 'raw_output': raw,
+                       'execution_status': 'read_only_no_actions',
+                       'output_directory': str(folder)}
+            return outcome
+        try:
+            prediction = decode(key, raw, generation_complete=True,
+                                normalizations=normalizations,
+                                cursor_position=request.get('cursor_position'))
+        except ActionUnavailable as error:
+            outcome = {'status': 'adapter_rejected', 'error': str(error),
+                       'raw_output': raw, 'execution_status': 'no_input_sent',
+                       'output_directory': str(folder)}
+            return outcome
+        except ValueError as error:
+            # The model response has been generated, but no action has reached
+            # the execution core. A fresh model turn may correct its format;
+            # generation, transport and post-dispatch errors are not retried.
+            outcome = {'status': 'format_rejected',
+                       'error': f'{type(error).__name__}: {error}',
+                       'raw_output': raw, 'execution_status': 'no_input_sent',
+                       'output_directory': str(folder)}
+            return outcome
+        if 'control' in prediction:
+            outcome = {'status': 'model_control', 'control': prediction['control'],
+                       'text': prediction['text'], 'raw_output': raw,
+                       'execution_status': 'no_input_sent', 'output_directory': str(folder)}
+            return outcome
+        annotation = image.copy()
+        draw = ImageDraw.Draw(annotation)
+        for i, action in enumerate(prediction['actions']):
+            args = action.get('args',{})
+            if 'x' in args:
+                x,y = args['x']*(image.width-1),args['y']*(image.height-1)
+                draw.ellipse((x-12,y-12,x+12,y+12),outline='red',width=3)
+                draw.text((x+14,y),str(i+1),fill='red')
+            elif action.get('skill') == 'drag':
+                start = (args['start_x']*(image.width-1), args['start_y']*(image.height-1))
+                end = (args['end_x']*(image.width-1), args['end_y']*(image.height-1))
+                draw.line([start, end], fill='red', width=3)
+                for label, (x, y) in [('start', start), ('end', end)]:
+                    draw.ellipse((x-7,y-7,x+7,y+7),outline='red',width=2)
+                    draw.text((x+9,y),f'{i+1} {label}',fill='red')
+            elif action.get('skill') == 'scroll':
+                draw.text((12,12+i*20),f"{i+1} scroll {args['direction']} {args['amount']} {args['by']}",fill='red')
+        annotation.save(folder/'annotated.png')
+        outcome = {'status':'predicted','model':key,'prediction':prediction,'raw_output':raw,
+                   'output_directory':str(folder), 'phase':'prediction',
+                   'execution_status':'not_executed_by_model_service',
+                   'task_verification_status':'not_evaluated_by_model_service',
+                   'protocol_normalizations': normalizations}
+        outcome['annotated_image']='data:image/png;base64,'+base64.b64encode((folder/'annotated.png').read_bytes()).decode()
+        return outcome
+
+    def _predict_llama(self, request, key, image, folder, save, cancelled, request_id,
+                       conversation, system_prompt, content, current_images,
+                       messages, images, input_record, context_report, review):
+        from trace2task.local_gui_llama import (
+            ContextFull,
+            GenerationCancelled,
+            llama_precision,
+            wire_messages,
+        )
+        started = time.perf_counter()
+        phase_ms = {'load_ms': 0.0, 'generate_ms': 0.0}
+        tokens = {'input_tokens': None, 'output_tokens': 0, 'cached_tokens': None}
+        raw, outcome = '', None
+        context_report['policy'] = INFERENCE_BACKENDS['llama-server'].context_policy
+        input_record['configuration'] = {
+            'backend': 'llama-server', **llama_precision(key),
+            'attention': 'llama.cpp flash-attention', 'max_new_tokens': 512,
+            'image_min_tokens': 1024, 'image_max_tokens': 1024,
+            'model_context_window': GUI_CONTEXT_TOKENS, 'context_shift': False,
+            'memory_policy': 'engine_managed_kv', 'image_count': len(images)}
+        try:
+            if cancelled.is_set():
+                raise GenerationCancelled('cancelled_before_load')
+            self.llama.load(key, cancelled)
+            self.key = key
+            phase_ms['load_ms'] = (time.perf_counter() - started) * 1000
+            if conversation is not None:
+                from trace2task.gui_summarization import (
+                    compact_conversation,
+                    projected_context_tokens,
+                )
+                projected = projected_context_tokens(conversation, content)
+                event = compact_conversation(conversation, self.llama, cancelled, projected, save)
+                if event is not None:
+                    context_report['compaction'] = event
+                    context_report['removed_images'] += event['removed_images']
+                    context_report['removed_text_messages'] = event['replaced_text_messages']
+                    context_report['removed_tokens'] = None
+                    context_report['history_images_after'] = conversation.history_image_count
+                    phase_ms['summarize_ms'] = event['elapsed_ms']
+                    messages, images = conversation.compose(system_prompt, content, current_images)
+            while True:
+                if cancelled.is_set():
+                    raise GenerationCancelled('cancelled_before_generation')
+                attempt_index = len(context_report['inference_attempts'])
+                names = []
+                for index, picture in enumerate(images):
+                    name = f'context-image-{attempt_index:02d}-{index:03d}.png'
+                    picture.save(folder / name)
+                    names.append(name)
+                steps = [*(conversation.image_steps() if conversation else [None] * len(input_record.get('experience_image_ids', []))), request.get('step_index', 0)]
+                input_record.update(messages=messages, image_order=names, input_stage='inference_started',
+                    image_sources=[{'filename': name, 'step_index': step,
+                                    'kind': 'experience' if step is None else 'current' if index == len(names) - 1 else 'history',
+                                    **({'evidence_id': input_record['experience_image_ids'][index]} if step is None else {})}
+                                   for index, (name, step) in enumerate(zip(names, steps, strict=True))])
+                input_record['configuration']['image_count'] = len(images)
+                from trace2task.model_registry import profile_for
+                payload = {'model': profile_for(key).alias, 'messages': wire_messages(messages, images),
+                           'max_tokens': 512, 'temperature': 0, 'stream': False, 'cache_prompt': True}
+                attempt = {'index': attempt_index, 'image_count': len(images), 'status': 'inference_started',
+                           'input_path': f'attempt-{attempt_index:02d}-input.json'}
+                context_report['inference_attempts'].append(attempt)
+                # Save the exact HTTP body (including image bytes), without authentication.
+                save(attempt['input_path'], payload)
+                save('input.json', input_record)
+                generated = time.perf_counter()
+                try:
+                    response = self.llama.complete(payload, cancelled)
+                    attempt['status'] = 'generated'
+                    break
+                except ContextFull as error:
+                    attempt.update(status='context_full_no_output', error=str(error))
+                    eviction = conversation.discard_oldest_image() if conversation else None
+                    if eviction is None:
+                        raise RuntimeError('模型上下文已满且无历史图片可移除；文本、经验与当前截图均未删减。') from error
+                    context_report['evictions'].append({**eviction, 'reason': 'model_context_window',
+                                                        'removed_tokens': None})
+                    context_report['removed_images'] += 1
+                    context_report['removed_tokens'] = None
+                    context_report['history_images_after'] = conversation.history_image_count
+                    messages, images = conversation.compose(system_prompt, content, current_images)
+                finally:
+                    phase_ms['generate_ms'] += (time.perf_counter() - generated) * 1000
+                    save('context-management.json', context_report)
+            save('llama-response.json', response)
+            choice = response['choices'][0]
+            raw = choice['message'].get('content') or ''
+            usage, timings = response.get('usage', {}), response.get('timings', {})
+            tokens.update(input_tokens=usage.get('prompt_tokens'), output_tokens=usage.get('completion_tokens', 0),
+                          cached_tokens=usage.get('prompt_tokens_details', {}).get('cached_tokens', timings.get('cache_n')))
+            context_report.update(input_tokens_after_cleanup=tokens['input_tokens'],
+                                  input_tokens_before_cleanup=tokens['input_tokens'] if not (
+                                      context_report['evictions'] or context_report.get('compaction')) else None)
+            save('prefix-cache.json', {'owner': 'llama-server', 'cached_tokens': tokens['cached_tokens'],
+                                       'timings': timings, 'usage': usage})
+            input_record['input_stage'] = 'generation_completed'
+            save('raw-output.json', {'request_id': request_id, 'text': raw, **tokens,
+                                    'finish_reason': choice.get('finish_reason'), 'cancel_requested': cancelled.is_set()})
+            if cancelled.is_set():
+                raise GenerationCancelled('cancelled_during_generation')
+            if choice.get('finish_reason') != 'stop' or not raw.strip():
+                raise ValueError('Model output truncated or empty; no action executed')
+            outcome = self._decode_prediction(key, raw, image, request, folder, review,
+                                              conversation, content, current_images)
+            if conversation is not None:
+                conversation.last_total_tokens = usage.get('total_tokens')
+            if context_report.get('compaction'):
+                context_report['compaction']['input_tokens_after'] = tokens['input_tokens']
+                save('compaction.json', context_report['compaction'])
+        except GenerationCancelled as error:
+            outcome = {'status': 'cancelled', 'reason': str(error), 'raw_output': raw}
+        except Exception as error:  # noqa: BLE001 - retain the inference failure in the audit
+            (folder / 'error.log').write_text(traceback.format_exc(), encoding='utf-8')
+            outcome = {'status': 'error', 'error': f'{type(error).__name__}: {error}', 'raw_output': raw}
+        finally:
+            if (folder / 'compaction.json').exists():
+                context_report['compaction'] = json.loads((folder / 'compaction.json').read_text(encoding='utf-8'))
+            phase_ms['total_ms'] = (time.perf_counter() - started) * 1000
+            if outcome is None:
+                outcome = {'status': 'error', 'error': 'Prediction ended without an outcome'}
+            outcome.update(request_id=request_id, model=key, backend='llama-server', output_directory=str(folder),
+                           context_management=context_report,
+                           metrics={'phase_ms': phase_ms, 'tokens': tokens,
+                                    'memory': {'available': False, 'reason': 'External engine; not PyTorch allocator metrics'}},
+                           elapsed_seconds=phase_ms['total_ms'] / 1000, load_seconds=phase_ms['load_ms'] / 1000,
+                           peak_allocated_bytes=None, peak_reserved_bytes=None)
+            if conversation is not None:
+                outcome.update(conversation_id=conversation.identity, dropped_history_images=conversation.dropped_images)
+            save('input.json', input_record)
+            save('context-management.json', context_report)
+            save('outcome.json', outcome)
+            if outcome['status'] == 'predicted':
+                save('prediction.json', outcome)
+            self.finish_cancellation(request_id)
+        return outcome
+
     def predict(self, request):
         key = request.get('model')
         if key not in MODELS:
             raise ValueError('Unknown model')
+        if request.get('expected_backend') not in (None, self.backend):
+            raise ValueError('Requested inference backend differs from the running engine; no inference performed')
+        profile_for(key, self.backend)
         if 'execution_context' in request and 'cua_context' in request:
             raise ValueError('Ambiguous execution context; provide only one field')
         task, history = request.get('task'), request.get('history', [])
-        if not isinstance(task,str) or not task.strip() or len(task)>10000 or not isinstance(history,list) or len(history)>4:
+        # Legacy/stateless calls may carry executor history: expose only native
+        # model output, never receipts or call-status metadata.
+        history = [{'model_output': item['model_output']} for item in history
+                   if isinstance(item, dict) and item.get('model_output')]
+        if not isinstance(task,str) or not task.strip() or len(task)>10000 or not isinstance(history,list):
             raise ValueError('Invalid task/history')
         experience_context = validate_experience_context(request.get('experience_context'))
         prompt_profile = (validate_prompt_profile(request['prompt_profile'])
                           if request.get('prompt_profile') is not None else None)
-        import torch
-        from PIL import Image, ImageDraw
-        from transformers import StoppingCriteriaList
+        conversation = None
+        if request.get('conversation_id') is not None:
+            from trace2task.gui_conversation import GuiConversation
+
+            identity = self._request_id(request['conversation_id'])
+            if request.get('conversation_start') is True:
+                if self.conversation is not None and self.conversation.identity == identity:
+                    raise ValueError('Conversation already started; duplicate start rejected')
+                self.conversation = GuiConversation(identity, key, task, experience_context, prompt_profile)
+            conversation = self.conversation
+            if (conversation is None or conversation.identity != identity
+                    or conversation.model != key or conversation.task != task):
+                raise ValueError('Task conversation was lost or changed; start a new task')
+            experience_context = conversation.experience
+            if prompt_profile is not None and prompt_profile != conversation.prompt_profile:
+                raise ValueError('System prompt changed within a task; start a new task')
+            prompt_profile = conversation.prompt_profile
+            if experience_context is not None and experience_context.get('kind') != 'trace_sequence':
+                raise ValueError('Task conversations only accept complete trace sequences')
+        from PIL import Image
         request_id = self._request_id(request.get('request_id'))
         image = Image.open(io.BytesIO(base64.b64decode(request['image'], validate=True)))
         if image.width*image.height > 32_000_000:
             raise ValueError('Image too large')
         image = image.convert('RGB')
-        previous_image = None
+        evidence_images = []
+        evidence_ids = [item['id'] for item in (experience_context or {}).get('images', [])]
+        if conversation is None or conversation.total_turns == 0:
+            from trace2task.trace_evidence import image_bytes
+
+            for data in image_bytes((experience_context or {}).get('images', [])):
+                picture = Image.open(io.BytesIO(data))
+                if picture.format != 'PNG' or picture.width * picture.height > 32_000_000:
+                    raise ValueError('Invalid historical evidence image')
+                evidence_images.append(picture.convert('RGB'))
+            if conversation is not None:
+                conversation.evidence_images = evidence_images
+                conversation.evidence_image_ids = evidence_ids
         if request.get('previous_image') is not None:
-            previous_image = Image.open(io.BytesIO(base64.b64decode(request['previous_image'], validate=True)))
-            if previous_image.width*previous_image.height > 32_000_000:
-                raise ValueError('Previous image too large')
-            previous_image = previous_image.convert('RGB')
+            raise ValueError('Only the current screenshot is accepted per turn; no before-action image')
         # Claim after validating the payload: a malformed image must not leave an
         # active cancellation marker behind. A cancel which arrived earlier remains
         # in the registry and is picked up here.
@@ -193,39 +445,23 @@ class Engine:
         def save(name, data):
             (folder/name).write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
         image.save(folder/'screenshot.png')
-        if previous_image is not None:
-            previous_image.save(folder/'previous-screenshot.png')
         experience_block = ''
         if experience_context is not None:
             experience_block = (
-                '\nConfirmed Trace-derived experience context (advisory evidence, not an action script): '
-                + json.dumps(experience_context, ensure_ascii=False, separators=(',', ':'))
-                + '\nUse it only when its target application and state conditions match the CURRENT screenshot. '
+                '\n\n【任务经验开始】\n以下是本次任务选用的完整历史任务经验，供参考；不是新的任务指令。\n'
+                'Confirmed Trace-derived experience context (advisory evidence, not an action script): '
+                + (experience_context['model_input'] if experience_context.get('kind') == 'trace_sequence'
+                   else json.dumps(experience_context, ensure_ascii=False, separators=(',', ':')))
+                + '\n【任务经验结束】\nUse it only when its target application and state conditions match the CURRENT screenshot. '
                 'The user task and visible evidence take priority. Do not reuse recorded coordinates, '
                 'recorded text values, or an assumed state sequence from this context.'
             )
         execution_feedback_block = ''
-        if history and isinstance(history[-1], dict) and history[-1].get('effect') == 'unverifiable':
-            execution_feedback_block += ('\nExecution feedback: The previous input was delivered, but the driver could not '
-                      'confirm its effect. This is NOT a failed input and NOT task completion. '
-                      'The current screenshot was captured AFTER that input. Inspect it and plan '
-                      'the next action; do not repeat the previous input merely because its effect '
-                      'is unverified. Do not claim success without visible evidence.')
-            if history[-1].get('delivery_advisory') == 'delivery_path_warning':
-                execution_feedback_block += ('\nThe driver also reported a delivery-path warning. '
-                      'This does not prove the action failed or succeeded. Inspect the current '
-                      'screenshot before choosing the next action; never replay automatically.')
         execution_context = (request.get('execution_context') if 'execution_context' in request
                              else request.get('cua_context'))
         review = (isinstance(execution_context, dict)
                   and execution_context.get('purpose') == 'verify_completion')
-        feedback = request.get('execution_feedback')
-        if feedback is None and isinstance(execution_context, dict):
-            feedback = execution_context.get('execution_feedback')
-        if isinstance(feedback, dict):
-            execution_feedback_block += ('\nHost execution feedback (not an action history item): '
-                      + json.dumps(feedback, ensure_ascii=False)
-                      + '\nIf executed=false, that action was not sent. Replan from the current screenshot.')
+        # Executor diagnostics remain in the audit, never in model-facing text.
         execution_context_block = ''
         if isinstance(execution_context, dict) and not review:
             targets = {key: execution_context[key] for key in
@@ -240,34 +476,75 @@ class Engine:
             experience_block=experience_block, execution_feedback_block=execution_feedback_block,
             execution_context_block=execution_context_block)
         system_prompt = prompt_profile['system_prompt'] if prompt_profile else prompt(key)
+        if conversation is not None and conversation.total_turns == 0:
+            conversation.initial_user_text = render_turn_template(
+                prompt_profile['turn_template'] if prompt_profile else TURN_TEMPLATE,
+                task=task, history='No previous action.', experience_block=experience_block,
+                execution_feedback_block='', execution_context_block='')
         if review:
             from trace2task.local_gui_protocol import COMPLETION_REVIEW_PROMPT
-            system_prompt = COMPLETION_REVIEW_PROMPT
+            system_prompt = (system_prompt if conversation is not None else COMPLETION_REVIEW_PROMPT)
             text = ('Read-only completion review. Original task: ' + task
-                    + '\nActual delivered history: ' + json.dumps(history, ensure_ascii=False)
+                    + '\n' + COMPLETION_REVIEW_PROMPT
+                    + '\nPrevious model output: ' + json.dumps(history, ensure_ascii=False)
                     + '\nInspect the attached fresh screenshot. Return the review JSON, no actions.')
         content = [{'type': 'image'}, {'type': 'text', 'text': text}]
+        if conversation is not None and not review:
+            content = [{'type': 'image'}]
+            if conversation.total_turns:
+                content.insert(0, {'type': 'text', 'text': 'Instruction: ' + conversation.task})
         images = [image]
-        if previous_image is not None and not review:
-            content = [{'type': 'text', 'text': 'BEFORE the most recent delivered action (reference only):'},
-                       {'type': 'image'},
-                       {'type': 'text', 'text': 'CURRENT screenshot. All action coordinates must refer to THIS image:'},
-                       {'type': 'image'}, {'type': 'text', 'text': text}]
-            images = [previous_image, image]
+        if conversation is None:
+            evidence_content = []
+            for index, identity in enumerate(evidence_ids):
+                evidence_content.extend([{'type': 'text', 'text': f'Historical demonstration A attachment {index + 1}, frame {identity}. NOT the current screen.'},
+                                         {'type': 'image'}])
+            content = [*evidence_content, *content]
+            images = [*evidence_images, image]
         messages = [{'role':'system','content':system_prompt}, {'role':'user','content':content}]
-        save('input.json', {'request_id':request_id,'model':key,'messages':messages,'screenshot':'screenshot.png',
+        current_images = images
+        if conversation is not None:
+            messages, images = conversation.compose(system_prompt, content, current_images)
+        context_report = {
+            'policy': INFERENCE_BACKENDS['transformers'].context_policy, 'evictions': [], 'removed_tokens': 0,
+            'removed_images': 0, 'removed_text_messages': 0,
+            'input_tokens_before_cleanup': None, 'input_tokens_after_cleanup': None,
+            'history_turns': len(conversation.turns) if conversation else 0,
+            'history_images_before': conversation.history_image_count if conversation else 0,
+            'history_images_after': conversation.history_image_count if conversation else 0,
+            'new_image_count': 1 + len(evidence_images), 'experience_image_count': len(evidence_ids), 'inference_attempts': [],
+        }
+        input_record = {'request_id':request_id,'model':key,'messages':messages,'screenshot':'screenshot.png',
              'image_size':image.size, 'step_index':request.get('step_index'),
              'adapter_cursor_position': request.get('cursor_position'),
              'experience_context': experience_context,
-             'image_order': ['previous-screenshot.png', 'screenshot.png'] if len(images) == 2 else ['screenshot.png'],
-             'configuration':{'max_pixels':1048576,'max_new_tokens':512,'do_sample':False,
+             'experience_image_ids': evidence_ids,
+             'input_stage': 'prepared_not_yet_inferred',
+             'conversation_id': conversation.identity if conversation else None,
+             'client_submission': {'conversation_start': request.get('conversation_start') is True,
+                                   'experience_sent': request.get('experience_context') is not None,
+                                   'prompt_profile_sent': request.get('prompt_profile') is not None,
+                                   'new_image_count': 1 + len(evidence_images)},
+             # The first user message acquires task/experience during compose().
+             # Audit the actual assembled message, not the pre-compose screenshot.
+             'new_messages': [messages[-1]],
+             'context_management': context_report,
+             'image_order': [],
+             'configuration':{'backend': self.backend, 'max_pixels':1048576,'max_new_tokens':512,'do_sample':False,
                               'dtype':'bfloat16','attention':'sdpa','profile':'local-12GB',
-                              'max_input_tokens':6144, 'image_count':len(images)}})
+                              'memory_policy': 'measured_vram_images_only', 'image_count':len(images)}}
+        save('input.json', input_record)
+        if self.llama is not None:
+            return self._predict_llama(request, key, image, folder, save, cancelled, request_id,
+                                       conversation, system_prompt, content, current_images,
+                                       messages, images, input_record, context_report, review)
+        import torch
+        from transformers import StoppingCriteriaList
         phase_ms = {'load_ms': 0.0, 'preprocess_ms': 0.0, 'generate_ms': 0.0,
                     'decode_ms': 0.0, 'total_ms': 0.0}
         tokens = {'input_tokens': None, 'output_tokens': 0}
         memory = {'before': self._memory(torch)}
-        generated = inputs = ids = None
+        generated = inputs = ids = past = None
         raw = ''
         outcome = None
         started_total = time.perf_counter()
@@ -284,32 +561,137 @@ class Engine:
                 outcome = {'status': 'cancelled', 'reason': 'cancelled_after_load'}
                 return outcome
             preprocess_started = time.perf_counter()
-            formatted = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            (folder/'formatted-prompt.txt').write_text(formatted,encoding='utf-8')
-            inputs = self.processor(text=[formatted],images=images,return_tensors='pt').to('cuda')
-            save('tokenized-input.json', {'input_ids':inputs.input_ids.tolist(),
-                 'attention_mask':inputs.attention_mask.tolist(),
-                 'image_grid_thw':inputs.image_grid_thw.tolist()})
-            tokens['input_tokens'] = int(inputs.input_ids.shape[-1])
-            if inputs.input_ids.shape[-1] > 6144:
-                raise ValueError('Input exceeds local 6144-token budget; no silent truncation')
-            phase_ms['preprocess_ms'] = (time.perf_counter()-preprocess_started)*1000
-            memory['before_generate'] = self._memory(torch)
-            if cancelled.is_set():
-                outcome = {'status': 'cancelled', 'reason': 'cancelled_before_generation'}
-                return outcome
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            started = time.perf_counter()
-            try:
-                with torch.inference_mode():
-                    generated = self.model.generate(
-                        **inputs, max_new_tokens=512, do_sample=False,
-                        stopping_criteria=StoppingCriteriaList([_CancelGeneration(cancelled)]))
+            pending_eviction = None
+            oom_type = getattr(torch, 'OutOfMemoryError', MemoryError)
+
+            def discard_image(reason, count, assessment):
+                eviction = conversation.discard_oldest_image() if conversation else None
+                if eviction is None:
+                    raise RuntimeError(
+                        '显存或模型窗口不足，且已无可丢弃的历史图片；全部文本、完整经验和当前截图均未删减。'
+                        f' reason={reason}, input_tokens={count}')
+                event = {**eviction, 'reason': reason, 'input_tokens_before': count,
+                         'input_tokens_after': None, 'removed_tokens': None, 'memory': assessment}
+                context_report['evictions'].append(event)
+                context_report['removed_images'] += eviction['removed_images']
+                context_report['removed_tokens'] = None
+                context_report['history_images_after'] = conversation.history_image_count
+                return event
+
+            while True:
+                if cancelled.is_set():
+                    outcome = {'status': 'cancelled', 'reason': 'cancelled_during_context_preparation'}
+                    return outcome
+                formatted = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                # Tokenize on CPU; do not allocate the oversized visual batch on CUDA before admission.
+                inputs = self.processor(text=[formatted],images=images,return_tensors='pt')
+                count = int(inputs.input_ids.shape[-1])
+                tokens['input_tokens'] = count
+                if context_report['input_tokens_before_cleanup'] is None:
+                    context_report['input_tokens_before_cleanup'] = count
+                if pending_eviction is not None:
+                    pending_eviction.update(input_tokens_after=count,
+                                            removed_tokens=pending_eviction['input_tokens_before'] - count)
+                    context_report['removed_tokens'] = sum(
+                        item['removed_tokens'] for item in context_report['evictions'])
+                    pending_eviction = None
+                context_report.update(input_tokens_after_cleanup=count,
+                                      history_images_after=conversation.history_image_count if conversation else 0)
+                config = getattr(self.model, 'config', None)
+                model_limit = getattr(getattr(config, 'text_config', None), 'max_position_embeddings', None)
+                input_record['configuration']['model_context_window'] = model_limit
+                assessment = local_gui_memory.memory_admission(
+                    self.model, inputs, torch, observed_bytes_per_token=self.observed_bytes_per_token)
+                context_report['memory_admission'] = assessment
+                reason = ('model_context_window' if model_limit is not None and count + 512 > model_limit
+                          else 'vram_pressure' if not assessment['fits'] else None)
+                input_record.update(messages=messages, input_stage='prepared_not_yet_inferred')
+                input_record['configuration']['image_count'] = len(images)
+                save('input.json', input_record)
+                save('context-management.json', context_report)
+                if reason is not None:
+                    pending_eviction = discard_image(reason, count, assessment)
+                    inputs = None
+                    messages, images = conversation.compose(system_prompt, content, current_images)
+                    continue
+
+                (folder/'formatted-prompt.txt').write_text(formatted,encoding='utf-8')
+                image_names = []
+                for index, picture in enumerate(images):
+                    name = f'context-image-{len(context_report["inference_attempts"]):02d}-{index:03d}.png'
+                    picture.save(folder/name)
+                    image_names.append(name)
+                input_record['image_order'] = image_names
+                historical_steps = (conversation.image_steps() if conversation else
+                                    [None] * len(input_record['experience_image_ids']))
+                input_record['image_sources'] = [
+                    {'filename': name, 'step_index': step,
+                     'kind': 'experience' if step is None else 'history' if index < len(historical_steps) else 'current',
+                     **({'evidence_id': input_record['experience_image_ids'][index]} if step is None else {})}
+                    for index, (name, step) in enumerate(zip(
+                        image_names, [*historical_steps, request.get('step_index', 0)], strict=True))]
+                tokenized = {'input_ids':inputs.input_ids.tolist(),
+                             'attention_mask':inputs.attention_mask.tolist(),
+                             'image_grid_thw':inputs.image_grid_thw.tolist()}
+                save('tokenized-input.json', tokenized)
+                phase_ms['preprocess_ms'] = (time.perf_counter()-preprocess_started)*1000
+                memory['before_generate'] = self._memory(torch)
+                if cancelled.is_set():
+                    outcome = {'status': 'cancelled', 'reason': 'cancelled_before_generation'}
+                    return outcome
                 torch.cuda.synchronize()
-            finally:
-                phase_ms['generate_ms'] = (time.perf_counter()-started)*1000
-                memory['peak'] = self._memory(torch, peak=True)
+                torch.cuda.reset_peak_memory_stats()
+                attempt_index = len(context_report['inference_attempts'])
+                attempt = {'index': attempt_index, 'input_tokens': count, 'image_count': len(images),
+                           'status': 'prepared', 'input_path': f'attempt-{attempt_index:02d}-input.json'}
+                context_report['inference_attempts'].append(attempt)
+                save(attempt['input_path'], {'messages': messages, 'tokenized': tokenized,
+                                            'image_order': image_names})
+                started = time.perf_counter()
+                out_of_memory = False
+                try:
+                    inputs = inputs.to('cuda')
+                    attempt['status'] = 'inference_started'
+                    input_record['input_stage'] = 'inference_started'
+                    save('input.json', input_record)
+                    with torch.inference_mode():
+                        prefill_started = time.perf_counter()
+                        past, cache_report = self.prefix_cache.prepare(self.model, inputs)
+                        torch.cuda.synchronize()
+                        phase_ms['prefill_ms'] = (time.perf_counter() - prefill_started) * 1000
+                        memory['prefix_cache'] = cache_report
+                        save('prefix-cache.json', cache_report)
+                        if cancelled.is_set():
+                            outcome = {'status': 'cancelled', 'reason': 'cancelled_during_prefill'}
+                            return outcome
+                        generated = self.model.generate(
+                            **inputs, **({'past_key_values': past} if past is not None else {}),
+                            max_new_tokens=512, do_sample=False,
+                            stopping_criteria=StoppingCriteriaList([_CancelGeneration(cancelled)]))
+                    torch.cuda.synchronize()
+                    attempt['status'] = 'generated'
+                    input_record['input_stage'] = 'generation_completed'
+                except oom_type:
+                    # No desktop action has been dispatched. Retry inference only after image eviction.
+                    attempt['status'] = 'cuda_out_of_memory_no_output'
+                    out_of_memory = True
+                finally:
+                    phase_ms['generate_ms'] += (time.perf_counter()-started)*1000
+                    memory['peak'] = self._memory(torch, peak=True)
+                if not out_of_memory:
+                    peak_bytes = memory['peak'].get('peak_allocated_bytes', 0)
+                    before_bytes = memory['before_generate'].get('allocated_bytes', 0)
+                    self.observed_bytes_per_token = max(
+                        self.observed_bytes_per_token, max(0, peak_bytes - before_bytes) / max(1, count))
+                    break
+                generated = past = inputs = None
+                self.prefix_cache.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
+                pending_eviction = discard_image('cuda_out_of_memory', count, assessment)
+                messages, images = conversation.compose(system_prompt, content, current_images)
+            save('input.json', input_record)
+            save('context-management.json', context_report)
             ids = generated[0,inputs.input_ids.shape[-1]:]
             tokens['output_tokens'] = len(ids)
             decode_started = time.perf_counter()
@@ -326,72 +708,26 @@ class Engine:
             eos = eos if isinstance(eos,list) else [eos]
             if not len(ids) or int(ids[-1]) not in eos:
                 raise ValueError('Model output truncated or empty; no action executed')
-            normalizations = []
-            if review:
-                from trace2task.local_gui_protocol import decode_completion_review
-                verdict = decode_completion_review(raw)
-                outcome = {'status': 'reviewed', 'phase': 'verification',
-                           'verification': verdict, 'raw_output': raw,
-                           'execution_status': 'read_only_no_actions',
-                           'output_directory': str(folder)}
-                return outcome
-            try:
-                prediction = decode(key, raw, generation_complete=True,
-                                    normalizations=normalizations,
-                                    cursor_position=request.get('cursor_position'))
-            except ActionUnavailable as error:
-                outcome = {'status': 'adapter_rejected', 'error': str(error),
-                           'raw_output': raw, 'execution_status': 'no_input_sent',
-                           'output_directory': str(folder)}
-                return outcome
-            except ValueError as error:
-                # The model response has been generated, but no action has reached
-                # the execution core. A fresh model turn may correct its format;
-                # generation, transport and post-dispatch errors are not retried.
-                outcome = {'status': 'format_rejected',
-                           'error': f'{type(error).__name__}: {error}',
-                           'raw_output': raw, 'execution_status': 'no_input_sent',
-                           'output_directory': str(folder)}
-                return outcome
-            if 'control' in prediction:
-                outcome = {'status': 'model_control', 'control': prediction['control'],
-                           'text': prediction['text'], 'raw_output': raw,
-                           'execution_status': 'no_input_sent', 'output_directory': str(folder)}
-                return outcome
-            annotation = image.copy()
-            draw = ImageDraw.Draw(annotation)
-            for i, action in enumerate(prediction['actions']):
-                args = action.get('args',{})
-                if 'x' in args:
-                    x,y = args['x']*(image.width-1),args['y']*(image.height-1)
-                    draw.ellipse((x-12,y-12,x+12,y+12),outline='red',width=3)
-                    draw.text((x+14,y),str(i+1),fill='red')
-                elif action.get('skill') == 'drag':
-                    start = (args['start_x']*(image.width-1), args['start_y']*(image.height-1))
-                    end = (args['end_x']*(image.width-1), args['end_y']*(image.height-1))
-                    draw.line([start, end], fill='red', width=3)
-                    for label, (x, y) in [('start', start), ('end', end)]:
-                        draw.ellipse((x-7,y-7,x+7,y+7),outline='red',width=2)
-                        draw.text((x+9,y),f'{i+1} {label}',fill='red')
-                elif action.get('skill') == 'scroll':
-                    draw.text((12,12+i*20),f"{i+1} scroll {args['direction']} {args['amount']} {args['by']}",fill='red')
-            annotation.save(folder/'annotated.png')
-            outcome = {'status':'predicted','model':key,'prediction':prediction,'raw_output':raw,
-                       'output_directory':str(folder), 'phase':'prediction',
-                       'execution_status':'not_executed_by_model_service',
-                       'task_verification_status':'not_evaluated_by_model_service',
-                       'protocol_normalizations': normalizations}
-            outcome['annotated_image']='data:image/png;base64,'+base64.b64encode((folder/'annotated.png').read_bytes()).decode()
+            outcome = self._decode_prediction(key, raw, image, request, folder, review,
+                                              conversation, content, current_images)
             return outcome
         except Exception as error:  # noqa: BLE001 - archive any model failure for the local client
+            self.prefix_cache.clear()
             (folder/'error.log').write_text(traceback.format_exc(),encoding='utf-8')
             outcome = {'status': 'error', 'error': f'{type(error).__name__}: {error}',
                        'raw_output': raw}
             return outcome
         finally:
-            # generated and processor inputs retain KV/cache tensors. Releasing them and
-            # emptying only unused allocator blocks keeps resident model weights loaded.
+            save('context-management.json', context_report)
+            save('input.json', input_record)
+            if conversation is not None and outcome is not None:
+                outcome.update(conversation_id=conversation.identity,
+                               dropped_history_images=conversation.dropped_images)
+            # Release request/image KV; retain only the bounded exact text prefix.
             generated = None
+            past = None
+            if cancelled.is_set():
+                self.prefix_cache.clear()
             inputs = None
             ids = None
             gc.collect()
@@ -409,6 +745,7 @@ class Engine:
                 memory['metric_error'] = f'{type(metric_error).__name__}: {metric_error}'
             phase_ms['total_ms'] = (time.perf_counter()-started_total)*1000
             final = {'request_id': request_id, 'model': key, 'output_directory': str(folder),
+                     'context_management': context_report,
                      'metrics': {'phase_ms': phase_ms, 'tokens': tokens, 'memory': memory}}
             if outcome is None:
                 outcome = {'status': 'error', 'error': 'Prediction ended without an outcome'}
@@ -430,7 +767,8 @@ def main():
     parser.add_argument('--token-file',type=Path,required=True)
     args=parser.parse_args()
     token=args.token_file.read_text().strip()
-    engine=Engine(args.root,args.output)
+    from trace2task.local_gui_llama import read_backend
+    engine=Engine(args.root,args.output,read_backend(args.output))
     class Handler(BaseHTTPRequestHandler):
         def reply(self,status,value):
             data=json.dumps(value,ensure_ascii=False).encode()
@@ -443,8 +781,13 @@ def main():
             if self.path != '/health':
                 return self.reply(404,{'error':'Not found'})
             self.reply(200,{'service':'trace2task-local-gui','protocol':1,'model':engine.key,
+                            'backend': engine.backend,
                             'capabilities': {'cancel': True, 'detailed_metrics': True,
+                                             'expected_backend': True, 'model_profiles': True,
                                              'editable_prompts': True,
+                                             'task_conversations': True,
+                                             'trace_evidence_images': True,
+                                             'image_only_history_eviction': True,
                                              'generic_execution_context': True,
                                              'official_owl_adapter': True}})
         def do_POST(self):

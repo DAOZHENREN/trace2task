@@ -1,254 +1,175 @@
-# Trace2Task
+<p align="center">
+  <img src="docs/assets/readme-hero.svg" alt="Trace2Task — 留下示范，看清每一步。" width="100%">
+</p>
 
-<p align="right"><a href="README.md">English</a> | <strong>简体中文</strong></p>
+<p align="center">
+  <a href="README.md">English</a> · <strong>简体中文</strong>
+</p>
 
-**把人类示范编译成可审查、可复用、可持续改进的桌面 Agent 经验。**
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#从示范到经验">使用流程</a> ·
+  <a href="#选择运行方式">模型与后端</a> ·
+  <a href="#文档导航">文档导航</a>
+</p>
 
-录制一次操作，可以边做边讲；让 Compiler 理解示范，形成任务模型；再用人工反馈不断修正。执行时，Agent 根据当前画面和本次指令重新决策，而不是照搬录制时的坐标。
+**把人类示范变成可审查的 GUI Agent 经验，一个以 Windows 为主的本地工作台。**
 
-Trace2Task 现在包含 **Windows 桌面软件、本地网页控制台、多种模型后端，以及检验 Trace 和经验是否有效的实验流程**。
+录下操作，决定模型能看到什么，再检查它实际做了什么。执行时以**本次指令和当前画面**为准；录制坐标只是历史参考，不是待回放的脚本。
 
-> **项目状态：** 持续开发中的研究软件。本文描述 2026 年 9 月的当前源码（`0.18.8`）；旧安装包不一定包含 `main` 的全部新功能。原生模型适配和 Cua 仍属实验能力。“动作已送达”或模型说“完成”，不等于任务已经验证成功。
+> [!NOTE]
+> **研究预览，不是可放心无人值守的自动化。** 本文对应当前源码，旧安装包可能不同。动作送达或模型说“完成”，不等于任务已经独立验证成功。
 
-[开始使用](#开始使用) · [当前功能](#当前功能) · [模型支持](#模型支持) · [量化实验](#量化验证-trace-和经验) · [文档导航](#文档导航)
+## 工作台一览
 
-## 核心是什么？
+<p align="center">
+  <img src="docs/assets/workbench.png" alt="Trace2Task 工作台：任务指令、模型选择、参考经验与明确的操作范围" width="100%">
+</p>
 
-脚本保存的是**当时点哪里**；通用 GUI 模型理解的是**现在屏幕上有什么**。Trace2Task 增加了一层：**人是怎么做的、为什么这么做，以及后续反馈纠正了什么**。
+<sub>真实界面的隔离只读预览，任务文字为测试样例。截图过程没有调用模型或执行桌面操作；当前界面语言为中文。</sub>
 
-```mermaid
-flowchart LR
-    A[人工示范<br/>动作 + 截图 + 可选讲解] --> B[保留原始 Trace]
-    B --> C[Compiler Agent]
-    C --> D[审查后的任务模型<br/>状态、转移、证据]
-    D --> E[执行 Agent<br/>本次指令 + 当前画面]
-    E --> F[校验与执行<br/>重新观察]
-    F --> E
-    F --> G[运行证据 + 人工反馈]
-    G --> H[审查并融合修订]
-    H --> D
-```
+- **看清模型输入。** 完整查看保存的经验文本，以及实际会发送的历史截图。
+- **每个版本有据可查。** 生成时间、重复生成确认、原始记录保留，以及支持恢复的经验库回收站。
+- **每个选择明确可见。** 模型来源、推理引擎、执行后端和授权目标在启动前分别确认。
+- **每一步可以复盘。** 增量查看模型请求与回答、实际派发动作、执行回执和停止原因。
 
-项目刻意区分三种内容：
+React / TypeScript / Fluent UI 工作台可运行在 WebView2 桌面窗口或本地浏览器中，共用 Python 后端与数据。
 
-- **Trace：原始证据。** 人工操作、截图、时间和可选讲解。修改经验不改写这份记录。
-- **任务模型 / `experience.yaml`：对证据的理解。** 包括状态、动作意图、前置条件、转移和终态；Compiler 可能理解错，因此允许人工修订。
-- **Guidance / `guidance.yaml`：执行诀窍。** 由多轮反馈生成、审查和增量融合，保留版本历史，不是每轮覆盖掉上一轮经验。
+## 快速开始
 
-也可以完全不用经验，以 Baseline 运行。早期 WASD 小游戏仅保留为回归测试，不再是主要使用场景。
+**Windows 10/11 · Python 3.11+ · [uv](https://docs.astral.sh/uv/) · 桌面窗口另需 WebView2 Runtime**
 
-## 当前功能
-
-### 录制、编译和迭代经验
-
-- 录制单个 Windows 程序窗口，或主显示器上的跨程序操作；通过 benchmark 集成层录制 WAA 虚拟机示范。
-- 保存原始键鼠事件与截图，**F8** 标记示范完成，**F9** 取消。
-- 可同时录制语音讲解，使用本地 Whisper Turbo 转写，人工修正后编译。普通自然语言输入框也提供语音输入。
-- 教师模型、编译思考强度与执行模型分开选择。
-- 把示范编译为**有向任务状态图**：支持分支、循环、回退和独立终态，不要求按编号一条路走到底。
-- 在任务详情中查看证据图、状态、转移、当前生效规则，并审查确认。
-- 分别修订**任务结构**和**执行诀窍**。Guidance 使用稳定 ID，通过 `add / update / keep / deprecate / conflict` 融合，保留历史。
-- 修改摘要、查看融合规则、单独删除人工反馈经验；支持的本地删除流程会保留可恢复副本。
-
-### 用一句话执行任务
-
-```text
-打开记事本，输入 hello，然后保存为文档目录里的 greeting.txt。
-```
-
-- 选择单窗口或整个主显示器，使用经验指导，或者无经验 **Baseline**。
-- 明确选择已审查、已语义编译的经验，或使用 Baseline；是否支持经验取决于模型和执行路径。
-- 开始前确认操作目标。Agent 可返回有上限的多动作批次；目标变化或异常可以丢弃剩余动作。当前执行页面已移除单独的“只生成计划”按钮。
-- 查看进度、停止原因和无进展保护；支持 **F9 / 停止按钮**，停止延迟取决于后端。
-- 通用桌面路径可启用 **LangGraph 子目标记忆与 SQLite 检查点**。恢复时重新看图，不回放旧坐标，也不盲目重试结果不确定的操作。
-
-原生 2B 适配支持可选的编译经验；D 保留冻结输入协议。两者均不使用 LangGraph 检查点恢复，不能把它们当作旧通用 Agent 路径的完整替代。详见[统一执行契约](docs/unified-execution-core.md)。
-
-### 桌面软件与网页控制台
-
-两种入口复用同一套 Python 后端和任务数据。
-
-- **桌面窗口：** WebView2、数据目录选择、同目录单实例、启动日志和运行中的退出保护。
-- **安装包构建：** PyInstaller + Inno Setup 生成按用户安装的 Windows x64 程序，自带 Python、快捷方式和卸载入口。程序、数据、模型分开存放。
-- **本地模型管理：** 启动/关闭已识别的 Trace2Task 模型服务，显示加载或错误状态，跨任务复用模型，不是每次预测都重新加载。
-- **统一控制台：** 录制、任务与经验详情、审查、反馈、模型选择、运行状态和逐轮模型输入输出查看。
-- **可选 OpenCUA 录制：** 视频、输入事件与近似参考帧提取，需要单独配置组件；该归档尚未接入 Compiler。详见[录制边界](docs/opencua-recording.md)。
-- **远程 RSI 练习：** 在单独配置的隔离 Linux 虚拟机中运行官方 RSIAgent，查看预算、停止/恢复、独立验证与候选记忆。候选不会自动替换生效经验，详见[部署与验收边界](docs/rsi-integration.md)。
-
-安装程序**不包含**模型权重、Codex CLI、Cua Driver 或 benchmark 虚拟机。关闭程序不会自动卸载独立模型服务。
-
-## 模型支持
-
-| 模型来源 | 用途 | 当前边界 |
-|---|---|---|
-| **Codex 订阅 / CLI** | 通用执行、教师编译和经验修订 | 需单独安装并登录；Compiler、Revision 和 WAA 模型调用仍使用此路径。 |
-| **OpenAI 兼容模型 API** | 接入自选服务商的视觉执行模型 | 需图片输入和兼容的 JSON 输出；支持自定义 ID、思考控制、`json_schema` / `json_object`，具体取决于服务商。 |
-| **Qwen3-VL-8B-Instruct · Q4_K_M** | 通过 llama.cpp 运行通用本地 Agent | 独立运行环境，复用 API 经验路径；显存和上下文上限取决于配置。 |
-| **Qwen3-VL-2B / GUI-Owl-1.5-2B / MAI-UI-2B** | 常驻的原生本地 GUI Baseline | BF16 适配，通常每轮一个动作，带近期真实执行历史，不接经验/LangGraph；MAI 是手机协议的 Windows 实验适配。 |
-| **Trace2Task D / step 5970** | 自定义结构化动作头研究模型 | 固定 Qwen3-VL-2B 底座 + 语言注意力 LoRA + 动作头；使用冻结、校验的 record，不是聊天接口。需单独提供可信模型包，本仓库不发布这些权重。 |
-
-三个原生 2B 模型共用常驻服务，切换时卸载上一个；D 和 llama.cpp 使用独立服务，同时运行会竞争显存。
-
-原生输出会转换为白名单动作，不支持的动作明确报错。D 支持预测动作组与连续执行，其他原生适配通常每轮只生成一个下一步动作。`done` / terminate 只表示**模型要求停止**，不是独立成功判定。
-
-部署方法：[Qwen 8B](docs/local-model.md)、[原生 2B 模型](docs/local-gui-models.md)、[D 模型](docs/trained-model-local.md)。
-
-## 操作范围、后台执行和任务记忆
-
-| 模式 | 控制什么 | 主要限制 |
-|---|---|---|
-| **Win32 单窗口** | 指定程序，可使用任务经验和已配置验证 | 后台消息/截图依赖应用支持，不保证游戏或最小化窗口可用。 |
-| **Win32 主桌面** | 主显示器上的跨程序前台操作 | 使用你的桌面；人工输入和焦点变化可能使计划失效，当前不以副屏为执行目标。 |
-| **Cua Driver · 实验性** | 为原生模型控制明确选择的窗口/启动项 | 只向模型提供授权范围，不偷偷回退前台；受驱动、应用和模型协议限制。 |
-| **LangGraph · 可选** | 通用桌面 Agent 的子目标工作记忆、检查点和恢复 | 不是另一个模型、VM 快照或长期学习，不保证识图正确；不确定结果会阻止自动恢复。 |
-
-Cua 可明确选择最多 12 个目标。Qwen 2B 有专用路由、滚动和拖动协议；不能默认 D、GUI-Owl 或 MAI 支持同样动作。正在进行的驱动调用可能需要约 20 秒才能响应停止，请先用可丢弃的测试文档验收。
-
-## 看清模型输入、输出与实际执行
-
-- 逐轮耗时，以及可获得的加载、预处理、生成、解码时间；原生模型还有 token 数与 GPU allocated/reserved 显存。
-- 应用实际提交的任务、system/user 消息或冻结 record、截图、生成配置和适用的动作 Schema。
-- 模型原始回答、解码动作、执行器输入/结果、错误、取消和被丢弃的迟到结果。
-- 运行轨迹、截图、预测位置标注和本地路径，用于复盘与反馈。
-
-通用 Agent 使用 `io-audit/`；原生本地运行还保存 `model-io.json` 和逐轮 `model-io/`。**这是应用边界日志，不是完整 TLS 抓包，也不能导出服务商隐藏的系统提示或思维过程。** 旧版本未记录的字段不能事后补回。
-
-日志可能包含私人截图、输入文字和经验。认证字段虽会脱敏，其余内容仍可能敏感，不要直接公开上传。
-
-## 开始使用
-
-### 从源码启动
-
-需要 Windows 10/11、Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)。桌面窗口还需要 Microsoft Edge WebView2 Runtime。
-
-```powershell
+~~~powershell
 git clone https://github.com/DAOZHENREN/trace2task.git
 cd trace2task
-uv sync --extra desktop
+uv sync --locked --extra desktop
 uv run --extra desktop trace2task desktop
-```
+~~~
 
-也可以继续使用浏览器控制台：
+桌面启动器会请求 Windows 管理员授权（UAC），取消则停止启动。请选择安装目录以外的数据目录。仓库已包含构建后的工作台资源，仅启动程序不需要 Node.js。
 
-```powershell
+也可以使用浏览器：
+
+~~~powershell
 uv run trace2task web
-```
+~~~
 
-默认地址 `http://127.0.0.1:8765/`，冲突时加 `--port 8766`。修改后端后要重启程序，仅刷新网页不会更新 Python 服务。
+打开 [localhost:8765](http://127.0.0.1:8765/)，端口占用时加 <code>--port 8766</code>。不要从多个实例同时执行桌面控制任务。
 
-在另一个 checkout 中复用已有数据：
-
-```powershell
-uv run --extra desktop trace2task desktop --project-root "D:\Trace2TaskData"
-```
-
-把示例路径换成自己的数据目录。不要从多个控制台同时运行桌面控制任务。
-
-### 先验证一个无风险小任务
-
-1. 打开“执行任务”，选择范围，先用空白记事本或测试页面。
-2. 选择 **Codex、模型 API 或本地模型**。本地运行环境和权重需另行准备，选择不等于自动下载。
-3. 选择 **Baseline / 不使用经验**，或后端支持的已审查经验。
-4. 输入一句无破坏性的指令，核对模型、执行后端和操作目标。
-5. 核对范围后确认执行，需要时按 **F9 / 停止**。
-
-使用 Codex 前单独运行 `codex login`。ChatGPT 订阅不等于任意 API 服务额度。
-
-API 模式填写地址、模型 ID、密钥、思考设置和 JSON 格式。保存的密钥使用 Windows 当前用户 DPAPI 加密，仅对相同端点复用。不支持严格 Schema 时可改 `json_object`；协议不支持会报错，不会偷偷切换模型。
-
-### 构建安装程序
-
-仓库提供安装包**源码与构建脚本**，不把 EXE 或权重提交进 Git；本机试用包不代表 GitHub Release 已发布下载。
-
-```powershell
-uv sync --extra desktop --extra dev
-uv pip install -r packaging\windows\requirements-build.txt
-.\scripts\build-desktop.ps1 -Iscc "D:\Tools\InnoSetup\ISCC.exe"
-```
-
-单独安装 Inno Setup，并替换其示例路径。产物在 `dist/installer/`，自带 Python 和应用依赖，支持独立数据目录；卸载不删除数据和模型权重。试用构建尚未签名。详见[桌面程序与打包](docs/desktop-app.md)。
-
-## 一次完整的经验闭环
-
-1. **人工示范：** 录制方法，必要时讲清原因；即使编译失败也保留原始 Trace。
-2. **教师编译：** 结合截图、动作和已审查讲解，形成状态、转移与预期效果。
-3. **人工审查：** 修正任务结构、核对证据并确认任务包。
-4. **执行新任务：** 根据新指令和当前画面规划，校验、执行并重新观察。
-5. **复盘：** 查看真实输入输出、动作结果、截图和停止原因。
-6. **迭代：** 审查增量 Guidance 或结构修订，确认后用于后续运行。
-
-例如：示范搜索联系人并编辑消息，下一次换成不同联系人和文字。反馈“发送前先核对会话标题”可以成为经审查的 Guidance，而不是另一段固定坐标脚本。发消息是真实的外部操作，先在安全测试会话中验证。
-
-## 量化验证 Trace 和经验
-
-[Windows Agent Arena 集成](integrations/windows_agent_arena/) 将重置、执行和评估分开，提供 VM 示范录制、任务选择器、已验证任务级 reset 回执、Compiler 快照、实验排程和机器可读报告。
-
-| 条件 | 执行时增加了什么 |
-|---|---|
-| **Baseline** | 指令和当前观察，不提供示范经验 |
-| **Raw Trace** | 人工示范证据 |
-| **Trace Compile** | 从 Trace 编译的语义经验 |
-| **Narrated Compile** | 从 Trace + 人工讲解编译的语义经验 |
-| **Feedback** | 对应编译经验 + 经审查的反馈 |
-
-条件需要在实验规范中声明并绑定兼容的冻结资产。仅仅点了确认，**不算另一种 Reviewed compile 方法**；实质改动经验后才有理由单列比较。不是每个任务都有全部条件，也不是实验都已完成。
-
-研究工具支持 held-out 变体、哈希、重复实验和耗时/动作/模型调用报告。远程 WAA VM 的**任务级重置不等于整机快照恢复**。WAA/VM 需单独配置，桌面软件不会自动安装它们。另有 [RSIAgent 接入](docs/rsi-integration.md)，使用固定版本的 OSWorld-V2 虚拟机进行离线练习；这不等于 OSWorld benchmark 成绩，也不会自动安装虚拟机。
-
-配置后的单窗口 Effect Verifier 可以生成独立回执。仅依赖截图/模型自述时标为未验证；桌面/原生运行不能因为模型输出 `done` 就当成独立验证成功。
-
-## 隐私与能力边界
-
-- 控制接口只监听本机回环地址，不是公网多用户服务。
-- Codex/云 API 会收到规划输入。本地推理留在本机，但首次下载依赖和权重仍需联网。
-- 未知动作、焦点变化、超限和不确定结果可能中止执行；保护机制不等于可安全无人值守执行任意操作。
-- 不同适配器的多动作能力不同；从一张图预测动作组，不代表组内自动重新观察。
-- 后台控制不是通用能力，不保证游戏、最小化窗口、管理员应用或反作弊环境可用。
-- 本地路径与显卡预设来自 Windows 开发环境，其他机器要配置路径并实测显存。
-- 安装/单元测试不等于模型准确率或广泛应用兼容性验证；还没有自动更新和托盘流程。
-- 不要提交 `runs/`、生成任务包、检查点、权重、密钥或未脱敏录制。
-
-## 文档导航
-
-| 主题 | 文档 |
-|---|---|
-| 软件安装和数据管理 | [桌面程序](docs/desktop-app.md) |
-| 录制、Baseline 与经验 | [桌面执行](docs/desktop-baseline.md) |
-| llama.cpp Qwen 8B | [本地模型](docs/local-model.md) |
-| Qwen 2B、GUI-Owl、MAI 与服务 | [原生 GUI 模型](docs/local-gui-models.md) |
-| D 结构化动作模型 | [D 模型接入](docs/trained-model-local.md) |
-| 子目标与恢复 | [LangGraph](docs/langgraph-desktop.md) |
-| 远程隔离练习与候选审查 | [RSIAgent 接入](docs/rsi-integration.md) |
-| 明确授权的后台目标 | [Cua 后端](docs/cua-experimental-backend.md) |
-| 模型/执行器日志 | [I/O 审计](docs/model-io-audit.md) · [本地运行实测](docs/local-model-runtime-validation.md) |
-| 发布前修复与剩余限制 | [2026-09-22 审查记录](docs/release-audit-2026-09-22.md) |
-| 讲解与证据 | [Narration](docs/narration-evidence.md) |
-| 可重复研究 | [Compiler 快照](docs/compiler-snapshots.md) · [WAA 报告](docs/waa-report-format.md) |
-| 研究设想，非已实现保证 | [低延迟方向](docs/research/trace-guided-low-latency-agent.md) |
+**先试一个小任务：** 打开空白记事本 → 选择模型与「不使用经验」→ 输入无破坏性的指令 → 核对范围和数据去向 → 确认执行。需要时使用 **停止 / F9**。模型凭据、本地权重，以及可选录制/驱动组件均需单独配置。
 
 <details>
-<summary>展开研究架构图</summary>
+<summary>复用数据、开发版启动与安装包构建</summary>
 
-<img src="docs/research/assets/trace-guided-runtime-architecture-v2.png" alt="Trace 指导执行与人工经验迭代架构" width="100%">
+不移动或覆盖数据，也可以复用已有目录：
 
-图中描述架构方向，不代表每条后端路径都实现了全部验证环节。
+~~~powershell
+uv run --extra desktop trace2task desktop --project-root "D:\Trace2TaskData"
+~~~
+
+首次配置依赖后，可双击 <code>Start Trace2Task Dev.vbs</code> 启动源码版。修改 Python 后重启程序，修改前端后先重新构建，详见[桌面开发版](docs/desktop-development.md)。
+
+仓库提供[安装包构建脚本](docs/desktop-app.md)，不内置模型权重，也不代表已经发布安装包下载。构建还需要 Node.js、PyInstaller 和 Inno Setup；程序、录制与权重分开存放。
 
 </details>
 
+## 从示范到经验
+
+**录制 → 生成 → 审查 → 选择 → 执行 → 复盘**
+
+1. **录制示范。** 用 OpenCUA 记录主显示器上的操作，**F8** 完成、**F9** 取消。所需组件及采集边界见[录制说明](docs/opencua-recording.md)。
+2. **本地生成。** 完成官方动作整理后，生成只有动作的 **D**，或包含视觉证据的 **A**。这两种生成都不调用模型。
+3. **完整审查。** 点击「查看模型原文」，阅读实际保存的全部文本；A 还展示每张选中图片。原始文件和审计信息单独保留。
+4. **明确选用。** 为新任务选择某个版本，或不使用经验。新生成的版本不会自动启用。
+5. **执行并复盘。** 根据当前画面，在所选范围内规划、执行、重新观察。检查运行证据，不把停止信号当作成功证明。
+
+### 模型到底会收到什么？
+
+| 表示 | 交给模型的经验内容 | 状态 |
+| --- | --- | --- |
+| **N · 无经验** | 不提供示范，只使用本次任务与当前观察 | 已实现 |
+| **D · 动作序列** | 按顺序排列的动作描述、持续时间、可见子动作与点击坐标 | 已实现 |
+| **A · 动作与视觉证据** | 与 D 相同的动作结构，加上**最多 8 张**历史截图及关联引用 | 已实现 |
+| **B · Procedure** | 从示范中语义编译、生成后冻结的任务方法 | 设计中 |
+| **C · 证据 + Procedure** | 与 A 相同的证据，加上与 B 完全相同的一份方法 | 设计中 |
+
+A 按时间顺序等距选取可用截图，包含首尾；不足 8 张全部选择。文件路径、哈希、视频时钟和原始事件日志只留在**审计归档**，不再塞入新版 A 的模型文本。图片仅近似对齐，不保证是严格前态，也不证明动作成功。
+
+原始录制与编译版本彼此独立。同一录制再次生成相同表示时，需要确认，旧版本保留；旧版 A 不会自动改写。
+
+**边界要分清：** 旧 Windows/WAA 状态图、带讲解编译和经审查的 Guidance 是另外一套流程，不直接改名为 B/C，也不混入新版 A/D 执行入口。[表示与版本管理细节 →](docs/workbench.md)
+
+## 选择运行方式
+
+| 路径 | 已接入能力 | 主要边界 |
+| --- | --- | --- |
+| **Codex CLI / 订阅** | 视觉执行、旧流程的编译与修订 | 需独立安装 CLI 并登录 |
+| **视觉模型 API** | 自选 Chat Completions 服务 | 必须支持图片及所请求的 JSON 格式 |
+| **Qwen3-VL 8B** | 官方 Q4_K_M + F16 视觉投影，llama-server 推理 | 权重需单独准备并校验 |
+| **Qwen3-VL 2B / GUI-Owl 1.5 2B** | llama-server 或 Transformers | llama 路径需完成 GGUF 转换与配置 |
+| **MAI-UI 2B** | Transformers | 手机协议的 Windows 实验适配 |
+| **D-5970 研究模型** | 冻结的结构化动作模型协议 | 需独立可信模型包，**不接收 A/D 经验** |
+
+**D 经验表示**与 **D-5970 模型**不是同一个概念。
+
+没有保存明确设置时，本地推理默认使用 llama-server；已有选择保留。不兼容的模型/引擎组合会报错，不静默切换。已注册 GUI 模型共用常驻服务与任务会话。[本地模型配置 →](docs/llama-gui-backend.md)
+
+**实际操作：** Win32 控制前台桌面；实验性 Cua 支持明确选择窗口/应用。后台输入并非通用能力，模型选择和参考经验都不会扩大授权范围。[执行契约](docs/unified-execution-core.md) · [Cua 限制](docs/cua-experimental-backend.md)
+
+## 证据、隐私与限制
+
+- **先审查，再分享。** 截图、输入文字、Trace 和模型日志都可能包含隐私；认证字段脱敏不代表整份运行记录可以公开。
+- **知道数据发给谁。** Codex 与远程 API 会收到任务、截图和所选经验。本地推理在本机完成，首次下载依赖与权重仍需联网。
+- **把操作当作真实操作。** 先用可丢弃文件验证。停止能取消后续工作，不能撤销已经送达的动作；响应延迟取决于后端。
+- **结论不越界。** 单元测试不是模型效果 benchmark；应用层审计也不能显示服务商隐藏的提示词或推理过程。
+- **运行数据不进 Git。** 不要提交录制、生成经验、检查点、权重、API Key 或未脱敏运行产物。
+
+### Android 开发预览
+
+独立的 [Android 工程](android/README.md) 支持录制无障碍事件与抽样截图，通过自配云端视觉 API 编译经验，并操作**一个选定应用**；保留反馈版本与急停功能。
+
+这仍是开发预览：不是完整原始触摸采集，尚未实现电脑配对。JVM 测试和 APK 构建不能代替真机与服务商联调验收。
+
+### 研究扩展
+
+[Windows Agent Arena](integrations/windows_agent_arena/) 分离任务重置、执行与评估；[RSIAgent](docs/rsi-integration.md) 用于单独配置的 Linux 虚拟机练习。旧 [LangGraph 检查点](docs/langgraph-desktop.md) 只属于其文档说明的执行路径，不是每个模型后端都有。
+
+报告实验时需要明确冻结资产与实际验证方法。任务级重置不等于整机快照恢复；只点确认也不构成独立的“Reviewed compile”方法。这些接入是研究工具，不是已经获得的 benchmark 成绩。
+
+## 文档导航
+
+| 从这里开始 | 进一步了解 |
+| --- | --- |
+| [工作台与 A/D 经验](docs/workbench.md) | [动作投影契约](docs/research-D-visual-projection.md) |
+| [桌面安装与打包](docs/desktop-app.md) | [源码开发](docs/desktop-development.md) |
+| [llama-server 模型配置](docs/llama-gui-backend.md) | [原生模型](docs/local-gui-models.md) · [D-5970](docs/trained-model-local.md) |
+| [OpenCUA 录制](docs/opencua-recording.md) | [讲解与证据](docs/narration-evidence.md) |
+| [运行记录与模型审计](docs/model-io-audit.md) | [任务会话](docs/task-conversations.md) · [上下文管理](docs/local-prefix-cache.md) |
+| [Android 预览](android/README.md) | [WAA 报告](docs/waa-report-format.md) · [Compiler 快照](docs/compiler-snapshots.md) |
+
 ## 开发与测试
 
-```powershell
-uv sync --extra desktop --extra dev
-uv run --extra desktop --extra dev pytest
-uv run --extra dev ruff check .
-node --check src\trace2task\web\app.js
-node --test tests/*.test.cjs
-```
+前端开发使用 Node.js 24，与 CI 一致。
 
-部分测试需要可选依赖或平台能力。真实模型/应用验收应单独进行；单元测试不是云服务验证或 benchmark 成功率。
+~~~powershell
+uv sync --locked --extra desktop --extra dev
+npm ci --prefix frontend
+npm run build --prefix frontend
+
+uv run --extra dev pytest
+uv run --extra dev ruff check .
+node --test tests/*.test.cjs
+
+# 浏览器回归使用隔离、禁止写入的预览实例
+cd frontend
+npx playwright install
+npm test
+~~~
+
+离线测试不调用真实模型，也不控制桌面；缺少特定平台能力时，相关测试可能跳过。工作台构建资源随源码提交，修改前端后需同步重新构建。
 
 ## 致谢与许可
 
-项目借鉴 [OpenAdapt](https://github.com/OpenAdaptAI/OpenAdapt) 的示范与验证思路、[Windows Agent Arena](https://github.com/microsoft/WindowsAgentArena) 和 [OSWorld](https://github.com/xlang-ai/OSWorld) 的评估边界，并使用 LangGraph、pywebview、PyInstaller、Inno Setup 等组件。模型及上游提示词来源在对应文档和源码中标注。
+项目使用 Python、React、Fluent UI、pywebview，以及各指南中列明的模型与运行时。感谢 [OpenCUA](https://github.com/xlang-ai/OpenCUA)、[OpenAdapt](https://github.com/OpenAdaptAI/OpenAdapt)、[Windows Agent Arena](https://github.com/microsoft/WindowsAgentArena) 与 [OSWorld](https://github.com/xlang-ai/OSWorld) 的开放研究和工具。
 
-项目代码采用 [Apache-2.0](LICENSE)。外部模型、驱动和工具保留各自的许可证及分发要求。
+代码采用 [Apache-2.0](LICENSE)。外部模型、驱动和工具保留各自的许可证及分发要求。

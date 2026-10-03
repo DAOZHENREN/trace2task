@@ -41,6 +41,21 @@ def validate_experience_context(value):
     """
     if value is None:
         return None
+    if isinstance(value, dict) and value.get("kind") == "trace_sequence":
+        import hashlib
+
+        if (set(value) not in ({"kind", "task_id", "model_input", "sha256"},
+                               {"kind", "task_id", "model_input", "sha256", "images"})
+                or not isinstance(value.get("task_id"), str) or not value["task_id"].strip()
+                or not isinstance(value.get("model_input"), str) or not value["model_input"].strip()
+                or value.get("sha256") != hashlib.sha256(value["model_input"].encode("utf-8")).hexdigest()):
+            raise ValueError("原始证据或精简序列上下文无效")
+        if 'images' in value:
+            from trace2task.trace_evidence import image_bytes
+
+            image_bytes(value['images'])
+        # Full text is intentional. The server rejects token overflow, never truncates.
+        return dict(value)
     if not isinstance(value, dict) or set(value) != EXPERIENCE_CONTEXT_KEYS:
         raise ValueError("经验上下文格式无效")
     task_id = value.get("task_id")
@@ -83,7 +98,7 @@ def _data_root():
 
 
 def cancel_gui(request_id):
-    """Cancel only the named request, without unloading the resident model."""
+    """Cancel only the named request; llama-server may unload its owned worker."""
     token_file = _data_root() / 'runs/local-gui/service.token'
     opener = build_opener(ProxyHandler({}), NoRedirect())
     request = Request('http://127.0.0.1:8768/cancel',
@@ -103,9 +118,13 @@ def archive_prediction(folder, body, result, logs):
         source = Path(result['output_directory']).resolve()
         if not source.is_relative_to(Path(logs).resolve()):
             raise ValueError('Model archive is outside the local service log directory')
-        for name in ('input.json', 'formatted-prompt.txt', 'tokenized-input.json', 'raw-output.json',
+        names = ['input.json', 'formatted-prompt.txt', 'tokenized-input.json', 'raw-output.json',
                      'prediction.json', 'outcome.json', 'metrics.json', 'error.log', 'screenshot.png',
-                     'previous-screenshot.png', 'annotated.png'):
+                     'context-management.json', 'prefix-cache.json', 'llama-response.json', 'annotated.png',
+                     'compaction.json', 'compaction-before.json', 'summary-request.json', 'summary-response.json']
+        names.extend(path.name for pattern in ('context-image-*.png', 'attempt-*-input.json')
+                     for path in source.glob(pattern))
+        for name in names:
             path = source/name
             if path.is_file() and path.resolve().is_relative_to(source):
                 shutil.copy2(path, folder/name)
@@ -114,9 +133,12 @@ def archive_prediction(folder, body, result, logs):
 def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_context=None,
                 execution_context=None,
                 request_id=None, audit_dir=None, previous_image=None, execution_feedback=None,
-                experience_context=None, prompt_profile=None, cursor_position=None):
+                experience_context=None, prompt_profile=None, cursor_position=None,
+                conversation_id=None, conversation_start=False, expected_backend=None):
     if model not in MODELS:
         raise ValueError('Unknown local model')
+    if previous_image is not None:
+        raise ValueError('每轮只能提交当前截图，不再接受操作前对照图')
     if cua_context is not None and execution_context is not None:
         raise ValueError('Use either execution_context or legacy cua_context, not both')
     context = execution_context if execution_context is not None else cua_context
@@ -159,6 +181,16 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
         try:
             if health.get('service')!='trace2task-local-gui' or health.get('protocol')!=1:
                 raise RuntimeError('Port 8768 belongs to another service; no screenshot sent')
+            if expected_backend is not None and (health.get('backend') != expected_backend
+                    or not health.get('capabilities', {}).get('expected_backend')):
+                raise RuntimeError('运行引擎与本次配置不符，或服务版本过旧；请重启所选服务。未发送截图。')
+            if conversation_id and not health.get('capabilities', {}).get('task_conversations'):
+                raise RuntimeError('本地服务尚不支持连续会话，请关闭并重启本地模型服务')
+            if conversation_id and not health.get('capabilities', {}).get('image_only_history_eviction'):
+                raise RuntimeError('本地服务仍是旧版上下文策略，请关闭并重启模型服务；未发送截图')
+            if (isinstance(experience_context, dict) and 'images' in experience_context
+                    and not health.get('capabilities', {}).get('trace_evidence_images')):
+                raise RuntimeError('本地服务尚不支持原始证据 A 的图片附件，请关闭并重启模型服务；未发送截图或经验')
             if request_id is not None and not health.get('capabilities', {}).get('cancel'):
                 raise RuntimeError('本地模型服务仍是旧版，请关闭并重新启动服务以启用取消生成和完整日志')
             if prompt_profile is not None and not health.get('capabilities', {}).get('editable_prompts'):
@@ -189,15 +221,17 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
                 'step_index':step_index,context_key:context,
                 'execution_feedback':execution_feedback,
                 'request_id':request_id or secrets.token_hex(16)}
+        if expected_backend is not None:
+            body['expected_backend'] = expected_backend
         if cursor_position is not None:
             body['cursor_position'] = cursor_position
+        if conversation_id:
+            body.update(conversation_id=conversation_id, conversation_start=conversation_start)
         experience_context = validate_experience_context(experience_context)
         if experience_context is not None:
             body['experience_context'] = experience_context
         if prompt_profile is not None:
             body['prompt_profile'] = validate_prompt_profile(prompt_profile)
-        if previous_image is not None:
-            body['previous_image'] = previous_image
         if audit_dir:
             archive_prediction(audit_dir, body, {'status':'pending', 'request_id':body['request_id']}, logs)
         request=Request(url+'/predict',data=json.dumps(body,ensure_ascii=False).encode(),

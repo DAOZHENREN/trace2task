@@ -59,6 +59,7 @@ from trace2task.rsi_remote import (
     RSIRemoteRequestError,
 )
 from trace2task.speech_transcription import TurboTranscriber
+from trace2task.trace_library import list_traces
 from trace2task.waa_results import materialize_waa_feedback_candidates
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import Win32Backend, WindowSelector, list_window_records
@@ -558,8 +559,12 @@ class ConsoleJob:
     prompt_profile: dict[str, str] | None = field(default=None, repr=False)
     prompt_guidance: str = field(default="", repr=False)
     model_io: list[dict[str, Any]] = field(default_factory=list)
+    run_facts: dict[str, Any] = field(default_factory=dict)
+    observed_inference: dict[str, Any] = field(default_factory=dict)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, details=True) -> dict[str, Any]:
+        from trace2task.run_session import operation_scope
+        scope = operation_scope(self.executor_backend, self.execution_scope, self.cua_target)
         return {
             "job_id": self.job_id,
             "task_path": self.task_path,
@@ -571,8 +576,9 @@ class ConsoleJob:
             "provider": self.provider,
             "selection_mode": self.selection_mode,
             "execution_scope": self.execution_scope,
-            "operation_scope": ("selected_windows" if self.executor_backend == "cua"
-                                else self.execution_scope),
+            "operation_scope": scope,
+            "run_facts": dict(self.run_facts),
+            "observed_inference": dict(self.observed_inference),
             "orchestration": self.orchestration,
             "resume_from": self.resume_from,
             "selection_confidence": self.selection_confidence,
@@ -580,21 +586,21 @@ class ConsoleJob:
             "kind": self.kind,
             "narrated": self.narrated,
             "defer_compilation": self.defer_compilation,
-            "input_mode": ("background_preferred" if self.executor_backend == "cua"
+            "input_mode": ("background_preferred" if self.executor_backend == "cua" and scope == "selected_windows"
                            else "background" if self.background else "foreground"),
             "adaptive_reasoning": self.adaptive_reasoning,
             "use_experience": self.use_experience,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "logs": list(self.logs),
+            "logs": list(self.logs) if details else [],
             "result": self.result,
             "error": self.error,
             "stop_requested": self.stop_requested,
             "pending_batch": self.pending_batch,
             "executor_backend": self.executor_backend,
             "cua_target": self.cua_target,
-            "model_io": list(self.model_io),
+            "model_io": list(self.model_io) if details else [],
         }
 
 
@@ -676,11 +682,15 @@ class WebConsoleController:
         self.api_settings = api_settings_store or APISettingsStore()
         self.task_root = (self.project_root / "taskpacks").resolve()
         self.candidate_root = (self.project_root / "runs" / "candidates").resolve()
+        from trace2task.local_trash import LocalTrash
+        self.trash = LocalTrash(self.project_root)
         self._cleanup_pending_deletions()
         self.runner = runner
         self.narration_transcriber = narration_transcriber or TurboTranscriber()
         self._lock = threading.RLock()
         self._jobs: dict[str, ConsoleJob] = {}
+        from trace2task.run_session import RunStore
+        self.run_store = RunStore(self.project_root)
         self._active_job_id: str | None = None
         self._waa_processes: dict[str, subprocess.Popen[str]] = {}
         self._rsi_client, self._rsi_profile_error = (
@@ -732,6 +742,12 @@ class WebConsoleController:
             "max_wall_seconds": self._rsi_client.profile.max_wall_seconds,
             "max_project_budget": self._rsi_client.profile.max_project_budget,
         }
+
+    def _register_job(self, job: ConsoleJob) -> None:
+        """Journal every workflow before its worker starts, even without a UI poll."""
+        self.run_store.save(job.snapshot(details=False), log="\n".join(job.logs) or None)
+        self._jobs[job.job_id] = job
+        self._active_job_id = job.job_id
 
     def _require_rsi_client(self) -> RSIRemoteClient:
         if self._rsi_client is None:
@@ -891,16 +907,17 @@ class WebConsoleController:
         return self.chat_prompt_profile(provider)
 
     def _cleanup_pending_deletions(self) -> None:
-        for root in (self.task_root, (self.project_root / "runs").resolve()):
-            if not root.is_dir():
-                continue
-            for marker in root.rglob(".trace2task-deleted.json"):
-                if ".trash" in marker.relative_to(root).parts:
-                    continue
-                try:
-                    shutil.rmtree(marker.parent)
-                except OSError:
-                    continue
+        self.trash.cleanup_pending()
+
+    def restore_trashed_asset(self, raw_path: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            return self.trash.restore(raw_path)
+
+    def purge_trashed_asset(self, raw_path: str, *, confirmed=False) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            return self.trash.purge(raw_path, confirmed=confirmed)
 
     def list_taskpacks(self) -> list[dict[str, Any]]:
         if not self.task_root.is_dir():
@@ -1349,7 +1366,7 @@ class WebConsoleController:
         background: bool = False,
         adaptive_reasoning: bool = False,
         provider: str = "codex",
-        use_experience: bool = True,
+        use_experience: bool = False,
         execution_scope: str = "window",
         orchestration: str = "legacy",
         resume_from: str = "",
@@ -1357,6 +1374,7 @@ class WebConsoleController:
         continuous: bool = False,
         executor_backend: str = "win32",
         cua_target: dict | None = None,
+        inference_backend: str | None = None,
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
         if executor_backend not in {"win32", "cua"}:
@@ -1429,6 +1447,7 @@ class WebConsoleController:
                 thinking_mode=api_options.get("thinking_mode", "default"),
                 response_format=api_options.get("response_format", "json_schema"),
                 timeout_seconds=api_options.get("timeout_seconds", 120),
+                context_window_tokens=api_options.get("context_window_tokens", 32768),
             )).with_credentials()
             model = validate_api_model(model)
             adaptive_reasoning = False
@@ -1446,13 +1465,21 @@ class WebConsoleController:
             adaptive_reasoning = False
             selection_mode, selection_confidence, selection_reason = "desktop", None, "不读取经验"
         elif isinstance(task_path, str) and task_path.strip():
-            resolved_task = self._resolve_task_path(task_path)
+            resolved_task = self._resolve_execution_experience(task_path)
             selection_mode = "manual"
             selection_confidence = None
             selection_reason = "用户手动选择 Trace 经验"
         else:
             raise ValueError("使用经验时，请手动选择任务经验；不再自动匹配经验")
-        if resolved_task is not None:
+        if resolved_task is not None and resolved_task.name == "model-input.txt":
+            from trace2task.trace_library import execution_context
+
+            if execution_scope != "desktop" or orchestration != "legacy" or not execute:
+                raise ValueError("A/D 经验支持独立任务执行，请使用桌面或 Cua 执行入口")
+            task_id = execution_context(resolved_task)["task_id"]
+        elif resolved_task is not None:
+            if use_experience:
+                raise ValueError("旧状态图经验已退出执行入口，请选择原始证据 A 或精简序列 D")
             contract = load_windows_task(resolved_task)
             task_id = contract.task.task_id
             if execution_scope == "window" and contract.execution_scope == "desktop":
@@ -1494,13 +1521,16 @@ class WebConsoleController:
                 prompt_profile=prompt_profile if provider == "trained_d" else None,
                 prompt_guidance=prompt_guidance,
             )
+            from trace2task.run_session import RunSession
+            job.run_facts = RunSession.for_job(job, self.project_root,
+                api_url=api_config.base_url if api_config else "",
+                requested_backend=inference_backend).public()
             if selection_mode == "auto":
                 job.logs.append(
                     f"自动选择经验：{contract.task.task_id}（置信度 "
                     f"{selection_confidence:.0%}）。{selection_reason}"
                 )
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_job,
             args=(job, resolved_task, execute, api_config),
@@ -1567,8 +1597,7 @@ class WebConsoleController:
                 model=model,
                 reasoning_effort=reasoning_effort,
             )
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_opencua_recording if recording_backend == "opencua" else self._run_recording,
             args=(job,) if recording_backend == "opencua" else (job, handle, selected),
@@ -1669,8 +1698,7 @@ class WebConsoleController:
                     "reset_spec": str(reset_spec),
                 },
             )
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_waa_recording,
             args=(
@@ -1725,6 +1753,7 @@ class WebConsoleController:
             job.updated_at = _now()
             process.stdin.write("GO\n")
             process.stdin.flush()
+            self.run_store.save(job.snapshot(details=False), log=job.logs[-1])
             return job.snapshot()
 
     def transcribe_recording_narration(
@@ -1763,6 +1792,7 @@ class WebConsoleController:
             job.result = payload
             job.logs.append("正在使用本地 Whisper Turbo 转写讲解；首次使用需要下载模型。")
             job.updated_at = _now()
+            self.run_store.save(job.snapshot(details=False), log=job.logs[-1])
 
         audio_path: Path | None = None
         try:
@@ -1910,6 +1940,7 @@ class WebConsoleController:
                 else "讲解已提交，正在归档并准备 Compiler Agent。"
             )
             job.updated_at = _now()
+            self.run_store.save(job.snapshot(details=False), log=job.logs[-1])
 
         try:
             narration = archive_narration(
@@ -1993,13 +2024,45 @@ class WebConsoleController:
         *,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+        confirm_duplicate: bool = False,
     ) -> dict[str, Any]:
         trace_path = self._resolve_recording_trace(raw_path)
+        confirmation = self._compilation_confirmation(trace_path)
+        if confirmation and confirm_duplicate is not True:
+            return confirmation
         return self._compile_trace_bundle(
             trace_path,
             model=model,
             reasoning_effort=reasoning_effort,
         )
+
+    def _compilation_confirmation(self, trace_path: Path) -> dict[str, Any] | None:
+        from trace2task.trace_library import version_time
+
+        task_path = self._find_taskpack_for_trace(trace_path)
+        if task_path is None:
+            return None
+        created_at, time_source = version_time({}, task_path)
+        return {"confirmation_required": True, "representation": "semantic",
+                "trace_path": trace_path.relative_to(self.project_root).as_posix(),
+                "existing_versions": [{"path": task_path.relative_to(self.project_root).as_posix(),
+                    "trace_name": task_path.parent.name, "created_at": created_at,
+                    "created_at_source": time_source}],
+                "message": "同一原始录制已有语义编译任务包。继续会在已有任务包重新生成语义层，请核对后确认。"}
+
+    def generate_trace_d(self, raw_path: str, *, confirm_duplicate=False) -> dict[str, Any]:
+        from trace2task.trace_library import generate_d
+
+        with self._lock:
+            self._require_idle()
+            return generate_d(self.project_root, raw_path, confirm_duplicate=confirm_duplicate)
+
+    def generate_trace_a(self, raw_path: str, *, confirm_duplicate=False) -> dict[str, Any]:
+        from trace2task.trace_library import generate_a
+
+        with self._lock:
+            self._require_idle()
+            return generate_a(self.project_root, raw_path, confirm_duplicate=confirm_duplicate)
 
     def start_compilation(
         self,
@@ -2007,6 +2070,7 @@ class WebConsoleController:
         *,
         model: str = DEFAULT_COMPILER_MODEL,
         reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+        confirm_duplicate: bool = False,
     ) -> dict[str, Any]:
         trace_path = self._resolve_recording_trace(raw_path)
         metadata_path = trace_path.with_name("metadata.json")
@@ -2018,6 +2082,9 @@ class WebConsoleController:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
         with self._lock:
             self._require_idle()
+            confirmation = self._compilation_confirmation(trace_path)
+            if confirmation and confirm_duplicate is not True:
+                return confirmation
             job = ConsoleJob(
                 job_id=uuid.uuid4().hex,
                 task_path="",
@@ -2029,8 +2096,7 @@ class WebConsoleController:
                 reasoning_effort=reasoning_effort,
             )
             job.logs.append("编译请求已接收，正在准备人类 Trace 证据。")
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_compilation,
             args=(job, trace_path),
@@ -2078,8 +2144,7 @@ class WebConsoleController:
                 reasoning_effort=reasoning_effort,
             )
             job.logs.append("反馈已接收，Revision Agent 正在对比当前经验与本次运行。")
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_revision,
             args=(job, candidate_path, task_path),
@@ -2154,8 +2219,7 @@ class WebConsoleController:
             job.logs.append(
                 "结构反馈已接收，Task Model Revision Agent 正在生成有向状态图草稿。"
             )
-            self._jobs[job.job_id] = job
-            self._active_job_id = job.job_id
+            self._register_job(job)
         thread = threading.Thread(
             target=self._run_task_model_revision,
             args=(job, candidate_path, task_path),
@@ -2495,6 +2559,8 @@ class WebConsoleController:
         for report_path in self.task_root.rglob("compiler-report.json"):
             if ".trash" in report_path.relative_to(self.task_root).parts:
                 continue
+            if report_path.with_name(".trace2task-deleted.json").exists():
+                continue
             try:
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 raw_source = (report.get("source") or {}).get("trace")
@@ -2808,6 +2874,7 @@ class WebConsoleController:
         with self._lock:
             self._require_idle()
             task_path = self._resolve_task_path(raw_path)
+            original_task_bytes = task_path.read_bytes()
             task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
             if not isinstance(task, dict):
                 raise TypeError("任务经验格式无效")
@@ -2824,8 +2891,15 @@ class WebConsoleController:
             if (
                 not guidance_path.is_relative_to(task_dir)
                 or not guidance_path.is_file()
+                or guidance_path == task_path
+                or guidance_path.name in {'restore.json', '.trace2task-trash.json', '.trace2task-deleted.json', 'guidance-revisions'}
             ):
                 raise ValueError("人工反馈经验不在当前任务目录中")
+
+            without_guidance = dict(task)
+            without_guidance.pop("human_guidance")
+            without_guidance_bytes = yaml.safe_dump(
+                without_guidance, sort_keys=False, allow_unicode=True, width=100).encode("utf-8")
 
             trash_root = self.task_root / ".trash" / "guidance"
             trash_root.mkdir(parents=True, exist_ok=True)
@@ -2848,6 +2922,7 @@ class WebConsoleController:
                             "kind": "human_guidance",
                             "task_path": task_path.relative_to(self.project_root).as_posix(),
                             "guidance_pointer": pointer,
+                            "task_without_guidance_sha256": hashlib.sha256(without_guidance_bytes).hexdigest(),
                             "deleted_at": _now(),
                         },
                         ensure_ascii=False,
@@ -2857,15 +2932,15 @@ class WebConsoleController:
                 )
                 task.pop("human_guidance", None)
                 temporary = task_path.with_suffix(f"{task_path.suffix}.tmp")
-                temporary.write_text(
-                    yaml.safe_dump(task, sort_keys=False, allow_unicode=True, width=100),
-                    encoding="utf-8",
-                )
+                temporary.write_bytes(without_guidance_bytes)
                 temporary.replace(task_path)
+                self.trash.register_guidance(destination, task_path)
             except Exception:
                 for trashed, original in reversed(moved):
                     if trashed.exists() and not original.exists():
                         trashed.replace(original)
+                if task_path.read_bytes() != original_task_bytes:
+                    task_path.write_bytes(original_task_bytes)
                 shutil.rmtree(destination, ignore_errors=True)
                 raise
             load_windows_task(task_path)
@@ -2880,14 +2955,32 @@ class WebConsoleController:
     def delete_recording(self, raw_path: str) -> dict[str, Any]:
         with self._lock:
             self._require_idle()
-            trace_path = self._resolve_recording_trace(raw_path)
             runs_root = (self.project_root / "runs").resolve()
+            trace_path = (self.project_root / raw_path).resolve()
+            if trace_path.name == "events.jsonl":
+                if trace_path.parent.parent != runs_root or not trace_path.is_file():
+                    raise ValueError("请选择本项目的原始录制")
+                metadata = json.loads(trace_path.with_name("trace2task.json").read_text(encoding="utf-8"))
+                if metadata.get("source") != "opencua_native":
+                    raise ValueError("不是 OpenCUA 原始录制")
+            else:
+                trace_path = self._resolve_recording_trace(raw_path)
             return self._move_to_trash(
                 trace_path.parent,
                 allowed_root=runs_root,
                 trash_root=runs_root / ".trash" / "recordings",
                 kind="recording",
             )
+
+    def delete_trace_experience(self, identifier: str) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            root = (self.project_root / "trace-library").resolve()
+            target = (root / identifier).resolve()
+            if not identifier or target.parent != root or not (target / "header.json").is_file():
+                raise ValueError("请选择有效的任务经验")
+            return self._move_to_trash(target, allowed_root=root,
+                trash_root=root / ".trash", kind="trace_experience")
 
     def delete_candidate(self, raw_path: str) -> dict[str, Any]:
         with self._lock:
@@ -2919,50 +3012,14 @@ class WebConsoleController:
             or not resolved_target.is_dir()
         ):
             raise ValueError("删除目标不在允许的本地资产目录中")
-        resolved_trash.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-        destination = resolved_trash / f"{stamp}-{resolved_target.name}"
-        pending_cleanup = False
-        try:
-            resolved_target.replace(destination)
-        except PermissionError:
-            try:
-                shutil.copytree(resolved_target, destination)
-            except OSError:
-                if destination.exists():
-                    shutil.rmtree(destination, ignore_errors=True)
-                raise
-            try:
-                shutil.rmtree(resolved_target)
-            except OSError:
-                pending_cleanup = True
-                marker = resolved_target / ".trace2task-deleted.json"
-                marker.write_text(
-                    json.dumps(
-                        {
-                            "trash_path": destination.relative_to(
-                                self.project_root
-                            ).as_posix(),
-                            "created_at": _now(),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-        return {
-            "deleted": True,
-            "kind": kind,
-            "trash_path": destination.relative_to(self.project_root).as_posix(),
-            "recoverable": True,
-            "pending_cleanup": pending_cleanup,
-        }
+        return self.trash.move(resolved_target, kind)
 
     def open_local(self, raw_path: str) -> dict[str, Any]:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError("缺少本地路径")
         candidate = (self.project_root / raw_path).resolve()
-        allowed_roots = ((self.project_root / "runs").resolve(), self.task_root)
+        allowed_roots = ((self.project_root / "runs").resolve(), self.task_root,
+                         (self.project_root / "trace-library").resolve())
         if not any(candidate.is_relative_to(root) for root in allowed_roots):
             raise ValueError("只能查看项目中的 runs 或 taskpacks 路径")
         if not candidate.exists():
@@ -2999,6 +3056,10 @@ class WebConsoleController:
                 return None
             return self._jobs[self._active_job_id].snapshot()
 
+    def workbench_runs(self):
+        with self._lock:
+            return {"runs": self.run_store.list(), "active_job_id": self._active_job_id}
+
     def stop_job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -3034,6 +3095,7 @@ class WebConsoleController:
                 job.logs.append(
                     "已放弃本次讲解和编译；保留原始 Trace，临时录音已删除。"
                 )
+                self.run_store.save(job.snapshot(details=False), log=job.logs[-1])
                 return job.snapshot()
             if job.status not in {
                 "queued",
@@ -3047,6 +3109,7 @@ class WebConsoleController:
             job.updated_at = _now()
             job.logs.append("网页控制台已请求停止；正在等待当前安全边界。")
             job.stop_event.set()
+            self.run_store.save(job.snapshot(details=False), log=job.logs[-1])
             process = self._waa_processes.get(job_id)
             if process is not None and process.stdin is not None and process.poll() is None:
                 try:
@@ -3074,18 +3137,31 @@ class WebConsoleController:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError("请选择一个示范任务")
         candidate = (self.project_root / raw_path).resolve()
-        if not candidate.is_relative_to(self.task_root) or candidate.name != "task.yaml":
+        if (not candidate.is_relative_to(self.task_root) or candidate.name != "task.yaml"
+                or ".trash" in candidate.relative_to(self.task_root).parts
+                or candidate.with_name(".trace2task-deleted.json").is_file()):
             raise ValueError("任务路径必须指向项目 taskpacks 目录中的 task.yaml")
         if not candidate.is_file():
             raise FileNotFoundError(f"任务包不存在: {raw_path}")
         return candidate
+
+    def _resolve_execution_experience(self, raw_path: str) -> Path:
+        candidate = (self.project_root / raw_path).resolve()
+        if (candidate.name == "model-input.txt"
+                and candidate.parent.parent == self.project_root / "trace-library"
+                and candidate.parent.name != ".trash" and candidate.is_file()
+                and not candidate.with_name(".trace2task-deleted.json").is_file()):
+            return candidate
+        return self._resolve_task_path(raw_path)
 
     def _resolve_recording_trace(self, raw_path: str) -> Path:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError("请选择一个原始录制")
         runs_root = (self.project_root / "runs").resolve()
         candidate = (self.project_root / raw_path).resolve()
-        if not candidate.is_relative_to(runs_root) or candidate.name != "trace.jsonl":
+        if (not candidate.is_relative_to(runs_root) or candidate.name != "trace.jsonl"
+                or ".trash" in candidate.relative_to(runs_root).parts
+                or candidate.with_name(".trace2task-deleted.json").is_file()):
             raise ValueError("录制路径必须指向项目 runs 目录中的 trace.jsonl")
         if not candidate.is_file():
             raise FileNotFoundError(f"原始录制不存在: {raw_path}")
@@ -3100,6 +3176,8 @@ class WebConsoleController:
             not candidate_dir.is_relative_to(self.candidate_root)
             or candidate_dir == self.candidate_root
             or not candidate_path.is_file()
+            or ".trash" in candidate_dir.relative_to(self.candidate_root).parts
+            or (candidate_dir / ".trace2task-deleted.json").is_file()
         ):
             raise ValueError("候选经验路径必须指向 runs/candidates 中的有效目录")
         return candidate_path
@@ -3734,6 +3812,7 @@ class WebConsoleController:
                         emergency_stop=kwargs["emergency_stop"], status_callback=kwargs["status_callback"],
                         approve=approve, continuous=job.continuous, model=job.model,
                         executor_backend=job.executor_backend,
+                        inference_backend=job.run_facts.get("inference_backend"),
                         cua_target=job.cua_target,
                         experience_context=(build_desktop_experience_context(task_path, execute=True)
                                              if job.use_experience else None),
@@ -3742,7 +3821,8 @@ class WebConsoleController:
                     )
                     job.pending_batch = None
                 elif (desktop and execute and job.orchestration == "legacy"
-                      and (not job.use_experience or job.executor_backend == "cua")):
+                      and (not job.use_experience or job.executor_backend == "cua"
+                           or (task_path is not None and task_path.name == "model-input.txt"))):
                     from trace2task.chat_agent_runner import run_chat_agent
 
                     result = run_chat_agent(
@@ -3772,8 +3852,8 @@ class WebConsoleController:
             if not isinstance(payload, dict):
                 payload = {"value": payload}
             payload["execution_scope"] = job.execution_scope
-            payload["operation_scope"] = ("selected_windows" if job.executor_backend == "cua"
-                                          else job.execution_scope)
+            payload["operation_scope"] = job.snapshot(details=False)["operation_scope"]
+            payload["run_facts"] = job.run_facts
             payload["use_experience"] = job.use_experience
             payload["executor_backend"] = job.executor_backend
             if (job.provider in {"codex", "api"} and not payload.get("model_io")
@@ -3792,6 +3872,8 @@ class WebConsoleController:
                         else:
                             with self._lock:
                                 job.model_io = payload["model_io"]
+                                for entry in job.model_io:
+                                    self.run_store.round(job.job_id, entry)
             if execute and not desktop:
                 try:
                     candidate = self._save_candidate(job, payload)
@@ -3985,6 +4067,8 @@ class WebConsoleController:
                 job.error = error
             job.updated_at = _now()
 
+            self.run_store.save(job.snapshot(details=False), log=log)
+
     def _model_round_update(self, job: ConsoleJob, entry: dict[str, Any]) -> None:
         with self._lock:
             index = entry["step_index"]
@@ -3994,6 +4078,16 @@ class WebConsoleController:
             elif 0 <= index < len(job.model_io):
                 job.model_io[index] = item
             job.updated_at = _now()
+            configuration = (entry.get("input") or {}).get("configuration") or {}
+            if configuration.get("backend"):
+                job.observed_inference = {"backend": configuration["backend"],
+                    "context_policy": (entry.get("context_management") or {}).get("policy"),
+                    "source": "model_response", "step_index": index}
+            elif job.provider in {"codex", "api"} and entry.get("status") not in {"pending", "error", "cancelled"}:
+                job.observed_inference = {"backend": job.run_facts.get("inference_backend"),
+                    "source": "transport_receipt", "step_index": index}
+            self.run_store.round(job.job_id, item)
+            self.run_store.save(job.snapshot(details=False))
 
 
 class WebConsoleHandler(BaseHTTPRequestHandler):
@@ -4008,6 +4102,28 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/runtime-catalog":
+            from trace2task.run_session import runtime_catalog
+            self._json(runtime_catalog(self.controller.project_root))
+            return
+        if parsed.path == "/api/workbench/runs":
+            self._json(self.controller.workbench_runs())
+            return
+        if parsed.path.startswith("/api/workbench/runs/"):
+            parts = parsed.path.removeprefix("/api/workbench/runs/").split("/")
+            try:
+                if len(parts) == 3 and parts[1] == "rounds":
+                    self._json(self.controller.run_store.read_round(parts[0], int(parts[2])))
+                elif len(parts) == 1:
+                    after = int((parse_qs(parsed.query).get("after") or ["0"])[0])
+                    self._json(self.controller.run_store.get(parts[0], after))
+                else:
+                    raise KeyError("Unknown run resource")
+            except KeyError as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+            except ValueError as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         if parsed.path == "/api/rsi/health":
             self._json(self.controller.rsi_health())
             return
@@ -4121,8 +4237,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
+                    "trace_representations": list_traces(self.controller.project_root),
+                    "trash": self.controller.trash.list(),
                     "candidates": self.controller.list_candidates(),
-                    "active_job": self.controller.active_job(),
+                    "active_job": (self.controller._jobs[self.controller._active_job_id].snapshot(details=False)
+                                   if parsed.query == "compact=1" and self.controller._active_job_id
+                                   else None if parsed.query == "compact=1" else self.controller.active_job()),
                     "agent_options": {
                         "api_defaults": {
                             "base_url": DEFAULT_API_BASE_URL,
@@ -4178,6 +4298,19 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError, json.JSONDecodeError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
+        if parsed.path == '/api/traces/asset':
+            from trace2task.trace_library import read_asset
+
+            try:
+                values = parse_qs(parsed.query)
+                filename = (values.get('file') or [''])[0]
+                data = read_asset(self.controller.project_root, (values.get('id') or [''])[0], filename)
+                self._bytes(data, content_type='image/png' if filename.endswith('.png') else 'text/plain; charset=utf-8')
+            except FileNotFoundError as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
+            except (ValueError, TypeError, KeyError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            return
         if parsed.path == "/api/local-image":
             try:
                 values = parse_qs(parsed.query).get("path", [])
@@ -4201,8 +4334,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             except KeyError as error:
                 self._error(HTTPStatus.NOT_FOUND, str(error))
             return
-        asset = "index.html" if parsed.path == "/" else unquote(parsed.path).removeprefix("/")
-        if asset not in {"index.html", "app.js", "components.js", "styles.css"}:
+        asset = ("workbench/index.html" if parsed.path == "/" and (self.asset_root / "workbench/index.html").is_file()
+                 else "index.html" if parsed.path in {"/", "/legacy"} else unquote(parsed.path).removeprefix("/"))
+        path = (self.asset_root / asset).resolve()
+        compiled = (asset.startswith("workbench/") and path.is_relative_to((self.asset_root / "workbench").resolve())
+                    and path.suffix in {".html", ".js", ".css", ".svg"} and path.is_file())
+        if not compiled and asset not in {"index.html", "app.js", "components.js", "styles.css", "workbench-legacy.css"}:
             self._error(HTTPStatus.NOT_FOUND, "Not found")
             return
         path = self.asset_root / asset
@@ -4210,9 +4347,10 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             ".html": "text/html; charset=utf-8",
             ".js": "text/javascript; charset=utf-8",
             ".css": "text/css; charset=utf-8",
+            ".svg": "image/svg+xml",
         }[path.suffix]
         data = path.read_bytes()
-        if asset == "index.html":
+        if path.suffix == ".html":
             # A per-server token complements the loopback Host/Origin checks below.
             # It stops a hostile page from submitting a state-changing local request
             # even when the browser is pointed at a rebinding hostname.
@@ -4239,6 +4377,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     else MAX_REQUEST_BYTES
                 )
             )
+            if parsed.path == "/api/trash/restore":
+                self._json(self.controller.restore_trashed_asset(payload.get("path", "")))
+                return
+            if parsed.path == "/api/trash/delete":
+                self._json(self.controller.purge_trashed_asset(
+                    payload.get("path", ""), confirmed=payload.get("confirmed", False)))
+                return
             if parsed.path == "/api/components":
                 active = self.controller.active_job()
                 if active and active.get("status") in {"queued", "running", "stopping"}:
@@ -4263,7 +4408,8 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 if active and active.get("status") not in {"completed", "failed", "cancelled", "stopped"}:
                     raise RuntimeError("请先停止当前任务，再管理本地模型服务")
                 from trace2task.local_model_service import control_service
-                self._json(control_service(payload.get("action"), payload.get("model"), self.controller.project_root))
+                self._json(control_service(payload.get("action"), payload.get("model"), self.controller.project_root,
+                                           backend=payload.get("backend")))
                 return
             if parsed.path == "/api/local-prompts":
                 active = self.controller.active_job()
@@ -4314,7 +4460,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     from trace2task.local_gui_client import predict_gui
                     chosen_task = payload.get("task_path")
                     experience_context = (build_desktop_experience_context(
-                        self.controller._resolve_task_path(chosen_task), execute=True,
+                        self.controller._resolve_execution_experience(chosen_task), execute=True,
                     ) if chosen_task else None)
                     result = predict_gui(payload.get("task", ""), model=selected,
                                           image=payload.get("image"),
@@ -4333,6 +4479,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         thinking_mode=payload.get("thinking_mode", "default"),
                         response_format=payload.get("response_format", "json_schema"),
                         timeout_seconds=payload.get("timeout_seconds", 120),
+                        context_window_tokens=payload.get("context_window_tokens", 32768),
                     )
                     self._json(self.controller.api_settings.save(
                         config, model=payload.get("model", ""),
@@ -4353,7 +4500,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     ),
                     background=payload.get("input_mode") == "background",
                     adaptive_reasoning=False,
-                    use_experience=payload.get("use_experience", True),
+                    use_experience=payload.get("use_experience", False),
                     execution_scope=payload.get("execution_scope", "window"),
                     orchestration=payload.get("orchestration", "legacy"),
                     resume_from=payload.get("resume_from", ""),
@@ -4362,6 +4509,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     continuous=payload.get("continuous", False),
                     executor_backend=payload.get("executor_backend", "win32"),
                     cua_target=payload.get("cua_target"),
+                    inference_backend=payload.get("inference_backend"),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
@@ -4466,16 +4614,34 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/recordings/compile":
-                self._json(
-                    self.controller.start_compilation(
-                        payload.get("trace_path", ""),
-                        model=payload.get("model", DEFAULT_COMPILER_MODEL),
-                        reasoning_effort=payload.get(
-                            "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
-                        ),
+                result = self.controller.start_compilation(
+                    payload.get("trace_path", ""),
+                    model=payload.get("model", DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get(
+                        "reasoning_effort", DEFAULT_COMPILER_REASONING_EFFORT
                     ),
-                    status=HTTPStatus.ACCEPTED,
+                    confirm_duplicate=payload.get("confirm_duplicate", False),
                 )
+                self._json(result, status=HTTPStatus.OK if result.get("confirmation_required") else HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/traces/generate-d":
+                self._json(self.controller.generate_trace_d(payload.get("trace_path", ""),
+                    confirm_duplicate=payload.get("confirm_duplicate", False)))
+                return
+            if parsed.path == '/api/traces/generate-a':
+                self._json(self.controller.generate_trace_a(payload.get('trace_path', ''),
+                    confirm_duplicate=payload.get('confirm_duplicate', False)))
+                return
+            if parsed.path == "/api/traces/body":
+                from trace2task.trace_library import read_body
+                self._json(read_body(self.controller.project_root, payload.get("id", "")))
+                return
+            if parsed.path == "/api/traces/model-input":
+                from trace2task.trace_library import read_model_input
+                self._json(read_model_input(self.controller.project_root, payload.get("id", "")))
+                return
+            if parsed.path == "/api/traces/delete":
+                self._json(self.controller.delete_trace_experience(payload.get("id", "")))
                 return
             if parsed.path == "/api/taskpacks/delete":
                 self._json(self.controller.delete_taskpack(payload.get("task_path", "")))
@@ -4624,16 +4790,17 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        embedded_legacy = urlparse(self.path).path == "/legacy"
         # The local structured-action preview returns an annotated image as a data
         # URL.  Permit that one rendering path without opening scripts, network
         # connections, frames, or form submissions to arbitrary origins.
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; form-action 'self'; "
-            "base-uri 'none'; object-src 'none'; frame-ancestors 'none'",
+            "base-uri 'none'; object-src 'none'; frame-ancestors " + ("'self'" if embedded_legacy else "'none'"),
         )
-        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Frame-Options", "SAMEORIGIN" if embedded_legacy else "DENY")
         self.send_header("Referrer-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(data)

@@ -14,6 +14,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from trace2task.local_gui_client import NoRedirect
 from trace2task.local_gui_protocol import MODELS
 from trace2task.local_process import stop_started_process
+from trace2task.model_registry import MODEL_PROFILES, profile_for
 
 _lock = threading.Lock()
 
@@ -42,8 +43,13 @@ def is_model_process(process):
     if name in {'python.exe', 'pythonw.exe'}:
         return any('/trace2task/' in arg and arg.endswith((
             '/scripts/local_gui/server.py', '/scripts/trained_model/preview.py')) for arg in arguments)
-    return (name == 'llama-server.exe' and
-            'd:/models/qwen3-vl-8b-instruct/qwen3vl-8b-instruct-q4_k_m.gguf' in arguments)
+    return (name == 'llama-server.exe' and (
+            'd:/models/qwen3-vl-8b-instruct/qwen3vl-8b-instruct-q4_k_m.gguf' in arguments or
+            any((p.alias in arguments or (p.id == 'qwen3-vl-8b-instruct' and
+                 'trace2task-gui-summary-qwen8b' in arguments)) and any(
+                arg.endswith('/' + p.prebuilt_gguf.files[0][0].lower()) if p.prebuilt_gguf
+                else arg.endswith(f'/gguf/{p.id}/model-bf16.gguf') for arg in arguments)
+                for p in MODEL_PROFILES.values() if 'llama-server' in p.engines)))
 
 
 def process_service(process):
@@ -51,7 +57,8 @@ def process_service(process):
     if not is_model_process(process):
         return None
     command = (process.get('CommandLine') or '').replace('\\', '/').lower()
-    if '/scripts/local_gui/server.py' in command:
+    if ('/scripts/local_gui/server.py' in command or any(p.alias in command for p in MODEL_PROFILES.values())
+            or 'trace2task-gui-summary-qwen8b' in command):
         return 'gui'
     if '/scripts/trained_model/preview.py' in command:
         return 'trained_d'
@@ -65,7 +72,8 @@ def _service_for_model(model):
 def _stop_processes(processes):
     for process in processes:
         subprocess.run(
-            ['taskkill.exe', '/PID', str(process['ProcessId']), '/F'],
+            ['taskkill.exe', '/PID', str(process['ProcessId']),
+             *(['/T'] if process_service(process) == 'gui' else []), '/F'],
             capture_output=True,
             check=False,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
@@ -76,8 +84,8 @@ def service_busy():
     return _lock.locked()
 
 
-def control_service(action, model, data_root):
-    if action not in {'start', 'stop'} or model not in {*MODELS, 'trained_d', 'qwen3-vl-8b-instruct'}:
+def control_service(action, model, data_root, backend=None):
+    if action not in {'start', 'stop'} or model not in {*MODELS, 'trained_d'}:
         raise ValueError('未知本地模型或服务操作')
     if not _lock.acquire(blocking=False):
         raise RuntimeError('本地服务正在启动或关闭，请稍候')
@@ -92,9 +100,20 @@ def control_service(action, model, data_root):
             python, models = gui_paths(data_root)
             required = []
             if model in MODELS:
+                from trace2task.local_gui_llama import (
+                    BACKENDS,
+                    read_backend,
+                    required_runtime_paths,
+                )
+                backend = backend if backend is not None else read_backend(logs)
+                if backend not in BACKENDS:
+                    raise ValueError('Unknown GUI inference backend')
+                profile_for(model, backend)
                 token = logs / 'service.token'
                 args = [str(python), str(root / 'scripts/local_gui/server.py'), '--output', str(logs), '--token-file', str(token), '--root', str(models)]
-                required = [python, Path(args[1]), models / model]
+                required = [python, Path(args[1])]
+                required.extend(required_runtime_paths(models, model) if backend == 'llama-server'
+                                else [models / model / 'verified.json'])
                 port = 8768
             elif model == 'trained_d':
                 args = [str(trained_python), str(root / 'scripts/trained_model/preview.py'),
@@ -102,20 +121,15 @@ def control_service(action, model, data_root):
                 required = [Path(args[0]), Path(args[1]), bundle / 'frozen-launch.json',
                             bundle / 'step-00005970.pt', bundle / 'weights', bundle / 'processor']
                 port = 8767
-            else:
-                directory = Path('D:/Models/Qwen3-VL-8B-Instruct')
-                args = ['D:/Tools/llama-b11026/bin/llama-server.exe', '-m', str(directory / 'Qwen3VL-8B-Instruct-Q4_K_M.gguf'),
-                        '--mmproj', str(directory / 'mmproj-Qwen3VL-8B-Instruct-F16.gguf'),
-                        '--host', '127.0.0.1', '--port', '8081', '--alias', model, '-ngl', '99', '-c', '16384',
-                        '-ctk', 'q8_0', '-ctv', 'q8_0', '-np', '1', '-b', '512', '-ub', '128', '-fa', 'on',
-                        '--image-min-tokens', '1024', '--image-max-tokens', '1280']
-                required = [Path(args[0]), Path(args[2]), Path(args[4])]
-                port = 8081
             missing = [str(path) for path in required if not path.exists()]
             if missing:
                 raise RuntimeError('本地模型运行环境不存在：' + missing[0])
+            if model in MODELS and backend == 'llama-server':
+                from trace2task.local_gui_llama import runtime_paths, verify_weights
+                verify_weights(runtime_paths(models, model), model)
         # Do not kill every local model merely because the user selected one.
-        # The shared GUI server owns all MODELS, while D and llama are separate.
+        # The shared GUI server owns all MODELS. D and the legacy standalone
+        # 8081 Qwen process stay separate; migration never kills that process.
         service = _service_for_model(model)
         processes = [p for p in managed_processes() if process_service(p) == service]
         _stop_processes(processes)
@@ -127,6 +141,8 @@ def control_service(action, model, data_root):
         if action == 'stop':
             return {'message': f'已关闭本地模型服务（清理 {len(processes)} 个进程），权重和日志已保留。'}
         logs.mkdir(parents=True, exist_ok=True)
+        if model in MODELS:
+            (logs / 'backend.json').write_text(json.dumps({'backend': backend}), encoding='utf-8')
         if model in MODELS and not token.exists():
             token.write_text(secrets.token_hex(32), encoding='ascii')
         import socket
@@ -167,7 +183,8 @@ def control_service(action, model, data_root):
                 except HTTPError as error:
                     detail = json.loads(error.read()).get('error', '模型加载失败')
                     raise RuntimeError(detail) from None
-            return {'message': f'{model} 本地模型服务已就绪（端口 {port}）。'}
+            label = f' / {backend}' if model in MODELS else ''
+            return {'message': f'{model}{label} 本地模型服务已就绪（端口 {port}）。'}
         except Exception:
             # The child was created by this request.  Do not leave a failed
             # loader resident, and never target an unrelated process by port.

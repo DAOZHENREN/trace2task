@@ -469,6 +469,7 @@ select:focus, textarea:focus {
 
 .library-list {
   display: grid;
+  align-content: start;
   gap: 9px;
   max-height: 248px;
   overflow: auto;
@@ -477,6 +478,21 @@ select:focus, textarea:focus {
 body.library-mode #taskpack-list { max-height: min(58vh, 620px); }
 
 .library-list.compact { max-height: 150px; }
+.library-panel-tools { display: flex; gap: 10px; margin: 8px 0; }
+.library-panel-tools input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid #dce5e0; border-radius: 9px; background: #fff; font: inherit; font-size: 13px; }
+.library-panel-tools input:focus { outline: 2px solid #a4cbbb; outline-offset: 1px; }
+.library-section.expanded { position: fixed; inset: 16px; z-index: 1000; background: white; padding: 20px; border-radius: 16px; box-shadow: 0 0 0 100vmax #0008; display: flex; flex-direction: column; }
+body .library-section.expanded > .library-list { flex: 1; min-height: 0; max-height: none !important; }
+.library-item[hidden], .library-search-empty[hidden] { display: none; }
+.recording-compile-menu > summary { cursor: pointer; background: #196b50; color: white; border-radius: 8px; padding: 9px 14px; font-size: 12px; }
+.compile-choices { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0; }
+.library-actions { align-items: flex-start; }
+.trace-experience-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.trace-experience-card .trace-experience-description { margin: 9px 0 12px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.trace-experience-body { border-top: 1px solid #e0e8e3; padding-top: 10px; }
+.trace-experience-body > summary { cursor: pointer; color: #196b50; font-size: 13px; font-weight: 600; }
+.trace-source-context { color: var(--muted); font-size: 12px; margin-top: 10px; }
+.trace-experience-body pre { margin: 8px 0 0; padding: 12px 14px; border: 1px solid #e0e8e3; border-radius: 8px; background: white; font-size: 12px; line-height: 1.8; white-space: pre; overflow: auto; max-height: 420px; tab-size: 2; }
 #candidate-list { max-height: 340px; }
 
 .library-item {

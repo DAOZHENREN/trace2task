@@ -1,15 +1,22 @@
-# Local 2B GUI models
+# Local GUI models
 
 The desktop application's **本地模型 · 本机 GPU** menu includes:
 
 - Qwen3-VL-2B-Instruct: unmodified base, fixed revision `89644892e4d85e24eaac8bacfd4f463576704203`.
+- Qwen3-VL-8B-Instruct: official Q4_K_M + F16 vision GGUF, fixed revision `f982a07559d4a2f6c8744d840bf6fccab30eea96` from `Qwen/Qwen3-VL-8B-Instruct-GGUF`; llama-server only.
 - GUI-Owl-1.5-2B-Instruct: `mPLUG/GUI-Owl-1.5-2B-Instruct`, revision `528ceaec795bbfbe6103bd79e03db849feadfb24`.
 - MAI-UI-2B: `Tongyi-MAI/MAI-UI-2B`, revision `503050934809558c8dfd2ddedaf9621fa74ac2de`.
 
 These use a shared resident service at **127.0.0.1:8768**, separate from D-5970 (8767)
-and llama.cpp Qwen 8B (8081). Switching between these three unloads the previous
+and the manually started legacy Qwen API service (8081). Switching GUI models unloads the previous
 model. Starting a new task on the same model does not reload it. Other GPU services
 must be stopped manually if they leave insufficient free VRAM.
+
+**llama-server** is preferred for new local integrations and is the default when no
+backend is saved; existing explicit settings are preserved. GUI-Owl and Qwen 2B
+use their same native prediction/action protocols on this backend. See [setup, context policy and measured
+acceptance](llama-gui-backend.md). Transformers remains available for the 2B profiles;
+Qwen 8B joins the same llama lifecycle, while the old independent service is not repurposed.
 
 ## Download without proxy
 
@@ -41,9 +48,12 @@ then the selected backend adapter checks its own capabilities before dispatch.
 An unsupported action produces no-input feedback for a fresh observation, while
 authorization failures remain fatal. `done`/terminate is not proof of success.
 
-These are **local adaptation profiles, not reproductions of official benchmark scores**:
-BF16/SDPA, one screenshot, maximum 1,048,576 image pixels, 6,144 input tokens,
-512 generated tokens and last four actually executed steps. Qwen can return up to
+These are **local adaptation profiles, not reproductions of official benchmark scores**.
+Transformers uses BF16/SDPA and at most 1,048,576 pixels per image; the optional
+GUI-Owl llama-server profile uses BF16/F16 GGUF, Flash Attention and a 32K window.
+Both accept one new screenshot per turn and at most 512 generated tokens. Task
+conversations retain text/experience and can evict old images explicitly;
+there is no fixed application-level 6,144-token cutoff. Qwen can return up to
 eight actions per response; GUI-Owl and MAI keep their native single tool call.
 The core executes a valid batch in order without treating ordinary redraws as
 an interruption. It rechecks the authorized target before every action and
@@ -97,8 +107,10 @@ frozen structured-head record format and should be disclosed in experiments.
 ## Audit
 
 `runs/local-gui/<prediction-id>/` contains the screenshot, full messages,
-formatted chat-template prompt, generation configuration, raw text/token output,
-parsed executor actions, annotated screenshot, load/inference times and peak VRAM.
+generation configuration, raw output, parsed executor actions, annotated screenshot
+and timing metrics. Transformers additionally records its formatted prompt, token
+IDs and allocator memory; llama-server records exact HTTP messages, engine usage
+and prefix-cache counts. External-engine allocator peaks are unavailable, not zero.
 Run-level trace.jsonl records only delivered actions in subsequent history.
 The authenticated local service has no screenshot upload path to external services.
 
@@ -107,8 +119,9 @@ The authenticated local service has no screenshot upload path to external servic
 ### Native service buttons
 
 Under the local model selector, **启动本地模型服务** clears recognized old
-Trace2Task model processes and loads the selected model. **关闭本地模型服务**
-stops recognized GUI, D and Qwen 8B services, including previous-build remnants.
+Trace2Task processes belonging to the selected service and loads that model.
+**关闭本地模型服务** stops only that service and its owned GUI inference child,
+including recognized previous-build remnants, not every local model service.
 Neither button deletes weights or logs. Active tasks block these operations.
 Unrelated Python processes and unknown port occupants are not terminated.
 The status line reports loading, ready, stopped or failure; startup logs are in

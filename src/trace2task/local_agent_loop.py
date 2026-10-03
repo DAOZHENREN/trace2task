@@ -45,7 +45,8 @@ def _execution_audit(execution, elapsed_ms, core):
         "reason": execution.reason,
         "delivery_mode_requested": execution.delivery_mode,
         "background_refusal": execution.background_refusal,
-        "executed": execution.status == "delivered",
+        "executed": (None if execution.status == 'reobserve' and core.feedback
+                     and core.feedback.get('executed') is None else execution.status == "delivered"),
         "effect": execution.receipt.get("effect") if execution.receipt else None,
         "elapsed_ms": elapsed_ms,
         "steps": list(execution.steps),
@@ -100,7 +101,7 @@ def _completion_review(*, observer, target, model, core, audit, predictor, instr
         model,
         instruction,
         review_path,
-        history[-4:],
+        history,
         review_index,
         {"purpose": "verify_completion"},
         experience_context=experience_context,
@@ -169,11 +170,10 @@ def run_local_agent_loop(
         raise ValueError(
             "D-5970 的冻结输入记录不支持经验上下文；未将经验混入任务文字"
         )
-    from trace2task.experience_runtime import known_state_ids, project_experience
+    if experience_context is not None and experience_context.get("kind") != "trace_sequence":
+        raise ValueError("执行仅支持 A 原始证据 / D 精简序列，不再使用状态图经验")
 
     target = initial_target
-    experience_state_hint = None
-    experience_state_ids = known_state_ids(experience_context)
     previous = None
     completion_rejections = 0
     adapter_rejections = 0
@@ -209,17 +209,16 @@ def run_local_agent_loop(
         if context is not None:
             context = dict(context)
             context["execution_feedback"] = core.feedback
-        turn_experience = project_experience(experience_context, experience_state_hint)
+        turn_experience = experience_context
         output = audit.predict(
             predictor,
             stop,
             model,
             instruction,
             path,
-            history[-4:],
+            history[-4:] if model == "D-5970" else history,
             observation_index,
             context,
-            previous_screenshot=previous_path if model != "D-5970" else None,
             execution_feedback=core.feedback if context is None else None,
             experience_context=turn_experience if model != "D-5970" else None,
             prompt_profile=prompt_profile if model != "D-5970" else None,
@@ -278,29 +277,6 @@ def run_local_agent_loop(
         format_rejections = 0
 
         plan = ActionPlan.from_prediction(output["prediction"])
-        reported_state = output.get("observed_state_id")
-        if reported_state in experience_state_ids:
-            candidate = (turn_experience["candidate_state"] or {}).get("id")
-            experience_state_hint = reported_state
-            result["active_experience_state"] = reported_state
-            if reported_state != candidate and plan.actions:
-                # The answer was planned without this state's scoped rules. Do
-                # not dispatch it; retrieve the right state and ask again.
-                record("experience_relocalize", step_index=step,
-                       from_state=candidate, observed_state=reported_state,
-                       discarded_actions=len(plan.actions), executed=False)
-                core.feedback = {
-                    "status": "experience_relocalized", "executed": False,
-                    "reason": "The current screenshot matched a different experience state. "
-                              "No action from the previous plan was sent.",
-                }
-                status_callback(f"经验状态改判为 {reported_state}；已丢弃未执行动作，按该状态重新规划。")
-                continue
-        elif experience_context is not None:
-            # Native GUI outputs do not include a state report. After the
-            # initial observation, do not keep feeding entry-state rules as if
-            # the application were still at the demonstration's first state.
-            experience_state_hint = "unknown"
         if plan.actions and approve is not None and not continuous:
             approve(
                 {
@@ -415,6 +391,11 @@ def run_local_agent_loop(
             continue
 
         if execution.status == "reobserve":
+            if core.feedback and core.feedback.get('executed') is None:
+                record('observation_changed', step_index=step, reason=execution.reason,
+                       executed=None)
+                status_callback('点击后前台应用已切换，动作效果待观察；不重试点击，重新截图规划。')
+                continue
             if steps:
                 status_callback("批次已执行前面的动作；目标或坐标绑定改变，剩余动作未发送，重新截图规划。")
                 continue

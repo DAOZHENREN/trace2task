@@ -1,0 +1,25 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'dev.trace2task.mobile'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    defaultConfig {
+        applicationId 'dev.trace2task.mobile'
+        minSdk 30
+        targetSdk 35
+        versionCode 2
+        versionName '0.2.0-preview'
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes { release { minifyEnabled false } }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}

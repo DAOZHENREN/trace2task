@@ -81,6 +81,7 @@ class APISettingsStore:
                 thinking_mode=value.get("thinking_mode", "default"),
                 response_format=value["response_format"],
                 timeout_seconds=value["timeout_seconds"],
+                context_window_tokens=value.get("context_window_tokens", 32768),
             )
             validate_api_model(value["model"])
             if value["reasoning_effort"] not in API_REASONING_EFFORTS:
@@ -91,6 +92,7 @@ class APISettingsStore:
             ):
                 raise ValueError
             value["thinking_mode"] = config.thinking_mode
+            value["context_window_tokens"] = config.context_window_tokens
             value["base_url"] = config.base_url
             return value
         except (KeyError, TypeError, ValueError):
@@ -111,7 +113,7 @@ class APISettingsStore:
             return {
                 **result, "saved": True, "has_saved_key": bool(stored.get("protected_key")),
                 **{key: stored[key] for key in (
-                    "base_url", "model", "reasoning_effort", "response_format", "timeout_seconds", "thinking_mode",
+                    "base_url", "model", "reasoning_effort", "response_format", "timeout_seconds", "thinking_mode", "context_window_tokens",
                 )},
             }
 
@@ -138,6 +140,7 @@ class APISettingsStore:
                 "reasoning_effort": reasoning_effort, "response_format": config.response_format,
                 "thinking_mode": config.thinking_mode,
                 "timeout_seconds": config.timeout_seconds,
+                "context_window_tokens": config.context_window_tokens,
                 "key_storage": "windows_dpapi_v1" if protected else None,
                 "protected_key": protected,
             }

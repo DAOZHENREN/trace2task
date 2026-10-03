@@ -1,10 +1,13 @@
-# Local Qwen GUI planner / 本地 Qwen 执行模型
+# Legacy standalone Qwen API / 历史独立 Qwen API 入口
 
-The web console supports **执行模型来源 → 本地模型 · 本机 GPU**.
-This preset uses the existing API planner and does not overwrite saved cloud API settings.
-It connects to an already running server; it does not download or start a model automatically.
+The current desktop workbench integrates Qwen 8B into the shared llama-server
+model registry and lifecycle. Use **模型与连接 → Qwen3-VL · 8B → llama-server**;
+see [current setup and verification](llama-gui-backend.md).
 
-网页选择本地模型后，无需填写云 API Key。模型仍通过 Trace2Task 的动作校验和执行器运行；不会绕过执行确认。
+The instructions below retain the manual 8081 compatibility route. To use it,
+select the generic **视觉模型 API** provider and explicitly configure its local
+address/model. The local 8B model selector no longer chooses this API route.
+No saved cloud API configuration or existing weights were changed by the migration.
 
 ## Requirements and launch
 

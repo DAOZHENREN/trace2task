@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-labelledby="title desc">
+  <title id="title">Trace2Task — Demonstrate once. Inspect every step.</title>
+  <desc id="desc">A forest-green banner. Human traces become reviewable A/D experience, used with the current screen to plan the next action.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14362c"/>
+      <stop offset="1" stop-color="#285444"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#dce9c3" opacity=".09"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="340" rx="24" fill="url(#background)"/>
+  <rect width="1280" height="340" rx="24" fill="url(#grid)"/>
+  <circle cx="1168" cy="26" r="260" fill="none" stroke="#bfd2a0" opacity=".09"/>
+  <circle cx="1168" cy="26" r="206" fill="none" stroke="#bfd2a0" opacity=".09"/>
+  <g fill="#deebbd" transform="translate(66 57) rotate(-8)">
+    <rect width="32" height="6" rx="3"/>
+    <rect x="6" y="12" width="22" height="6" rx="3"/>
+    <rect x="12" y="24" width="12" height="6" rx="3"/>
+  </g>
+  <g font-family="Segoe UI, Inter, Arial, sans-serif">
+    <text x="115" y="78" font-size="13" letter-spacing="3.3" font-weight="600" fill="#dce9bd">EXPERIENCE IN MOTION</text>
+    <text x="64" y="166" font-size="72" letter-spacing="-3.2" font-weight="700" fill="#fbfcf6">Trace2Task</text>
+    <text x="68" y="216" font-size="26" letter-spacing="-.4" fill="#f0f3e7">Demonstrate once. Inspect every step.</text>
+    <path d="M68 248 H109" stroke="#ceb983" stroke-width="2"/>
+    <text x="124" y="254" font-size="14" letter-spacing=".4" fill="#c5d5c8">Human evidence. Current screen. Explicit control.</text>
+    <text x="68" y="308" font-size="11" letter-spacing="2.1" fill="#a7bfb0">WINDOWS-FIRST  /  LOCAL WORKBENCH  /  OPEN SOURCE</text>
+  </g>
+  <g font-family="Segoe UI, Inter, Arial, sans-serif">
+    <rect x="847" y="46" width="359" height="64" rx="14" fill="#234a3c" stroke="#567663"/>
+    <rect x="864" y="62" width="32" height="32" rx="9" fill="#dce9bd"/>
+    <path d="M873 70 H887 M873 77 H884 M873 84 H879" fill="none" stroke="#234a3c" stroke-width="2" stroke-linecap="round"/>
+    <text x="912" y="74" font-size="11" letter-spacing="1.6" fill="#adc8b5">01 / PRESERVE</text>
+    <text x="912" y="95" font-size="17" font-weight="600" fill="#f3f5eb">The human trace</text>
+    <path d="M879 112 V130 M875 126 L879 130 L883 126" fill="none" stroke="#97b08b" stroke-width="1.5"/>
+    <rect x="847" y="133" width="359" height="64" rx="14" fill="#234a3c" stroke="#567663"/>
+    <rect x="864" y="149" width="32" height="32" rx="9" fill="#e2d1a4"/>
+    <path d="M870 165 Q880 154 890 165 Q880 176 870 165Z" fill="none" stroke="#234a3c" stroke-width="1.6"/>
+    <circle cx="880" cy="165" r="3" fill="#234a3c"/>
+    <text x="912" y="161" font-size="11" letter-spacing="1.6" fill="#adc8b5">02 / INSPECT</text>
+    <text x="912" y="182" font-size="17" font-weight="600" fill="#f3f5eb">A / D experience</text>
+    <path d="M879 199 V217 M875 213 L879 217 L883 213" fill="none" stroke="#97b08b" stroke-width="1.5"/>
+    <rect x="847" y="220" width="359" height="74" rx="14" fill="#e7efcf"/>
+    <rect x="864" y="240" width="32" height="32" rx="9" fill="#c7d9a8"/>
+    <path d="M875 247 L887 255 L882 257 L880 264Z" fill="none" stroke="#234a3c" stroke-width="1.8" stroke-linejoin="round"/>
+    <text x="912" y="247" font-size="11" letter-spacing="1.6" fill="#536e4f">03 / REPLAN</text>
+    <text x="912" y="269" font-size="17" font-weight="600" fill="#193d30">The next action, from now</text>
+  </g>
+</svg>

@@ -4,13 +4,13 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-REPOS = {
-    'qwen3-vl-2b': ('Qwen/Qwen3-VL-2B-Instruct', '89644892e4d85e24eaac8bacfd4f463576704203'),
-    'gui-owl-2b': ('mPLUG/GUI-Owl-1.5-2B-Instruct', '528ceaec795bbfbe6103bd79e03db849feadfb24'),
-    'mai-ui-2b': ('Tongyi-MAI/MAI-UI-2B', '503050934809558c8dfd2ddedaf9621fa74ac2de'),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
+from trace2task.model_registry import MODEL_PROFILES
+
+REPOS = {p.id: (p.repository, p.revision) for p in MODEL_PROFILES.values()}
 
 def curl(url, *args):
     return subprocess.run(['curl.exe', '--noproxy', '*', '--ssl-revoke-best-effort',
@@ -35,7 +35,8 @@ def valid_file(candidate, item):
 
 def download(root, key, endpoint):
     repo, revision = REPOS[key]
-    folder = root / key
+    preset = MODEL_PROFILES[key].prebuilt_gguf
+    folder = root / 'gguf' / key if preset else root / key
     folder.mkdir(parents=True, exist_ok=True)
     manifest = folder / 'download-manifest.json'
     if manifest.exists():
@@ -54,31 +55,40 @@ def download(root, key, endpoint):
             part in {'', '.', '..'} for part in name.split('/')
         ):
             raise ValueError(f'Unsafe download filename: {name!r}')
+    if preset:
+        pinned_files = dict(preset.files)
+        remote_files = {item['rfilename']: item.get('lfs', {}).get('sha256')
+                        for item in metadata['siblings'] if item['rfilename'] in pinned_files}
+        if remote_files != pinned_files:
+            raise ValueError('Official GGUF file checksum metadata differs from the pinned registry')
     if not manifest.exists():
         manifest.write_text(json.dumps({'repo': repo, 'proxy': False, 'endpoint': endpoint,
                                        'metadata': metadata}, indent=2), encoding='utf-8')
     checked = []
     for item in metadata['siblings']:
         name = item['rfilename']
-        if '/' in name or not name.endswith(('.json', '.jinja', '.txt', '.safetensors', '.md')):
+        if (preset and name not in pinned_files) or (not preset and
+                ('/' in name or not name.endswith(('.json', '.jinja', '.txt', '.safetensors', '.md')))):
             continue
         path = folder / name
         if path.is_symlink() or path.with_name(name + '.part').is_symlink():
             raise ValueError(f'Download target must not be a symbolic link: {path}')
         expected = item.get('lfs', {}).get('sha256')
         if not valid_file(path, item):
+            if preset and path.exists():
+                raise FileExistsError(f'Existing GGUF differs from the pinned model; it will not be overwritten: {path}')
             shared = root / 'qwen3-vl-2b' / name
             # Reuse the already verified fixed-revision Qwen base, not the trained adapter.
             cached = Path('D:/Models/Trace2Task-D-5970/weights') / name
             if key == 'qwen3-vl-2b' and expected and cached.is_file() and digest(cached) == expected:
                 shutil.copyfile(cached, path)
-            elif key != 'qwen3-vl-2b' and not name.endswith('.safetensors') and valid_file(shared, item):
+            elif not preset and key != 'qwen3-vl-2b' and not name.endswith('.safetensors') and valid_file(shared, item):
                 shutil.copyfile(shared, path)
             else:
                 partial = path.with_name(name + '.part')
                 print(f'DOWNLOAD {key}/{name} {item["size"]} bytes (direct, no proxy)', flush=True)
                 url = f'{endpoint}/{repo}/resolve/{metadata["sha"]}/{name}'
-                timeout = '7200' if name.endswith('.safetensors') else '300'
+                timeout = '7200' if name.endswith(('.safetensors', '.gguf')) else '300'
                 try:
                     curl(url, '--max-time', timeout, '--continue-at', '-', '--output', str(partial))
                 except subprocess.CalledProcessError as error:
@@ -93,7 +103,8 @@ def download(root, key, endpoint):
             if not valid_file(path, item):
                 raise RuntimeError(f'Checksum mismatch: {path}')
         checked.append({'file': name, 'sha256': digest(path), 'size': path.stat().st_size})
-    (folder / 'verified.json').write_text(json.dumps({'revision': metadata['sha'], 'files': checked},
+    (folder / ('verified-gguf.json' if preset else 'verified.json')).write_text(json.dumps({
+        'model': repo, 'revision': metadata['sha'], 'files': checked},
                                                    indent=2), encoding='utf-8')
     print(f'VERIFIED {key}: {len(checked)} files, revision {metadata["sha"]}', flush=True)
 

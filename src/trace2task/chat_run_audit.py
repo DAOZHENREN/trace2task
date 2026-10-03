@@ -58,6 +58,8 @@ class ChatRunAudit:
             )
             stop.raise_if_requested()
             entry.update(status=output["status"], prompt=output.get("prompt"),
+                         context_management=output.get('context_management'),
+                         tokens=output.get('tokens', {}),
                          input={"messages": output.get("input_messages") or
                                            [{"role": "user", "content": output.get("prompt", "")}],
                                 "output_schema": output.get("schema"),

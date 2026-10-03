@@ -68,14 +68,16 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             from trace2task.codex_app_server import CodexAppServerSession
             session = CodexAppServerSession(resolve_codex_binary(), model=model,
                                              reasoning_effort=reasoning_effort,
-                                             cwd=root, timeout_seconds=300)
+                                             cwd=root, timeout_seconds=300,
+                                             thread_config={"model_auto_compact_token_limit": 2_000_000_000})
     session.audit = raw_audit
     if provider == "api":
         session.system_guidance = prompt_guidance
     from trace2task.cua_desktop import DESKTOP_TARGET
     cua_desktop = executor_backend == "cua" and cua_target == DESKTOP_TARGET
     adapter = ChatModelAdapter(session, selected_windows=executor_backend == "cua" and not cua_desktop,
-                               provider=provider, prompt_guidance=prompt_guidance)
+                               provider=provider, prompt_guidance=prompt_guidance,
+                               evidence_directory=root / 'experience-images')
     started = time.perf_counter()
     driver = None
     emergency_stop.start()

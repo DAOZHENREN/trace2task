@@ -1,7 +1,9 @@
 """Primary-display Cua observation and execution using native desktop targets."""
+import re
+
 from PIL import Image
 
-from trace2task.execution_protocol import ActionUnavailable, ObservationStale
+from trace2task.execution_protocol import ActionUnavailable, ObservationStale, PostActionReobserve
 
 DESKTOP_TARGET = {"kind": "desktop", "display_id": "primary"}
 
@@ -89,7 +91,20 @@ class CuaDesktopExecutionBackend:
         if prepared is None:
             stop.sleep(action.args["duration_ms"] / 1000)
             return {"effect": "confirmed", "route": "local_wait"}, target
-        return self.driver.call(*prepared), target
+        try:
+            return self.driver.call(*prepared), target
+        except RuntimeError as error:
+            # v0.28.2 can reject a successful cross-app click after dispatch.
+            # Only desktop clicks admit this exact post-action diagnostic.
+            match = re.fullmatch(
+                r'Cua returned a non-JSON error: foreground_unavailable: exact target HWND '
+                r'(0x[0-9a-fA-F]+) or a verified same-process post-action window was not '
+                r'foreground after the click \(actual foreground HWND (0x[0-9a-fA-F]+)\)',
+                str(error).strip())
+            if (target == DESKTOP_TARGET and prepared[0] == 'click' and match
+                    and int(match[2], 16) != 0 and int(match[1], 16) != int(match[2], 16)):
+                raise PostActionReobserve(str(error)) from error
+            raise
 
     def retry_foreground(self, action, prepared, target, stop):
         raise ActionUnavailable("桌面输入已使用系统键鼠，不能重复发送被拒绝的动作")

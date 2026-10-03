@@ -107,27 +107,28 @@ def test_desktop_rejects_background(tmp_path):
                              execution_scope="desktop", background=True)
 
 
-def test_desktop_experience_uses_shared_worker_and_manual_task(tmp_path, monkeypatch):
-    from trace2task import desktop_runner
-
+def test_desktop_rejects_retired_graph_experience(tmp_path):
     task = _write_windows_task(tmp_path, semantic=True, guidance=True)
-    calls = []
-    def runner(**kwargs):
-        calls.append(kwargs)
-        return {"stop_reason": "plan_only", "task_complete": False}
-    monkeypatch.setattr(desktop_runner, "run_desktop_baseline", runner)
     controller = WebConsoleController(tmp_path)
-    job = controller.start_job(task_path=str(task), instruction="do it", execute=False,
-                               execution_scope="desktop", use_experience=True)
-    assert controller.wait(job["job_id"])["status"] == "completed"
-    assert calls[0]["task_path"] == task
-    assert calls[0]["use_experience"] is True
+    with pytest.raises(ValueError, match="旧状态图"):
+        controller.start_job(task_path=str(task), instruction="do it", execute=True,
+                             execution_scope="desktop", use_experience=True)
+
+
+def _write_sequence(root):
+    directory = root / 'trace-library' / 'demo'
+    directory.mkdir(parents=True)
+    (directory/'header.json').write_text(json.dumps({'trace_name': 'demo', 'description': 'demo',
+                                                   'representation': 'D'}), encoding='utf-8')
+    path = directory/'model-input.txt'
+    path.write_text('Complete demonstration with every action', encoding='utf-8')
+    return path
 
 
 def test_local_gui_model_receives_selected_experience_without_changing_executor(tmp_path, monkeypatch):
     from trace2task import trained_model_runner
 
-    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    task = _write_sequence(tmp_path)
     calls = []
     monkeypatch.setattr(trained_model_runner, "run_trained_desktop", lambda **kwargs: (
         calls.append(kwargs) or {"stop_reason": "completion_unverifiable", "task_complete": False}
@@ -143,8 +144,8 @@ def test_local_gui_model_receives_selected_experience_without_changing_executor(
     assert completed["status"] == "stopped"
     assert calls[0]["executor_backend"] == "win32"
     assert calls[0]["experience_context"]["task_id"] == job["task_id"]
-    assert "state_graph" in calls[0]["experience_context"]["semantic"]
-    assert calls[0]["experience_context"]["human_guidance"] is not None
+    assert calls[0]["experience_context"]["model_input"] == task.read_text(encoding='utf-8')
+    assert calls[0]["experience_context"]["kind"] == 'trace_sequence'
 
 
 def test_frozen_d_model_rejects_experience_without_silent_task_prompt_merging(tmp_path):
@@ -295,14 +296,14 @@ def test_chat_cua_window_experience_is_not_silently_downgraded(tmp_path):
                              executor_backend="cua", cua_target={"pid": 10, "window_id": 20})
 
 
-def test_experienced_desktop_keeps_cycle_aware_legacy_runner(tmp_path, monkeypatch):
+def test_sequence_uses_continuous_chat_runner_for_both_backends(tmp_path, monkeypatch):
     from trace2task import chat_agent_runner, desktop_runner
 
-    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    task = _write_sequence(tmp_path)
     calls = []
-    monkeypatch.setattr(chat_agent_runner, "run_chat_agent",
-                        lambda **kwargs: pytest.fail("experience lost its legacy completion policy"))
     monkeypatch.setattr(desktop_runner, "run_desktop_baseline",
+                        lambda **kwargs: pytest.fail("must not use the old experience runner"))
+    monkeypatch.setattr(chat_agent_runner, "run_chat_agent",
                         lambda **kwargs: (calls.append(kwargs) or {
                             "stop_reason": "model_reported_complete", "task_complete": True}))
     controller = WebConsoleController(tmp_path)
@@ -796,6 +797,9 @@ def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Pa
     }).encode()
     try:
         with opener.open(base + "/") as response:
+            html = response.read().decode()
+        assert 'id="root"' in html
+        with opener.open(base + "/legacy") as response:
             html = response.read().decode()
         assert 'id="model-provider"' in html
         assert 'id="api-model"' in html
@@ -2748,11 +2752,37 @@ def test_recompiling_same_trace_reuses_latest_taskpack(
     )
     controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
 
-    result = controller.compile_recording(trace_path.relative_to(tmp_path).as_posix())
+    before = task_path.read_bytes()
+    pending = controller.compile_recording(trace_path.relative_to(tmp_path).as_posix())
+    assert pending['confirmation_required'] and not semantic_calls
+    assert task_path.read_bytes() == before
+    result = controller.compile_recording(trace_path.relative_to(tmp_path).as_posix(), confirm_duplicate=True)
 
     assert result["reused_taskpack"] is True
     assert Path(result["task_path"]) == task_path
     assert semantic_calls == [task_path]
+
+
+def test_semantic_duplicate_does_not_start_job_until_confirmed(tmp_path, monkeypatch):
+    trace = _write_windows_recording(tmp_path)
+    task = _write_windows_task(tmp_path)
+    task.with_name('compiler-report.json').write_text(json.dumps({'source': {'trace': str(trace)}}))
+    controller = WebConsoleController(tmp_path)
+    before = task.read_bytes()
+    for confirmation in [False, None, 1, 'true']:
+        pending = controller.start_compilation(trace.relative_to(tmp_path).as_posix(), confirm_duplicate=confirmation)
+        assert pending['confirmation_required']
+        assert pending['existing_versions'][0]['path'] == task.relative_to(tmp_path).as_posix()
+        assert controller.run_store.list() == [] and controller._jobs == {}
+        assert task.read_bytes() == before
+
+    def worker(job, source):
+        assert source == trace
+        controller._update(job, status='completed', result={'test_only': True})
+
+    monkeypatch.setattr(controller, '_run_compilation', worker)
+    job = controller.start_compilation(trace.relative_to(tmp_path).as_posix(), confirm_duplicate=True)
+    assert controller.wait(job['job_id'])['status'] == 'completed'
 
 
 def test_compiling_a_different_trace_rejects_duplicate_task_name(tmp_path: Path) -> None:
@@ -2912,6 +2942,103 @@ def test_human_guidance_is_deleted_without_deleting_the_task_or_trace(
     assert len(listed) == 1
     assert listed[0]["human_guidance"] is None
 
+    restored = controller.restore_trashed_asset(result['trash_path'])
+    assert restored['restored']
+    assert not trash.exists()
+    assert revisions.is_dir()
+    assert (task_dir / 'guidance.yaml').read_bytes() == (revisions / 'revision-0001.yaml').read_bytes()
+    assert controller.list_taskpacks()[0]['human_guidance']['revision'] == 1
+    assert (task_dir / 'demonstration.json').read_bytes() == demonstration_before
+    assert (task_dir / 'experience.yaml').read_bytes() == experience_before
+
+
+def test_guidance_restore_refuses_changed_task(tmp_path):
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    controller = WebConsoleController(tmp_path)
+    result = controller.delete_human_guidance(task.relative_to(tmp_path).as_posix())
+    modified = task.read_bytes() + b'\n# Later user change\n'
+    task.write_bytes(modified)
+    assert not controller.trash.describe(result['trash_path'])['can_restore']
+    with pytest.raises(ValueError, match='已变化'):
+        controller.restore_trashed_asset(result['trash_path'])
+    assert task.read_bytes() == modified
+    assert not task.with_name('guidance.yaml').exists()
+    assert (tmp_path / result['trash_path'] / 'guidance.yaml').is_file()
+
+
+def test_guidance_restore_validation_failure_rolls_back_task_and_files(tmp_path, monkeypatch):
+    from trace2task import windows_task
+
+    task = _write_windows_task(tmp_path, semantic=True, guidance=True)
+    controller = WebConsoleController(tmp_path)
+    result = controller.delete_human_guidance(task.relative_to(tmp_path).as_posix())
+    without_guidance = task.read_bytes()
+    archive = tmp_path / result['trash_path']
+    feedback = (archive / 'guidance.yaml').read_bytes()
+
+    def reject(path):
+        raise ValueError('test invalid restored task')
+
+    monkeypatch.setattr(windows_task, 'load_windows_task', reject)
+    with pytest.raises(ValueError, match='test invalid'):
+        controller.restore_trashed_asset(result['trash_path'])
+    assert task.read_bytes() == without_guidance
+    assert (archive / 'guidance.yaml').read_bytes() == feedback
+    assert not task.with_name('guidance.yaml').exists()
+
+
+def test_trash_http_roundtrip_requires_csrf_and_preserves_run_history(tmp_path):
+    from urllib.error import HTTPError
+
+    recording = _write_windows_recording(tmp_path)
+    original = recording.read_bytes()
+    controller = WebConsoleController(tmp_path)
+    controller.run_store.save({'job_id': 'recording-history', 'updated_at': '2026-10-03',
+        'status': 'completed', 'kind': 'recording', 'task_id': 'Retained audit record'})
+    server = create_web_server(tmp_path, port=0, controller=controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    opener = build_opener(ProxyHandler({}))
+    try:
+        headers = {'Content-Type': 'application/json', **_csrf_headers(opener, base)}
+
+        def post(path, payload):
+            with opener.open(Request(base + path, data=json.dumps(payload).encode(), headers=headers), timeout=5) as response:
+                return json.load(response)
+
+        def state():
+            with opener.open(base + '/api/state?compact=1', timeout=5) as response:
+                return json.load(response)
+
+        result = post('/api/recordings/delete', {'trace_path': recording.relative_to(tmp_path).as_posix()})
+        path = result['trash_path']
+        assert state()['recordings'] == []
+        assert state()['trash'][0]['path'] == path
+        with pytest.raises(HTTPError) as denied:
+            opener.open(Request(base + '/api/trash/delete', data=json.dumps({'path': path, 'confirmed': True}).encode(),
+                headers={'Content-Type': 'application/json', 'Origin': base}), timeout=5)
+        assert denied.value.code == 400
+        assert '安全令牌' in json.load(denied.value)['error']
+        denied.value.close()
+        assert post('/api/trash/restore', {'path': path})['restored']
+        assert recording.read_bytes() == original
+        assert len(state()['recordings']) == 1 and state()['trash'] == []
+        path = post('/api/recordings/delete', {'trace_path': recording.relative_to(tmp_path).as_posix()})['trash_path']
+        with pytest.raises(HTTPError) as denied:
+            post('/api/trash/delete', {'path': path})
+        assert denied.value.code == 400
+        denied.value.close()
+        assert (tmp_path / path).is_dir()
+        assert post('/api/trash/delete', {'path': path, 'confirmed': True})['recoverable'] is False
+        assert state()['trash'] == []
+        assert controller.run_store.get('recording-history')['session']['status'] == 'completed'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        controller.run_store.db.close()
+
 
 def test_web_server_serves_console_state_and_job_api(
     tmp_path: Path,
@@ -2941,6 +3068,9 @@ def test_web_server_serves_console_state_and_job_api(
         with opener.open(f"{base}/", timeout=5) as response:
             html = response.read().decode("utf-8")
             content_security_policy = response.headers["Content-Security-Policy"]
+        assert 'id="root"' in html
+        with opener.open(f"{base}/legacy", timeout=5) as response:
+            html = response.read().decode("utf-8")
         csrf_headers = _csrf_headers(opener, base)
         with opener.open(f"{base}/app.js", timeout=5) as response:
             javascript = response.read().decode("utf-8")
@@ -3018,7 +3148,7 @@ def test_web_server_serves_console_state_and_job_api(
     assert "任务经验详情" in html
     assert "经验摘要（确认前可编辑）" in javascript
     assert "删除人工反馈经验" in javascript
-    assert "删除整个任务" in javascript
+    assert "删除任务经验" in javascript
     assert "#task/" in javascript
     assert "查看详情" in javascript
     assert "运行 Agent 实际读取什么" in javascript

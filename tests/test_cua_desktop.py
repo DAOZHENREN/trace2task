@@ -42,6 +42,58 @@ class Stop:
         pass
 
 
+POST_CLICK_ERROR = (
+    'Cua returned a non-JSON error: foreground_unavailable: exact target HWND '
+    '0x5b0d12 or a verified same-process post-action window was not foreground '
+    'after the click (actual foreground HWND 0xa20d80)\n')
+
+
+def test_cross_app_click_reobserves_without_retry_or_remaining_batch(tmp_path):
+    class SwitchingDriver(Driver):
+        def call(self, tool, payload):
+            if tool == 'click':
+                self.calls.append((tool, payload))
+                raise RuntimeError(POST_CLICK_ERROR)
+            return super().call(tool, payload)
+
+    driver = SwitchingDriver(tmp_path)
+    target, state, _ = CuaDesktopObservation(driver).observe(None, 0)
+    events = []
+    core = ExecutionCore(CuaDesktopExecutionBackend(driver), Stop(),
+                         lambda kind, **data: events.append((kind, data)))
+    result = core.execute({'actions': [
+        {'skill': 'double_click', 'args': {'x': .5, 'y': .25}},
+        {'skill': 'type_text', 'args': {'text': 'must not send'}},
+    ]}, target=target, observation_id='one', state=state)
+    assert result.status == 'reobserve'
+    assert core.feedback['executed'] is None
+    assert core.last_requests[0]['status'] == 'unknown'
+    assert not result.steps
+    assert [name for name, _ in driver.calls if not name.startswith('get_')] == ['click']
+    assert not any(data.get('executed') is True for _, data in events)
+    CuaDesktopObservation(driver).observe(None, 1)
+    assert (tmp_path / '0001.png').is_file()
+
+
+@pytest.mark.parametrize('message,operation', [
+    ('Cua returned a non-JSON error: other error', 'click'),
+    (POST_CLICK_ERROR.replace('0xa20d80', '0x0'), 'click'),
+    (POST_CLICK_ERROR.replace('0xa20d80', '0x5b0d12'), 'click'),
+    (POST_CLICK_ERROR, 'type_text'),
+])
+def test_other_desktop_errors_still_stop(tmp_path, message, operation):
+    class FailingDriver(Driver):
+        def call(self, tool, payload):
+            raise RuntimeError(message)
+
+    from trace2task.execution_protocol import PostActionReobserve
+
+    with pytest.raises(RuntimeError) as caught:
+        CuaDesktopExecutionBackend(FailingDriver(tmp_path)).dispatch(
+            None, (operation, {}), DESKTOP_TARGET, Stop())
+    assert not isinstance(caught.value, PostActionReobserve)
+
+
 def test_desktop_batch_maps_physical_pixels_and_preserves_order(tmp_path):
     driver = Driver(tmp_path)
     target, state, path = CuaDesktopObservation(driver).observe(None, 0)
@@ -83,7 +135,8 @@ def test_desktop_drag_hover_and_unsupported_action(tmp_path):
 
 
 @pytest.mark.parametrize('provider', ['api', 'codex'])
-def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider):
+@pytest.mark.parametrize('cross_app_click', [False, True])
+def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider, cross_app_click):
     import json
     from types import SimpleNamespace
 
@@ -93,7 +146,8 @@ def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider):
         def __init__(self):
             self.replies = iter([
                 {'task_complete': False, 'reason': 'type', 'actions': [
-                    {'skill': 'type_text', 'args': {'text': 'hello'}}]},
+                    ({'skill': 'double_click', 'args': {'x': .5, 'y': .5}} if cross_app_click
+                     else {'skill': 'type_text', 'args': {'text': 'hello'}})]},
                 {'task_complete': True, 'reason': 'visible', 'actions': []},
                 {'verdict': 'complete', 'evidence': 'hello visible', 'missing': ''},
             ])
@@ -105,9 +159,21 @@ def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider):
             assert 'current selected window' not in request['prompt']
             return json.dumps(next(self.replies))
 
+    class SwitchingDriver(Driver):
+        def call(self, tool, payload):
+            if tool == 'click':
+                self.calls.append((tool, payload))
+                raise RuntimeError(POST_CLICK_ERROR)
+            return super().call(tool, payload)
+
+    driver = SwitchingDriver(tmp_path) if cross_app_click else Driver(tmp_path)
     result = run_chat_agent(instruction='type hello', model='fake', reasoning_effort='low',
         output_root=tmp_path, emergency_stop=Stop(), status_callback=lambda message: None,
         executor_backend='cua', cua_target=DESKTOP_TARGET, session=Session(),
-        api_config=SimpleNamespace() if provider == 'api' else None, cua_driver=Driver(tmp_path))
-    assert result['actions'] == 1
+        api_config=SimpleNamespace() if provider == 'api' else None, cua_driver=driver)
+    assert result['actions'] == (0 if cross_app_click else 1)
     assert result['stop_reason'] == 'visual_completion_reviewed'
+    if cross_app_click:
+        assert [name for name, _ in driver.calls].count('click') == 1
+        assert [name for name, _ in driver.calls].count('get_desktop_state') == 3
+        assert result['model_io'][0]['execution']['executed'] is None

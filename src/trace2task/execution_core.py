@@ -12,6 +12,7 @@ from trace2task.execution_protocol import (
     DriverRefusal,
     ForegroundUnavailable,
     ObservationStale,
+    PostActionReobserve,
 )
 
 
@@ -194,6 +195,18 @@ class ExecutionCore:
                                 executed=None, background_refusal=background_refusal,
                                 delivery_mode_requested='foreground', error=str(retry_error))
                     raise
+            except PostActionReobserve as error:
+                request['status'] = 'unknown'
+                self.feedback = {'status': 'reobserve', 'executed': None,
+                                 'reason': str(error), 'action': payload,
+                                 'instruction': 'The click may already have taken effect and changed the foreground app. '
+                                 'Inspect the new screenshot before planning; do not blindly repeat the click.'}
+                self.record('execution_result', observation_id=observation_id,
+                            batch_action_index=index, **self.feedback)
+                self.record('batch_boundary', observation_id=observation_id,
+                            reason='post_click_foreground_changed', remaining=len(plan.actions)-index)
+                return ExecutionResult('reobserve', target, payload, reason=str(error),
+                                       steps=tuple(self.last_steps))
             except Exception as error:
                 request['status'] = 'unknown'
                 # An admitted call may already have had an effect. Never retry it here.

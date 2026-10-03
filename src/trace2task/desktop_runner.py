@@ -151,6 +151,10 @@ def build_desktop_experience_context(task_path, *, execute):
     """Load reviewed task guidance as model context, never as an execution grant."""
     if task_path is None:
         raise ValueError("使用桌面经验时，请选择已编译的任务经验")
+    if Path(task_path).name == "model-input.txt":
+        from trace2task.trace_library import execution_context
+
+        return execution_context(task_path)
     contract = load_windows_task(Path(task_path))
     if execute and contract.task.requires_confirmation:
         raise ValueError("请先审查并确认经验，再开始执行")

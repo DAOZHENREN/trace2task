@@ -33,7 +33,7 @@ test('plan-only action is removed from the execution surface', () => {
 
 test('experience is selected explicitly and quarantined rules are visible', () => {
   assert.ok(js.includes('"请选择任务经验"'));
-  assert.ok(js.includes('请手动选择已语义编译的经验'));
+  assert.ok(js.includes('请手动选择精简序列 D'));
   assert.ok(!js.includes('将从 ${taskpacks.filter'));
   assert.ok(js.includes('task.guidance_review_pending?.length'));
   assert.ok(js.includes('暂停生效的旧规则'));

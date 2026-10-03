@@ -6,6 +6,7 @@
     <meta name="trace2task-csrf" content="__TRACE2TASK_CSRF_TOKEN__">
     <title>Trace2Task 控制台</title>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/workbench-legacy.css">
   </head>
   <body>
     <div class="shell">
@@ -17,7 +18,7 @@
             <div class="brand-subtitle">示范驱动的桌面 Agent</div>
           </div>
         </div>
-        <div class="local-badge"><span></span>仅本机</div>
+        <div class="local-badge">控制台在本机 · 模型去向见配置</div>
       </header>
 
       <main>
@@ -75,7 +76,7 @@
             <div id="desktop-workflow-settings" hidden>
               <label class="field-label" for="desktop-orchestration">桌面任务管理</label>
               <div class="select-wrap"><select id="desktop-orchestration">
-                <option value="legacy">原版 · 截图与最近动作（对照）</option>
+                <option value="legacy">任务内连续对话</option>
                 <option value="langgraph">LangGraph · 子目标记忆与检查点（试验）</option>
               </select></div>
               <label class="field-label" for="desktop-resume">恢复未完成任务</label>
@@ -136,8 +137,13 @@
                 <button type="button" class="button secondary" id="local-service-stop">关闭本地模型服务</button>
               </div>
               <p id="local-service-status" role="status" aria-live="polite"></p>
-              <p class="field-help">启动会先清理旧本地模型服务，再加载所选模型。关闭会清理本项目的 Qwen、D 和 GUI 模型残留服务，释放显存；不会删除模型。任务运行期间不可操作。</p>
-              <p class="field-help">推荐启动配置：16K 上下文、Q8 KV 缓存、严格 JSON 输出。实际容量由本地服务启动参数决定；长经验仍可能超限。</p>
+              <label class="field-label" for="local-gui-runtime">本地推理引擎（启动服务时生效）</label>
+              <select id="local-gui-runtime">
+                <option value="llama-server">llama-server · BF16 / Flash Attention / 32K</option>
+                <option value="transformers">Transformers · 原版回退后端</option>
+              </select>
+              <p class="field-help">引擎兼容关系来自模型注册表；不支持的组合会明确拒绝。启动/关闭只管理所选模型所属服务及其子进程，不删除权重。任务运行期间不可操作。</p>
+              <p class="field-help">llama-server 使用 32K 上下文；接近 24K 时摘要早期对话，保留最近 4 轮、任务与完整经验。Qwen 8B 独立服务保持原配置。</p>
             </div>
             <div id="execution-backend-settings">
               <label class="field-label" for="local-executor">执行后端</label>
@@ -160,7 +166,7 @@
             <div id="trained-model-settings" class="hidden">
               <p class="field-help">Qwen 2B 可在选定目标之间规划窗口切换；D / GUI-Owl / MAI 仍受各自输出协议限制。独立按下/松开尚不支持。</p>
               <p class="field-help">指定窗口：只操作本次选定目标，后台优先；明确拒绝后台输入时，对同一动作切前台重试一次，此后该窗口改走前台。控件树不完整时，未指定坐标的文本会尝试输入当前焦点控件，效果需重新截图确认。F9 / 停止需等待当前驱动调用返回（最长约 20 秒）。</p>
-              <p class="field-help">常驻本机模型。主屏任务原文 + 截图 + 最近四步真实执行历史；不注入经验或 LangGraph。连续执行，无需逐批确认，F9 / 程序停止，最多 40 个动作。done 仅为模型停止声明。三个 2B 基线共用 8768 服务，切换时换载；请先停止空闲的 D 或 Qwen 8B 服务以释放显存。MAI 为手机协议的桌面实验适配，不支持的动作会明确停止。</p>
+              <p class="field-help">2B GUI 模型使用连续任务会话，任务与完整经验固定保留，每轮新增当前截图。Transformers 按显存清理历史图片；llama-server 还会摘要早期对话，策略和压缩记录可在日志查看。F9 / 程序停止，最多 40 个动作。done 仅为模型停止声明。模型共用 8768 服务。D-5970 保持冻结预测协议，不支持精简序列经验。MAI 是手机协议的桌面实验适配。</p>
               <p>连续执行 · 无需逐批确认 · F9 / 停止按钮中止</p>
               <div id="trained-batch" hidden>
                 <p>本批动作待确认。确认后请在 3 秒内切回截图中的目标窗口。</p>
@@ -207,6 +213,11 @@
                   <label class="field-label" for="api-timeout">每次请求超时（秒）</label>
                   <input class="text-input" id="api-timeout" type="number"
                     min="1" max="600" value="120">
+                </div>
+                <div>
+                  <label class="field-label" for="api-context-window">上下文预算（tokens）</label>
+                  <input class="text-input" id="api-context-window" type="number" min="2048" value="32768">
+                  <p class="field-help">仅用于远端 / Chat Completions 服务，按服务实际窗口设置；接近预算时只清除历史图片，全部文本保留。默认值不是模型能力检测结果。本地 2B GUI 服务改按显存管理，不使用此项。</p>
                 </div>
               </div>
               <div class="agent-settings">
@@ -428,6 +439,7 @@
               <span id="candidate-count">0 项</span>
             </div>
             <div class="library-list compact" id="candidate-list"></div>
+
 
             <div class="library-heading recordings-heading">
               <h3>原始录制</h3>

@@ -106,3 +106,23 @@ def test_only_pure_official_methods_used(tmp_path):
     derive.reduce_events(Reducer, tmp_path, {"screen_width": 10, "screen_height": 10}, original)
     assert original == [{"action": "press"}]
     assert calls == ["compress", "reduce_all", "transform", "finish", ("id", 0)]
+
+
+def test_click_details_join_by_id_without_rewriting_official_files(tmp_path):
+    visual = [{"id": i, "action": "click", "start_time": 1, "end_time": 2} for i in [8, 3, 9]]
+    full = [{"id": 3, "action": "click", "button": "right", "coordinate": {"x": 30, "y": 40}},
+            {"id": 8, "action": "click", "button": "left", "coordinates": [{"x": 2302, "y": 1231}, {"x": 2303, "y": 1232}]}]
+    files = []
+    for name, rows in [("vis", visual), ("complete", full)]:
+        path = tmp_path / f"reduced_events_{name}.jsonl"
+        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        files.append((path, path.read_bytes()))
+    manifest = {"warnings": [], "frames": {"a": {"path": None}},
+                "action_frames": {str(i): {"before": "a", "after": "a"} for i in [8, 3, 9]}}
+    derive.render_report(tmp_path, manifest)
+    page = (tmp_path / "index.html").read_text(encoding="utf-8")
+    assert "按钮：左键 · 点击坐标：x=2302, y=1231 → x=2303, y=1232" in page
+    assert "按钮：右键 · 点击坐标：x=30, y=40" in page
+    assert "坐标未提供或无效" in page
+    assert page.index("x=2302") < page.index("x=30")
+    assert all(path.read_bytes() == original for path, original in files)

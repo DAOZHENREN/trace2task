@@ -95,6 +95,10 @@ class ActionUnavailable(ValueError):
     """Known pre-dispatch capability rejection: no input was sent; safe to replan."""
 
 
+class PostActionReobserve(RuntimeError):
+    """Input may have taken effect; abandon the batch and observe without retry."""
+
+
 class ObservationStale(RuntimeError):
     """Trusted target changed before dispatch; no input was sent."""
 

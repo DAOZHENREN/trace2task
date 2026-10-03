@@ -35,3 +35,7 @@ models/
 /logs/rsi-*.jsonl
 /observation-*.png
 /runtime.log
+/frontend/node_modules/
+/frontend/test-results/
+/frontend/playwright-report/
+/trace-library/

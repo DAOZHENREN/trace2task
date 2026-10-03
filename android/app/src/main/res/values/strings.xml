@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">Trace2Task</string>
+    <string name="service_status">%1$s\n%2$s</string>
+    <string name="overlay_status">Trace2Task · 第 %1$d 轮\n%2$s</string>
+    <string name="record_consent">我同意本次录制将目标应用的事件、可见文本/输入文字和抽样截图保存在本机私有经验库（不上传）。最多 80 条事件、12 张截图、5 分钟；不要录制敏感内容。自绘/游戏界面可能漏记，可用悬浮按钮标记画面。</string>
+    <string name="experience_selected">已选择 %1$s\n返回主页后选择匹配应用并填写新任务；每轮按当前画面重新规划，不回放旧坐标。</string>
+    <string name="experience_generating">正在生成经验…此页离开或 90 秒超时会取消；不执行任何手机动作。</string>
+    <string name="experience_saved">已保存新版本 %1$s。请查看经验后点击“设为下次执行的经验版本”。旧版与原始示范保留；模型生成内容尚未验证。</string>
+    <string name="run_consent">我同意本次任务将选定应用的屏幕截图、任务文字、所选经验内容和最近动作记录发送到上方 API 地址，并允许模型直接操作（无需逐步确认）。请勿在密码、支付或其他敏感页面使用。</string>
+    <string name="accessibility_description">仅在你主动开始任务或录制后，Trace2Task 才会读取目标应用。执行模式将截图、任务和所选经验发送给你配置的模型并直接操作，不逐步确认；人工示范模式只在本机私有库保存事件、可见/输入文本和抽样截图，不执行模型动作，只有另行同意编译或修订才上传示范。悬浮按钮或音量下键停止。启用服务本身不采集；不绕过安全窗口、锁屏或系统权限。请勿在敏感页面使用。</string>
+</resources>

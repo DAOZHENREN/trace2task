@@ -8,3 +8,4 @@ Pillow==11.3.0
 numpy==2.2.6
 pygame==2.6.1
 PyYAML==6.0.2
+langchain==1.4.3

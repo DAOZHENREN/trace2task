@@ -15,7 +15,9 @@ dependencies = [
   "faster-whisper>=1.1,<2",
   "langgraph>=1,<2",
   "langgraph-checkpoint-sqlite>=3,<4",
+  "langchain==1.4.3",
   "numpy>=2.0",
+  "pillow>=11,<13",
   "pygame>=2.6,<3",
   "pyyaml>=6.0,<7",
 ]
@@ -23,7 +25,6 @@ dependencies = [
 [project.optional-dependencies]
 desktop = ["pywebview>=6.0,<7"]
 dev = [
-  "pillow>=11,<13",
   "pytest>=8.3",
   "ruff>=0.12",
 ]

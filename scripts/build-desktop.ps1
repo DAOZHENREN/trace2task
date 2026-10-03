@@ -3,6 +3,13 @@ $ErrorActionPreference = 'Stop'
 $codeRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $codeRoot
 try {
+    Push-Location (Join-Path $codeRoot 'frontend')
+    try {
+        & npm.cmd ci --no-fund --no-audit
+        if ($LASTEXITCODE -ne 0) { throw 'Frontend dependencies failed' }
+        & npm.cmd run build
+        if ($LASTEXITCODE -ne 0) { throw 'Workbench build failed' }
+    } finally { Pop-Location }
     # Only build machines need uv. End users receive the native installer binary.
     $vendorDir = Join-Path $codeRoot 'build/desktop-vendor'
     New-Item -ItemType Directory -Force -Path $vendorDir | Out-Null

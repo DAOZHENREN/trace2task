@@ -314,23 +314,15 @@ def test_d_model_done_stops_without_visual_completion_review(tmp_path):
     assert len(core.calls) == 1
 
 
-def test_experience_context_reaches_every_non_d_model_request(tmp_path):
+@pytest.mark.parametrize('with_images', [False, True])
+def test_experience_context_reaches_every_non_d_model_request(tmp_path, with_images):
+    from test_task_conversations import experience, image_experience
+
     result = {"actions": 0, "history": [], "model_io": []}
     observer, core = Observer(tmp_path), Core()
     audit = Audit(result)
-    experience_context = {
-        "task_id": "Notepad draft",
-        "semantic": {
-            "goal": "Type the requested text.",
-            "completion": {"mode": "state", "success_condition": "Text is visible."},
-            "state_graph": {
-                "entry_state_id": "editing",
-                "states": [{"id": "editing", "name": "Editing", "visual_anchors": ["empty document"]}],
-                "transitions": [], "terminals": [],
-            },
-        },
-        "human_guidance": None,
-    }
+    # A/D are frozen complete inputs, not the retired state-graph projection.
+    experience_context = image_experience() if with_images else experience()
 
     responses = [
         {"status": "predicted", "prediction": {"actions": [CLICK]}},
@@ -360,10 +352,7 @@ def test_experience_context_reaches_every_non_d_model_request(tmp_path):
     )
 
     assert len(audit.predictions) == 3
-    assert audit.predictions[0]["experience_context"]["candidate_state"]["id"] == "editing"
-    assert audit.predictions[1]["experience_context"]["candidate_state"] is None
-    assert all("applicability" not in item["experience_context"]
-               for item in audit.predictions)
+    assert all(item['experience_context'] == experience_context for item in audit.predictions)
 
 
 def test_d_model_rejects_experience_without_mutating_its_task_input(tmp_path):

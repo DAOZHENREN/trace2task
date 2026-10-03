@@ -117,8 +117,17 @@ def extract_previous_frames(video, timestamps, origin, output):
 
 
 def render_report(output, manifest):
-    # The official visual export is the only source of displayed action content.
+    # Keep official visual ordering; join details by ID, never list position.
     actions = [a for a in read_jsonl(output / "reduced_events_vis.jsonl") if a is not None]
+    complete_path = output / "reduced_events_complete.jsonl"
+    complete = {}
+    if complete_path.exists():
+        for item in read_jsonl(complete_path):
+            if item is None:
+                continue
+            if item["id"] in complete:
+                raise ValueError("Duplicate official action ID")
+            complete[item["id"]] = item
     esc = lambda value: html.escape(str(value), quote=True)
     cards = []
     for action in actions:
@@ -130,8 +139,29 @@ def render_report(output, manifest):
                        if frame.get("path") else '<p>没有时间边界之前的可用参考帧。</p>')
             images.append(f'<figure><figcaption>{label}</figcaption>{picture}</figure>')
         duration = (action.get("end_time") or action["start_time"]) - action["start_time"]
+        click_details = ""
+        if action["action"] == "click":
+            detail = complete.get(action["id"], {})
+            if detail.get("action") != "click":
+                detail = {}
+            points = detail.get("coordinates") or [detail.get("coordinate")]
+            positions = []
+            for point in points:
+                if isinstance(point, dict) and all(
+                    isinstance(point.get(axis), (int, float)) and not isinstance(point[axis], bool)
+                    and math.isfinite(point[axis]) for axis in ("x", "y")
+                ):
+                    positions.append(f'x={point["x"]}, y={point["y"]}')
+                else:
+                    positions.append("坐标未提供或无效")
+            button = {"left": "左键", "right": "右键", "middle": "中键"}.get(
+                detail.get("button"), detail.get("button") or "未提供")
+            click_details = (f'<p>按钮：{esc(button)} · 点击坐标：{esc(" → ".join(positions))}'
+                             '（原始桌面像素坐标）<br><small>来源：官方完整动作，'
+                             f'ID {esc(action["id"])}；多次点击按记录顺序列出。</small></p>')
         cards.append(f'<article><h2>{action["id"] + 1}. {esc(action.get("description") or action["action"])}</h2>'
                      f'<p>动作：{esc(action["action"])} · 持续时间：{duration:.3f} 秒</p>'
+                     f'{click_details}'
                      f'<div class="images">{"".join(images)}</div><details><summary>官方展示动作（含可见子动作）</summary>'
                      f'<pre>{esc(json.dumps(action, ensure_ascii=False, indent=2))}</pre></details></article>')
     warnings = ''.join(f'<li>{esc(w)}</li>' for w in manifest["warnings"])

@@ -59,6 +59,26 @@ def completed_turn(
     }
 
 
+def test_token_usage_marks_context_for_discard_without_compaction(tmp_path):
+    transport = ScriptedTransport([
+        {"id": 1, "result": {}},
+        {"id": 2, "result": {"thread": {"id": "thread-1"}}},
+        {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+        {"method": "thread/tokenUsage/updated", "params": {"threadId": "thread-1",
+            "tokenUsage": {"modelContextWindow": 10000, "last": {"totalTokens": 8500}}}},
+        completed_turn("turn-1", '{}'),
+    ])
+    session = CodexAppServerSession('codex', model='test', cwd=tmp_path,
+        transport_factory=lambda _: transport,
+        thread_config={"model_auto_compact_token_limit": 2_000_000_000})
+    session.run_turn(prompt='task', image_path=None, output_schema={})
+    assert session.context_near_limit
+    session.reset_thread()
+    assert not session.context_near_limit
+    assert session.thread_id is None
+    assert not any('compact' in message.get('method', '') for message in transport.sent)
+
+
 def test_session_initializes_once_and_reuses_thread_for_multiple_turns(tmp_path: Path) -> None:
     transport = ScriptedTransport(
         [

@@ -28,6 +28,22 @@ function allNodes(node) {
   return [node, ...node.children.flatMap(allNodes)];
 }
 
+test('first-round visible bubbles include task and experience even in old image-only incremental archives', () => {
+  const context = vm.createContext({document: fakeDocument(), encodeURIComponent});
+  vm.runInContext(source.slice(source.indexOf('function modelIoStatusLabel'),
+    source.indexOf('function renderLibrary')), context);
+  const task = '按会议通知整理交付文件夹。\n完整任务经验：保持原文。';
+  const chat = context.makeModelChat([{status: 'predicted', input: {
+    client_submission: {conversation_start: true},
+    messages: [{role: 'system', content: 'system'}, {role: 'user', content: [
+      {type: 'text', text: task}, {type: 'image'}]}],
+    new_messages: [{role: 'user', content: [{type: 'image'}]}],
+  }}]);
+  // Ignore folded complete-input audit: the default visible bubble must have text.
+  const visible = chat.children[0].children.filter(node => node.tagName !== 'details');
+  assert.ok(visible.flatMap(allNodes).some(node => node.textContent.includes(task)));
+});
+
 test('image gallery distinguishes current, previous, missing paths and load errors', () => {
   const context = vm.createContext({document: fakeDocument(), encodeURIComponent});
   vm.runInContext(source.slice(source.indexOf('function modelIoStatusLabel'),

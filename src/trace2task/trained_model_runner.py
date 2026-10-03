@@ -77,7 +77,7 @@ def interruptible_prediction(predictor, stop, instruction, *, on_cancel=None, on
 def run_trained_desktop(*, instruction, output_root, emergency_stop, status_callback,
                         approve, continuous=False, max_actions=40, backend=None,
                         capture=None, size=None, predictor=predict_local, model="D-5970", executor_backend="win32", cua_target=None,
-                        experience_context=None, prompt_profile=None, on_model_round=None):
+                        experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None):
     if model == "D-5970" and experience_context is not None:
         raise ValueError("D-5970 冻结输入结构不支持经验指导")
     if executor_backend == "cua":
@@ -85,7 +85,7 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
         return run_cua_local(instruction=instruction, output_root=output_root,
                              emergency_stop=emergency_stop, status_callback=status_callback, model=model,
                              cua_target=cua_target, experience_context=experience_context,
-                             prompt_profile=prompt_profile, on_model_round=on_model_round)
+                             prompt_profile=prompt_profile, on_model_round=on_model_round, inference_backend=inference_backend)
     if executor_backend != "win32":
         raise ValueError("Unknown executor backend")
     if model != "D-5970":
@@ -95,7 +95,7 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
         from trace2task.local_gui_protocol import MODELS
         if model not in MODELS:
             raise ValueError("Unknown local GUI model")
-        predictor = partial(predict_gui, model=model)
+        predictor = partial(predict_gui, model=model, expected_backend=inference_backend)
     suffix = "trained-d" if model == "D-5970" else model
     root = Path(output_root) / (datetime.now(UTC).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8] + "-" + suffix)
     root.mkdir(parents=True)

@@ -1,0 +1,16 @@
+/* Isolated compatibility surface; the new workbench owns navigation and status. */
+.workbench-embedded {background:#fff; color:#203b33; font-family:"Segoe UI Variable","Microsoft YaHei",sans-serif;}
+.workbench-embedded .shell {max-width:none; margin:0; padding:18px;}
+.workbench-embedded .topbar,.workbench-embedded .hero,.workbench-embedded .view-tabs,
+.workbench-embedded #components-panel {display:none;}
+.workbench-embedded main {padding:0;}
+.workbench-embedded .card {border:1px solid #e3e8e1; border-radius:12px; box-shadow:none; background:#fff;}
+.workbench-embedded .workspace {gap:18px;}
+.workbench-embedded h2 {font-size:20px; color:#203b33;}
+.workbench-embedded .section-kicker,.workbench-embedded .field-help {color:#68776e;}
+.workbench-embedded .button.primary,.workbench-embedded .mini-button.primary {background:#186653; border-color:#186653;}
+.workbench-embedded input,.workbench-embedded select,.workbench-embedded textarea {border-radius:7px; border-color:#d5ddd0;}
+.workbench-embedded .step {background:#eef2e4; color:#668155;}
+.workbench-embedded.components-only #components-panel {display:block;}
+.workbench-embedded.components-only .workspace {display:none;}
+@media(max-width:900px) {.workbench-embedded .workspace {grid-template-columns:1fr;}}

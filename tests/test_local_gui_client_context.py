@@ -42,3 +42,44 @@ def test_predict_gui_rejects_conflicting_context_aliases_before_network():
     with pytest.raises(ValueError, match='Use either execution_context'):
         local_gui_client.predict_gui('test', model='mai-ui-2b', image='image-bytes',
                                      execution_context={}, cua_context={})
+
+
+@pytest.mark.parametrize('supported', [False, True])
+def test_a_images_require_explicit_service_support_and_send_frozen_bytes(monkeypatch, tmp_path, supported):
+    from test_task_conversations import image_experience
+
+    directory = tmp_path / 'runs' / 'local-gui'
+    directory.mkdir(parents=True)
+    (directory / 'service.token').write_text('test-token', encoding='ascii')
+    monkeypatch.setenv('TRACE2TASK_DATA_ROOT', str(tmp_path))
+    requests = []
+
+    class Opener:
+        def open(self, request, timeout):
+            if isinstance(request, str):
+                return io.BytesIO(json.dumps({'service': 'trace2task-local-gui', 'protocol': 1,
+                    'capabilities': {'trace_evidence_images': supported}}).encode())
+            requests.append(json.loads(request.data))
+            return io.BytesIO(b'{"status":"predicted"}')
+
+    monkeypatch.setattr(local_gui_client, 'build_opener', lambda *args: Opener())
+    context = image_experience()
+    if not supported:
+        with pytest.raises(RuntimeError, match='未发送截图或经验'):
+            local_gui_client.predict_gui('task', model='mai-ui-2b', image='private-current', experience_context=context)
+        assert requests == []
+    else:
+        result = local_gui_client.predict_gui('task', model='mai-ui-2b', image='current', experience_context=context)
+        assert result['status'] == 'predicted'
+        assert requests[0]['experience_context'] == context
+
+
+def test_frozen_engine_mismatch_rejects_before_sending_screenshot(monkeypatch, tmp_path):
+    monkeypatch.setenv('TRACE2TASK_DATA_ROOT', str(tmp_path))
+    class Opener:
+        def open(self, request, timeout):
+            assert isinstance(request, str) and request.endswith('/health')
+            return io.BytesIO(b'{"service":"trace2task-local-gui","protocol":1,"backend":"transformers","capabilities":{"expected_backend":true}}')
+    monkeypatch.setattr(local_gui_client, 'build_opener', lambda *args: Opener())
+    with pytest.raises(RuntimeError, match='未发送截图'):
+        local_gui_client.predict_gui('test', model='qwen3-vl-2b', image='private-image', expected_backend='llama-server')
