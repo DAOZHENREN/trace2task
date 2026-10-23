@@ -400,5 +400,5 @@ def test_checkout_rejects_symlinked_locked_task_source(tmp_path, monkeypatch):
         task.symlink_to(target)
     except OSError:
         pytest.skip("symlinks are unavailable on this test host")
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(ValueError, match="locked task source is not a real file"):
         rsi_worker.check_checkout(checkout, rsi_worker.OSWORLD_REVISION)

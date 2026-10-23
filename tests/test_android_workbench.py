@@ -67,7 +67,9 @@ def test_mobileforge_session_closed_on_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('mobileforge', ['', 'pinned-source'])
-def test_worker_routes_android_and_keeps_stop_control(tmp_path, monkeypatch, mobileforge):
+def test_worker_routes_android_and_keeps_stop_control(
+    tmp_path, monkeypatch, mobileforge, synthetic_console_hotkey
+):
     from trace2task import android_workbench, chat_agent_runner, mobileforge_adapter
     calls = []
     monkeypatch.setattr(android_workbench, 'prepare', lambda value: {})

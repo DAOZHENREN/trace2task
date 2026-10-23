@@ -67,7 +67,7 @@ def test_symlinked_cache_path_is_rejected(tmp_path):
         (upstream / "results").symlink_to(tmp_path / "outside", target_is_directory=True)
     except OSError:
         pytest.skip("Windows test account cannot create symlinks")
-    with pytest.raises(rsi_exam_fence.ExamFenceCacheError, match="symlink"):
+    with pytest.raises(rsi_exam_fence.ExamFenceCacheError, match="escapes the upstream checkout"):
         rsi_exam_fence.verify_exam_fence_cache(
             upstream, upstream_revision="u" * 40, osworld_revision="o" * 40,
             osworld_task_source_identity=_identity(),

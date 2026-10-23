@@ -258,7 +258,9 @@ def test_stop_after_search_never_loads_or_dispatches(tmp_path):
     assert len(session.requests) == 1
 
 
-def test_controller_freezes_auto_policy_and_persists_actual_choice(tmp_path, monkeypatch):
+def test_controller_freezes_auto_policy_and_persists_actual_choice(
+    tmp_path, monkeypatch, synthetic_console_hotkey
+):
     controller = WebConsoleController(tmp_path, rsi_client=object())
     calls = []
     monkeypatch.setattr(controller, '_run_job', lambda *args: calls.append(args))

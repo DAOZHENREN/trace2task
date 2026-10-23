@@ -6,6 +6,17 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 
+@pytest.fixture
+def synthetic_console_hotkey(monkeypatch):
+    """Fake runners need no native input; real F9 has separate protocol tests."""
+    from types import SimpleNamespace
+
+    from trace2task import web_console
+
+    monkeypatch.setattr(web_console, 'Win32EmergencyStop', lambda: SimpleNamespace(
+        start=lambda: None, close=lambda: None, raise_if_requested=lambda: None))
+
+
 @pytest.fixture(autouse=True)
 def isolated_personal_profiles(tmp_path):
     """Offline tests must not load the developer's deployments or API credentials."""

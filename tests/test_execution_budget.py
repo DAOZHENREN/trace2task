@@ -64,7 +64,7 @@ def test_expired_model_answer_cannot_dispatch(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('reason', ['action_limit', 'time_limit'])
-def test_budget_stop_is_not_completed_job(tmp_path, monkeypatch, reason):
+def test_budget_stop_is_not_completed_job(tmp_path, monkeypatch, reason, synthetic_console_hotkey):
     from test_android_workbench import configuration
 
     from trace2task import android_workbench, chat_agent_runner

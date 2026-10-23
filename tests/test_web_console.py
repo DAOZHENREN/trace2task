@@ -26,12 +26,7 @@ from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
 from trace2task.windows_runner import WindowsAgentRunFailed
 
-
-@pytest.fixture(autouse=True)
-def synthetic_console_hotkey(monkeypatch):
-    # Controller tests use fake runners; native F9 has its own protocol tests.
-    monkeypatch.setattr(web_console, 'Win32EmergencyStop', lambda: SimpleNamespace(
-        start=lambda: None, close=lambda: None, raise_if_requested=lambda: None))
+pytestmark = pytest.mark.usefixtures('synthetic_console_hotkey')
 
 
 def _mock_chat_runner(monkeypatch, calls):
@@ -2305,7 +2300,7 @@ def test_web_controller_opens_only_local_experience_directories(
     task_path = _write_windows_task(tmp_path)
     controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
     opened: list[Path] = []
-    monkeypatch.setattr(web_console.os, "startfile", opened.append)
+    monkeypatch.setattr(web_console, "os", SimpleNamespace(name="nt", startfile=opened.append))
 
     result = controller.open_local(task_path.relative_to(tmp_path).as_posix())
 
