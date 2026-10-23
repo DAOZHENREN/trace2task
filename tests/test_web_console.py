@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
@@ -24,6 +25,13 @@ from trace2task.codex_app_server import CodexTurnTimeoutError
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
 from trace2task.windows_runner import WindowsAgentRunFailed
+
+
+@pytest.fixture(autouse=True)
+def synthetic_console_hotkey(monkeypatch):
+    # Controller tests use fake runners; native F9 has its own protocol tests.
+    monkeypatch.setattr(web_console, 'Win32EmergencyStop', lambda: SimpleNamespace(
+        start=lambda: None, close=lambda: None, raise_if_requested=lambda: None))
 
 
 def _mock_chat_runner(monkeypatch, calls):
