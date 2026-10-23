@@ -124,7 +124,7 @@ export function App() {
   const busy = !!liveRun;
   const recording = liveRun && isRecording(liveRun) ? liveRun : runs.find(run => run.job_id === recordId) || runs.find(isRecording);
   const go = (next: Page) => {setPage(next); setError(''); setVisited(old => new Set([...old, next]));
-    if (['library', 'history'].includes(next)) void refresh().catch(e => setError(String(e)));};
+    if (['library', 'history', 'trash'].includes(next)) void refresh().catch(e => setError(String(e)));};
   function viewRun(run: Run) {
     if (isRecording(run)) {setRecordId(run.job_id); go('record');} else {setSelectedRun(run.job_id); go('tasks');}
   }

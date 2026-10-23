@@ -431,7 +431,9 @@ test('trash removes active assets, restores safely and requires permanent-delete
   await expect(page.getByText(/无法从本回收站恢复/)).toBeVisible();
   await expect(page.getByRole('heading', {name: '回收站是空的', exact: true})).toBeVisible();
   expect(writes.map(w => w.url)).toEqual(['/api/traces/delete', '/api/trash/restore', '/api/recordings/delete', '/api/trash/delete']);
+  const historyRefreshed = page.waitForResponse(response => response.url().endsWith('/api/state?compact=1'));
   await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await historyRefreshed; // Add new entries only after the previous page's refresh has finished.
   await expect(page.getByRole('heading', {name: history.task_id, level: 3, exact: true})).toBeVisible();
   trash.push({path: 'runs/.trash/recordings/pending', name: '占用中的安全副本', kind: 'recording',
     pending_cleanup: true, can_restore: true, can_delete: false},
