@@ -15,6 +15,230 @@ test.beforeEach(async ({page}) => {page.on('dialog', async dialog => {
 
 test.afterEach(async ({page}) => {await page.unrouteAll({behavior: 'wait'});});
 
+test('C combines the explicitly selected B, previews evidence and requires explicit use', async ({page}, info) => {
+  const b = {id: 'b-selected', trace_name: '保存文档', representation: 'B', description: '选定版本', created_at: '2026-10-08T10:00:00Z'};
+  const other = {...b, id: 'b-other', description: '另一版本', created_at: '2026-10-07T10:00:00Z'};
+  const c = {...b, id: 'c-combined', representation: 'C', description: 'B 原文与 A 证据'};
+  const traces: object[] = [b, other]; const writes: string[] = []; const requests: any[] = [];
+  const content = '# 组合经验 C\n\n# 保存文档\n用途原文。\n## 步骤\n1. 保存。\n\n## A 原始证据（原文）\n冻结的动作文本';
+  const image = {id: '0000', file: 'evidence/images/0000.png', sha256: 'test'};
+  page.on('request', r => {if (r.method() === 'POST') writes.push(new URL(r.url()).pathname);});
+  await page.route('**/api/state?compact=1', async route => {const state = await (await route.fetch()).json();
+    await route.fulfill({json: {...state, trace_representations: traces}});});
+  await page.route('**/api/traces/generate-c', route => {
+    const body = route.request().postDataJSON(); requests.push(body); expect(body.b_id).toBe(b.id);
+    if (traces.some((t: any) => t.id === c.id)) return route.fulfill({json: {confirmation_required: true,
+      representation: 'C', message: '此 B 已有 C，是否生成新版本？', existing_versions: [c]}});
+    traces.push(c); return route.fulfill({json: {id: c.id, representation: 'C', source_b_id: b.id}});
+  });
+  await page.route('**/api/traces/model-input', route => {expect(route.request().postDataJSON().id).toBe(c.id);
+    return route.fulfill({json: {content, format: 'procedure-with-evidence-v1', images: [image], image_selection: {rule: '沿用 B 冻结的 A 图片'}}});});
+  await page.route('**/api/traces/body', route => route.fulfill({json: {representation: 'C', source_b_id: b.id, frames: []}}));
+  await page.route('**/api/traces/asset?*', route => route.fulfill({contentType: 'image/png',
+    body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')}));
+  await page.goto('/'); await page.getByRole('button', {name: '经验库', exact: true}).click();
+  const source = page.locator('article').filter({hasText: '选定版本'});
+  await source.getByRole('button', {name: '生成组合证据 C', exact: true}).click();
+  await expect(page.getByRole('dialog')).toContainText(b.id);
+  await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click(); expect(requests).toHaveLength(0);
+  await source.getByRole('button', {name: '生成组合证据 C', exact: true}).click(); await acceptConfirmation(page, '生成组合证据 C');
+  await expect(page.getByText(/已生成组合证据 C（c-combined）/)).toBeVisible();
+  const combined = page.locator('article').filter({hasText: '可执行参考 · 组合证据 C'});
+  await combined.getByRole('button', {name: '查看模型原文', exact: true}).click();
+  await expect(page.getByText('组合证据 C · 同一 B 原文 + 对应 A 证据', {exact: true})).toBeVisible();
+  expect(await page.locator('.detail-workspace .experience-preview').textContent()).toBe(content);
+  await expect(page.getByRole('heading', {name: '实际发送的历史图片 · 1 张'})).toBeVisible();
+  await page.screenshot({path: info.outputPath('combined-c.png'), animations: 'disabled'});
+  await source.getByRole('button', {name: '生成组合证据 C', exact: true}).click();
+  await page.getByRole('dialog').getByRole('button', {name: '生成组合证据 C', exact: true}).click();
+  await expect(page.getByRole('dialog', {name: '重新生成组合证据 C？'})).toBeVisible();
+  await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click();
+  expect(traces).toHaveLength(3); expect(requests).toHaveLength(2);
+  await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
+  await combined.getByRole('button', {name: '用于新任务', exact: true}).click();
+  await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('trace-library/c-combined/model-input.txt');
+  expect(writes.every(path => ['/api/traces/generate-c', '/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+});
+
+test('bulk recycle scopes selection, cancels safely, reports partial failure and restores run history', async ({page}, info) => {
+  let traces = ['经验一', '经验二'].map((name, i) => ({id: `bulk-${i}`, trace_name: name, description: '批量测试', representation: 'D'}));
+  let runs = ['运行一', '运行二'].map((name, i) => ({job_id: `run-${i}`, task_id: name, instruction: name,
+    kind: 'agent', model: 'test', provider: 'codex', status: 'completed', created_at: '2026-10-08T10:00:00Z'}));
+  const originalRuns = [...runs]; const trash: TrashItem[] = []; const writes: string[] = [];
+  let failSecond = true;
+  const recording = {task_id: '录制批量测试', trace_path: 'runs/bulk/events.jsonl', local_path: 'runs/bulk',
+    recording_backend: 'opencua', success: true, input_events: 2};
+  await page.route('**/api/state?compact=1', async route => {const state = await (await route.fetch()).json();
+    await route.fulfill({json: {...state, active_job: null, trace_representations: traces, recordings: [recording], trash}});});
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs}}));
+  await page.route('**/api/traces/delete', route => {
+    const {id} = route.request().postDataJSON(); writes.push(id);
+    const trace = traces.find(t => t.id === id)!;
+    trash.push({path: `trace-library/.trash/${id}`, name: trace.trace_name, kind: 'trace_experience', can_restore: true, can_delete: true});
+    traces = traces.filter(t => t.id !== id); return route.fulfill({json: {deleted: true}});
+  });
+  await page.route('**/api/workbench/runs/delete', route => {
+    const {id} = route.request().postDataJSON(); writes.push(id);
+    if (id === 'run-1' && failSecond) return route.fulfill({status: 409, json: {error: '模拟记录被占用'}});
+    const run = runs.find(r => r.job_id === id)!;
+    trash.push({path: `workbench-run/${id}`, name: run.instruction, kind: 'run', can_restore: true, can_delete: true, can_open: false});
+    runs = runs.filter(r => r.job_id !== id); return route.fulfill({json: {deleted: true}});
+  });
+  await page.route('**/api/trash/restore', route => {
+    const {path} = route.request().postDataJSON(); writes.push('restore');
+    runs.push(originalRuns.find(r => `workbench-run/${r.job_id}` === path)!);
+    trash.splice(trash.findIndex(t => t.path === path), 1); return route.fulfill({json: {restored: true}});
+  });
+  await page.goto('/'); await page.getByRole('button', {name: '经验库', exact: true}).click();
+  await expect(page.getByRole('button', {name: '移到回收站', exact: true})).toHaveCount(0);
+  await page.getByRole('checkbox', {name: '全选当前列表', exact: true}).check();
+  await page.getByRole('textbox', {name: '搜索经验'}).fill('经验一');
+  await expect(page.getByText('已选 1 项', {exact: true})).toBeVisible();
+  await page.getByRole('textbox', {name: '搜索经验'}).fill('');
+  await page.getByRole('checkbox', {name: '全选当前列表', exact: true}).check();
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click();
+  await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click(); expect(writes).toEqual([]);
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click(); await acceptConfirmation(page, '批量移到回收站');
+  await expect(page.getByText('已移到回收站 2 项。可在全局回收站恢复。', {exact: true})).toBeVisible();
+  await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await page.getByRole('checkbox', {name: '全选当前列表', exact: true}).check();
+  await page.screenshot({path: info.outputPath('bulk-history.png'), animations: 'disabled'});
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click(); await acceptConfirmation(page, '批量移到回收站');
+  await expect(page.getByText(/已移到回收站 1 项，失败 1 项/)).toBeVisible();
+  await expect(page.getByRole('checkbox', {name: '选择 运行二', exact: true})).toBeChecked();
+  failSecond = false;
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click(); await acceptConfirmation(page, '批量移到回收站');
+  await expect(page.getByRole('checkbox', {name: '选择 运行二', exact: true})).toHaveCount(0);
+  await page.getByRole('button', {name: '回收站', exact: true}).click();
+  await expect(page.getByRole('heading', {name: '全局回收站', exact: true})).toBeVisible();
+  const runCard = page.locator('article').filter({has: page.getByRole('heading', {name: '运行一', exact: true})});
+  await runCard.getByRole('button', {name: '恢复', exact: true}).click(); await acceptConfirmation(page, '确认恢复');
+  await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await expect(page.getByRole('heading', {name: '运行一', exact: true})).toBeVisible();
+  await page.getByRole('navigation', {name: '主导航'}).getByRole('button', {name: '录制示范', exact: true}).click();
+  await expect(page.getByRole('checkbox', {name: '选择 录制批量测试', exact: true})).toBeVisible();
+  expect(writes).toEqual(['bulk-0', 'bulk-1', 'run-0', 'run-1', 'run-1', 'restore']);
+});
+
+test('Agent compiles B as a separate Markdown version, with disclosure, duplicate gate and explicit use', async ({page}, info) => {
+  const record = {task_id: '保存会议纪要示范', trace_path: 'runs/procedure-demo/events.jsonl', local_path: 'runs/procedure-demo',
+    recording_backend: 'opencua', success: true, input_events: 16, compilation_supported: false, derivation: {status: 'completed'}};
+  const procedure = '# 保存会议纪要\n将会议正文保存到指定文件。\n\n输入：{正文}、{文件名}，由当前任务提供。\n\n## 步骤\n1. 在编辑器输入 {正文}。\n2. 选择保存，填写 {文件名} 并确认。\n3. 核对目标文件名；截图不能证明落盘结果，执行时还需检查文件。\n';
+  const trace = {id: 'procedure-version-1', trace_name: '保存会议纪要', representation: 'B', description: '将会议正文保存到指定文件。',
+    created_at: '2026-10-08T10:00:00+00:00', created_at_source: 'metadata'};
+  const traces: object[] = []; const requests: any[] = []; const writes: string[] = [];
+  let run: any = null; let finished = false;
+  const id = 'b'.repeat(32);
+  const snapshot = () => run && {...run, status: finished ? 'completed' : 'running',
+    ...(finished ? {result: {representation: 'B', compiled_trace_id: trace.id}} : {})};
+  page.on('request', r => {if (r.method() === 'POST') writes.push(new URL(r.url()).pathname);});
+  await page.route('**/api/state?compact=1', async route => {const state = await (await route.fetch()).json();
+    state.agent_options.compiler_defaults = {model: 'gpt-6.1-sol', reasoning_effort: 'high'};
+    await route.fulfill({json: {...state, recordings: [record], trace_representations: traces}});});
+  await page.route('**/api/traces/generate-b', route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    expect(body).toMatchObject({trace_path: record.trace_path, model: 'gpt-6.1-sol', reasoning_effort: 'high'});
+    if (traces.length) return route.fulfill({json: {confirmation_required: true, representation: 'B',
+      existing_versions: traces, message: '已有方法 B；继续将生成新版本，已有版本保留。'}});
+    run = {job_id: id, kind: 'compilation', instruction: `Agent 编译 Procedure B：${record.task_id}`, model: body.model,
+      provider: 'codex', status: 'running', created_at: new Date().toISOString()};
+    return route.fulfill({status: 202, json: snapshot()});
+  });
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: run ? [snapshot()] : []}}));
+  await page.route(`**/api/workbench/runs/${id}?*`, route => route.fulfill({json: {session: snapshot(), events: [], cursor: 0, has_more: false}}));
+  await page.route('**/api/traces/model-input', route => route.fulfill({json: {content: procedure, format: 'procedure-markdown-v1', images: [],
+    compiler: {model: 'gpt-6.1-sol', reasoning_effort: 'high', prompt_version: 'procedure-markdown-2026-10-08',
+      instructions: '固定提示词：仅输出最终 Procedure。', input: '历史示范动作，非当前任务。', images: [], image_selection: {rule: '最多 8 张历史截图，包含首尾。'}}}}));
+  await page.route('**/api/traces/body', route => route.fulfill({json: {representation: 'B', runtime_images: []}}));
+  await page.goto('/'); await page.getByRole('button', {name: '经验库', exact: true}).click();
+  await page.getByRole('tab', {name: /原始录制/}).click();
+  await page.getByRole('button', {name: 'Agent 编译方法 B', exact: true}).click();
+  await expect(page.getByRole('dialog')).toContainText('最多 8 张选中历史截图');
+  await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click();
+  expect(requests).toHaveLength(0);
+  await page.getByRole('button', {name: 'Agent 编译方法 B', exact: true}).click();
+  await acceptConfirmation(page, '开始 Agent 编译');
+  expect(requests).toHaveLength(1);
+  await expect(page.getByRole('heading', {name: run.instruction, exact: true})).toBeVisible();
+  await expect(page.getByRole('button', {name: /停止任务/})).toBeVisible();
+  await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
+  traces.push(trace); finished = true;
+  await expect(page.getByRole('button', {name: '到经验库查看 Procedure B'})).toBeVisible();
+  await page.getByRole('button', {name: '到经验库查看 Procedure B'}).click();
+  await expect(page.getByText('Agent 方法 B · 执行时仅发送下方完整 Markdown Procedure')).toBeVisible();
+  expect(await page.locator('.detail-workspace .experience-preview').first().textContent()).toBe(procedure);
+  await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
+  await page.screenshot({path: info.outputPath('agent-procedure-b.png'), animations: 'disabled'});
+  await page.getByText('Agent 编译输入与来源（不发送给执行模型）', {exact: true}).click();
+  await expect(page.getByText('固定提示词：仅输出最终 Procedure。', {exact: true})).toBeVisible();
+  await page.getByRole('tab', {name: /原始录制/}).click();
+  await page.getByRole('button', {name: 'Agent 编译方法 B', exact: true}).click();
+  await page.getByRole('dialog', {name: '通过 Agent 编译方法 B？'}).getByRole('button', {name: '开始 Agent 编译'}).click();
+  await expect(page.getByRole('dialog', {name: '重新生成Agent 方法 B？'})).toBeVisible();
+  await expect(page.getByRole('dialog')).toContainText('保存会议纪要');
+  await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click();
+  expect(requests).toHaveLength(2); expect(traces).toHaveLength(1);
+  await page.getByRole('tab', {name: /经验版本/}).click();
+  await page.locator('article').filter({hasText: '可执行参考 · Agent 方法 B'}).getByRole('button', {name: '用于新任务'}).click();
+  await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue(`trace-library/${trace.id}/model-input.txt`);
+  await expect(page.getByLabel('参考经验', {exact: true}).locator('option:checked')).toContainText(' · B · ');
+  expect(writes.every(path => ['/api/traces/generate-b', '/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+});
+
+test('service card hides D and refreshes only on opening or explicit request', async ({page}, info) => {
+  let services: any[] = [
+    {id: 'gui', label: '本地 GUI 服务', endpoint: 'http://127.0.0.1:8768', reachable: true,
+      status: 'running', model: 'gui-owl-2b', backend: 'llama-server', pid: 29064},
+    {id: 'trained_d', label: 'D-5970 预览服务', endpoint: 'http://127.0.0.1:8767', reachable: true,
+      status: 'running', model: 'trained_d', backend: 'frozen-checkpoint'},
+  ];
+  let checks = 0; let unavailable = false; const writes: string[] = [];
+  page.on('request', r => {if (r.method() === 'POST') writes.push(r.url());});
+  await page.route('**/api/local-model/status', route => {
+    checks++;
+    return route.fulfill(unavailable ? {status: 503, json: {error: 'test status unavailable'}}
+      : {json: {services, checked_at: '2026-10-08T09:00:00Z'}});
+  });
+  await page.goto('/');
+  await expect(page.locator('.local-runtime-pill')).toContainText('GUI-Owl');
+  await expect(page.locator('.local-runtime-pill')).not.toContainText('D-5970');
+  await page.locator('.local-runtime-pill').click();
+  const panel = page.getByRole('region', {name: '实际后台服务'});
+  await expect(panel.locator('.local-service-row.running')).toHaveCount(1);
+  await expect(panel.getByText(/D-5970/)).toHaveCount(0);
+  await expect(panel.getByText(/PID 29064/)).not.toBeVisible();
+  await panel.getByText('连接详情与诊断', {exact: true}).click();
+  await expect(panel.getByText(/PID 29064/)).toBeVisible();
+  await panel.getByText('连接详情与诊断', {exact: true}).click();
+  const original = page.locator('.model-card').filter({has: page.locator('.running-model-tag')});
+  await expect(original).toHaveCount(1);
+  const other = page.locator('.model-card').filter({hasNot: page.locator('.running-model-tag')}).first();
+  await other.click();
+  await expect(other).toContainText('已选择 · 待启动配置');
+  await expect(original).toContainText('运行中 · llama-server');
+  await expect(page.getByText(/与所选配置不同/)).toBeVisible();
+  await page.screenshot({path: info.outputPath('live-local-services.png'), animations: 'disabled'});
+  const manualChecks = checks;
+  await page.evaluate(() => {window.dispatchEvent(new Event('focus')); document.dispatchEvent(new Event('visibilitychange'));});
+  await page.waitForTimeout(5500);
+  expect(checks).toBe(manualChecks);
+  const beforeReload = checks;
+  await page.reload();
+  await expect(page.locator('.local-runtime-pill')).toContainText('GUI-Owl');
+  expect(checks).toBeGreaterThan(beforeReload);
+  services = services.map(s => ({...s, reachable: false, status: 'unavailable', model: null}));
+  await page.locator('.local-runtime-pill').click();
+  await page.getByRole('button', {name: '刷新', exact: true}).click();
+  await expect(page.locator('.local-runtime-pill')).toContainText('未检测到已加载模型', {timeout: 10000});
+  // An explicit refresh must not preserve a stale green status after API failure.
+  unavailable = true;
+  await page.getByRole('button', {name: '刷新', exact: true}).click();
+  await expect(page.locator('.local-runtime-pill')).toContainText('状态未知');
+  await page.locator('.local-runtime-pill').click();
+  await expect(page.getByText(/状态暂不可用，不能确认模型是否仍在运行/)).toBeVisible();
+  expect(writes).toEqual([]);
+});
+
 test('A compiles locally, exposes full text and exactly the selected images, then can be used', async ({page}, info) => {
   const recording = {task_id: '整理会议材料', trace_path: 'runs/raw-a/events.jsonl', local_path: 'runs/raw-a',
     recording_backend: 'opencua', success: true, input_events: 10, compilation_supported: false, derivation: {status: 'completed'}};
@@ -50,7 +274,7 @@ test('A compiles locally, exposes full text and exactly the selected images, the
   await expect(page.getByRole('dialog', {name: '重新生成原始证据 A？'})).toBeVisible();
   await page.getByRole('dialog').getByRole('button', {name: '取消', exact: true}).click();
   expect(writes).toHaveLength(2); expect(traces).toHaveLength(1);
-  await page.getByRole('tab', {name: /序列经验/}).click();
+  await page.getByRole('tab', {name: /经验版本/}).click();
   await page.getByRole('button', {name: '查看模型原文', exact: true}).click();
   await expect(page.getByText('模型输入 = 下方完整文本 + 8 张历史图片', {exact: true})).toBeVisible();
   await expect(page.getByText('文本以 D 式动作序列为主，只引用选中的历史截图。原始事件、文件路径和校验信息仅供审计，不塞入模型文本。', {exact: true})).toBeVisible();
@@ -135,7 +359,7 @@ test.describe('compiled versions', () => {
     expect(requests.map(body => body.confirm_duplicate)).toEqual([undefined, undefined, true]);
     expect(generated).toBe(1);
     await page.getByRole('button', {name: '任务工作台', exact: true}).click();
-    await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('');
+    await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
   });
 });
 
@@ -175,25 +399,27 @@ test('trash removes active assets, restores safely and requires permanent-delete
   await page.getByRole('button', {name: '用于新任务', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('trace-library/trash-D/model-input.txt');
   await page.getByRole('button', {name: '经验库', exact: true}).click();
-  await page.getByRole('button', {name: '移到回收站', exact: true}).click(); await acceptConfirmation(page, '移到回收站');
+  await page.getByRole('checkbox', {name: `选择 ${trace.trace_name}`, exact: true}).check();
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click(); await acceptConfirmation(page, '批量移到回收站');
   await expect(page.getByRole('heading', {name: trace.trace_name, exact: true})).toHaveCount(0);
-  await expect(page.getByText(/已移到回收站并从正常列表移除/)).toBeVisible();
+  await expect(page.getByText(/已移到回收站 1 项/)).toBeVisible();
   await page.getByRole('button', {name: '任务工作台', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('');
   await page.getByRole('button', {name: '经验库', exact: true}).click();
-  await page.getByRole('tab', {name: /回收站/}).click();
+  await page.getByRole('button', {name: '回收站', exact: true}).click();
   await expect(page.getByRole('heading', {name: trace.trace_name, exact: true})).toBeVisible();
   await page.getByRole('button', {name: '恢复', exact: true}).click(); await acceptConfirmation(page, '确认恢复');
   await expect(page.getByText(/未自动启用为当前任务经验/)).toBeVisible();
   await page.getByRole('button', {name: '任务工作台', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('');
   await page.getByRole('button', {name: '经验库', exact: true}).click();
-  await page.getByRole('tab', {name: /序列经验/}).click();
+  await page.getByRole('tab', {name: /经验版本/}).click();
   await expect(page.getByRole('heading', {name: trace.trace_name, exact: true})).toBeVisible();
   await page.getByRole('tab', {name: /原始录制/}).click();
-  await page.getByRole('button', {name: '移到回收站', exact: true}).click(); await acceptConfirmation(page, '移到回收站');
+  await page.getByRole('checkbox', {name: `选择 ${recording.task_id}`, exact: true}).check();
+  await page.getByRole('button', {name: '批量移到回收站', exact: true}).click(); await acceptConfirmation(page, '批量移到回收站');
   await expect(page.getByRole('heading', {name: recording.task_id, exact: true})).toHaveCount(0);
-  await page.getByRole('tab', {name: /回收站/}).click();
+  await page.getByRole('button', {name: '回收站', exact: true}).click();
   const before = writes.length;
   await page.getByRole('button', {name: '永久删除', exact: true}).click();
   await expect(page.getByRole('dialog')).toHaveClass(/confirmation-danger/);
@@ -211,13 +437,17 @@ test('trash removes active assets, restores safely and requires permanent-delete
     pending_cleanup: true, can_restore: true, can_delete: false},
     {path: 'trace-library/.trash/conflict', name: '同名冲突', kind: 'trace_experience',
       can_restore: false, restore_blocked_reason: '原位置已有内容', can_delete: true});
-  await page.getByRole('button', {name: '经验库', exact: true}).click();
+  await page.getByRole('button', {name: '回收站', exact: true}).click();
   await expect(page.locator('article').filter({hasText: '占用中的安全副本'}).getByRole('button', {name: '永久删除', exact: true})).toBeDisabled();
   await expect(page.locator('article').filter({hasText: '同名冲突'}).getByRole('button', {name: '恢复', exact: true})).toBeDisabled();
 });
 
 test('Qwen 8B uses the shared llama model service and local task contract', async ({page}) => {
   let serviceStarted = false, started = false;
+  await page.route('**/api/local-model/status', route => route.fulfill({json: {
+    checked_at: new Date().toISOString(), services: [{id: 'gui', label: '本地 GUI 服务', endpoint: 'http://127.0.0.1:8768',
+      reachable: serviceStarted, status: serviceStarted ? 'running' : 'unavailable', backend: 'llama-server', model: serviceStarted ? 'qwen3-vl-8b-instruct' : null}],
+  }}));
   const id = '8'.repeat(32);
   const run = {job_id: id, kind: 'agent', model: 'qwen3-vl-8b-instruct', provider: 'trained_d',
     instruction: '仅验证 8B 路由', status: 'running', created_at: new Date().toISOString()};
@@ -236,7 +466,7 @@ test('Qwen 8B uses the shared llama model service and local task contract', asyn
   await page.route('**/api/jobs', async route => {
     const body = route.request().postDataJSON();
     expect(body).toMatchObject({provider: 'trained_d', model: 'qwen3-vl-8b-instruct', inference_backend: 'llama-server',
-      executor_backend: 'win32', continuous: true, mode: 'execute'});
+      executor_backend: 'cua', continuous: true, mode: 'execute'});
     expect(body.api).toBeUndefined(); started = true; await route.fulfill({json: run});
   });
   await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: started ? [run] : []}}));
@@ -296,7 +526,7 @@ test('first screen, workflow navigation and compact layouts', async ({page, brow
   await expect(page.getByRole('heading', {name: '每一步，都可以回看。'})).toBeVisible();
   await page.getByRole('button', {name: '经验库', exact: true}).click();
   await expect(page.getByRole('heading', {name: '经验积累下来，下一次更从容。'})).toBeVisible();
-  for (const name of ['原始录制', '编译与历史版本', '反馈审查']) await page.getByRole('tab', {name: new RegExp(name)}).click();
+  for (const name of ['原始录制', '旧版状态图', '反馈审查']) await page.getByRole('tab', {name: new RegExp(name)}).click();
   await page.getByRole('navigation', {name: '主导航'}).getByRole('button', {name: '录制示范', exact: true}).click();
   await expect(page.getByLabel('经验名称', {exact: true})).toHaveValue('切换页面保留的录制草稿');
   await page.getByRole('button', {name: '设置与工具', exact: true}).click();
@@ -341,7 +571,8 @@ test('native recording and library use existing contracts without an old page', 
   await page.route('**/api/candidates/revisions/confirm', async route => {writes.push({url: route.request().url(), body: route.request().postDataJSON()}); candidate.revision.status = 'confirmed'; await route.fulfill({json: {status: 'confirmed'}});});
   await page.goto('/'); await page.getByRole('button', {name: '经验库', exact: true}).click();
   await page.getByRole('tab', {name: /原始录制/}).click();
-  await expect(page.getByRole('button', {name: '语义编译', exact: true})).toBeDisabled();
+  await expect(page.getByRole('button', {name: '语义编译', exact: true})).toHaveCount(0);
+  await expect(page.getByRole('button', {name: 'Agent 编译方法 B', exact: true})).toBeEnabled();
   await page.getByRole('button', {name: '生成精简序列 D', exact: true}).click();
   await expect(page.getByRole('heading', {name: '示范 A · D', exact: true})).toBeVisible();
   expect(writes[0].body).toEqual({trace_path: 'runs/demo/events.jsonl'});
@@ -416,11 +647,134 @@ test('incremental rounds keep disclosures open and fetch raw content only on dem
   await page.getByRole('button', {name: /UI 回执测试/}).click();
   await expect(page.locator('.round-card')).toBeVisible();
   expect(reads).toBe(0);
-  await page.getByText('模型回答与执行回执', {exact: true}).click();
+  await page.getByText('模型输入、输出与执行回执', {exact: true}).click();
   await expect(page.getByText('只读模型回答', {exact: true})).toBeVisible();
   await expect.poll(() => polls).toBeGreaterThan(1);
   await expect(page.locator('.round-content > details')).toHaveAttribute('open', '');
   expect(reads).toBe(1);
+});
+
+test('round input is readable before output with full text, folded history/system, images and copy', async ({page}, info) => {
+  const id = 'e'.repeat(32);
+  const run = {job_id: id, instruction: '逐轮输入展示测试', provider: 'api', model: 'fixture', status: 'completed', kind: 'agent', created_at: new Date().toISOString()};
+  const prompt = '继续整理会议材料。\n先核对当前画面，再决定下一步。\n<script>这是输入原文，不是代码</script>\n' + '保留完整经验内容。'.repeat(1000) + '\n原文结束。';
+  let reads = 0;
+  await page.addInitScript(() => {Object.defineProperty(navigator, 'clipboard', {value: {writeText: async (text: string) => {(window as any).copiedInput = text;}}});});
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [run]}}));
+  await page.route(`**/api/workbench/runs/${id}?*`, route => route.fulfill({json: {session: run, cursor: 1, has_more: false, events: [
+    {seq: 1, name: 'model.round', attributes: {step_index: 0, status: 'format_rejected', executed: false, tokens: {input_tokens: 100085, output_tokens: 56},
+      artifact_ref: `/api/workbench/runs/${id}/rounds/0`}},
+  ]}}));
+  await page.route(`**/api/workbench/runs/${id}/rounds/0`, route => {reads++; return route.fulfill({json: {
+    input: {messages: [{role: 'system', content: '仅供展开查看的系统指令'}, {role: 'user', content: '早先发送的任务全文'},
+      {role: 'assistant', content: '早先的模型回答'}, {role: 'user', content: [{type: 'text', text: prompt},
+        {type: 'image', local_path: 'runs/fixture/current.png'}]}], configuration: {temperature: 0, max_new_tokens: 512}},
+    raw_output: '这轮真实模型输出', execution: {executed: false},
+  }});});
+  await page.route('**/api/local-image?*', route => route.fulfill({contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jxWQAAAAASUVORK5CYII=', 'base64')}));
+  await page.goto('/'); await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await page.getByRole('button', {name: /逐轮输入展示测试/}).click();
+  expect(reads).toBe(0);
+  await page.getByText('模型输入、输出与执行回执', {exact: true}).click();
+  const input = page.getByRole('region', {name: '模型输入', exact: true});
+  await expect(input).toBeVisible();
+  expect(await input.locator('.model-input-text').first().textContent()).toBe(prompt);
+  await expect(input.locator('.model-input-text script')).toHaveCount(0);
+  await expect(input).not.toContainText('temperature');
+  await expect(input.getByText('仅供展开查看的系统指令', {exact: true})).toBeHidden();
+  await expect(input.getByText('早先发送的任务全文', {exact: true})).toBeHidden();
+  await expect(input.getByRole('img', {name: '图片 1 · 图片附件'})).toBeVisible();
+  await input.getByRole('button', {name: '复制本轮文字'}).click();
+  expect(await page.evaluate(() => (window as any).copiedInput)).toBe(prompt);
+  await expect(page.getByText('未发送操作输入', {exact: true})).toBeVisible();
+  await expect(page.getByText('这轮真实模型输出', {exact: true})).toBeVisible();
+  const order = await page.locator('.raw-round h4').allTextContents();
+  expect(order).toEqual(['模型输入', '模型输出', '执行回执']);
+  await input.getByText('本轮携带的历史消息 · 2 条', {exact: true}).click();
+  await expect(input.getByText('早先发送的任务全文', {exact: true})).toBeVisible();
+  await input.getByText('系统 / 开发者提示词 · 1 条', {exact: true}).click();
+  await expect(input.getByText('仅供展开查看的系统指令', {exact: true})).toBeVisible();
+  await input.getByText('本轮携带的历史消息 · 2 条', {exact: true}).click();
+  await input.getByText('系统 / 开发者提示词 · 1 条', {exact: true}).click();
+  await page.setViewportSize({width: 960, height: 900});
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.setViewportSize({width: 1366, height: 1100});
+  await input.evaluate(node => node.scrollIntoView({block: 'center'}));
+  await input.screenshot({path: info.outputPath('round-model-input.png'), animations: 'disabled'});
+  expect(reads).toBe(1);
+});
+
+test('round input discloses Codex context limits, missing images and unavailable input', async ({page}) => {
+  const id = 'f'.repeat(32);
+  const run = {job_id: id, instruction: '输入边界测试', provider: 'codex', status: 'completed', kind: 'agent', created_at: new Date().toISOString()};
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [run]}}));
+  await page.route(`**/api/workbench/runs/${id}?*`, route => route.fulfill({json: {session: run, cursor: 2, has_more: false, events: [0, 1].map(step => (
+    {seq: step + 1, name: 'model.round', attributes: {step_index: step, status: 'error', tokens: {}, artifact_ref: `/api/workbench/runs/${id}/rounds/${step}`}}))}}));
+  await page.route(`**/api/workbench/runs/${id}/rounds/0`, route => route.fulfill({json: {input: {messages: [
+    {role: 'user', content: [{type: 'text', text: '已归档的本轮文本'}, {type: 'image_url', image_url: {url: 'https://untrusted.invalid/no-load.png'}}]},
+  ]}}}));
+  await page.route(`**/api/workbench/runs/${id}/rounds/1`, route => route.fulfill({json: {error: '调用前失败'}}));
+  const external: string[] = []; page.on('request', request => {if (request.url().includes('untrusted.invalid')) external.push(request.url());});
+  await page.goto('/'); await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await page.getByRole('button', {name: /输入边界测试/}).click();
+  await expect(page.locator('.round-card')).toHaveCount(2);
+  for (const card of await page.locator('.round-card').all()) await card.getByText('模型输入、输出与执行回执', {exact: true}).click();
+  const first = page.locator('.round-card').first();
+  await expect(first.getByText('已归档的本轮文本', {exact: true})).toBeVisible();
+  await expect(first.getByText(/不代表完整上下文/)).toBeVisible();
+  await expect(first.getByText('记录包含此图片，但未保存可用的预览路径。')).toBeVisible();
+  await expect(first.locator('.model-input img')).toHaveCount(0);
+  await expect(page.locator('.round-card').last().getByText(/这轮尚未记录可读的模型输入/)).toBeVisible();
+  expect(external).toEqual([]);
+});
+
+test('round observations expand in place without a shared sidebar or eager image/raw requests', async ({page}, info) => {
+  const id = 'observation-inline'; let polls = 0, rawReads = 0;
+  const images: string[] = [];
+  const run = {job_id: id, instruction: '逐轮画面就地查看', provider: 'api', status: 'running', kind: 'agent', created_at: new Date().toISOString(),
+    run_facts: {model: 'fixture', execution_backend: 'cua', inference_backend: 'api', operation_scope: 'desktop', destination: '隔离测试'}};
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [run]}}));
+  await page.route(`**/api/workbench/runs/${id}?*`, route => {
+    polls++; const after = Number(new URL(route.request().url()).searchParams.get('after'));
+    const steps = after ? [7] : Array.from({length: 8}, (_, i) => i);
+    return route.fulfill({json: {session: run, cursor: polls + 8, has_more: false, events: steps.map(step => ({
+      seq: step + polls, name: 'model.round', attributes: {step_index: step, status: 'predicted', tokens: {},
+        screenshot: `runs/fixture/round-${step}.png`, artifact_ref: `/api/workbench/runs/${id}/rounds/${step}`},
+    }))}});
+  });
+  await page.route(`**/api/workbench/runs/${id}/rounds/*`, route => {rawReads++; return route.fulfill({json: {}});});
+  await page.route('**/api/local-image?*', route => {
+    const path = new URL(route.request().url()).searchParams.get('path')!; images.push(path);
+    return route.fulfill({contentType: 'image/svg+xml', body: `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="430"><rect width="900" height="430" fill="#eaf1e6"/><rect x="90" y="60" width="720" height="310" rx="18" fill="white"/><text x="130" y="150" font-size="28" fill="#245943">Archived observation</text><text x="130" y="215" font-size="22" fill="#56704c">${path}</text><text x="130" y="305" font-size="18" fill="#56704c">Isolated UI fixture</text></svg>`});
+  });
+  await page.goto('/'); await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await page.getByRole('button', {name: /逐轮画面就地查看/}).click();
+  await expect(page.locator('.round-card')).toHaveCount(8);
+  await expect(page.locator('.run-aside')).toHaveCount(0);
+  expect(images).toEqual([]); expect(rawReads).toBe(0);
+  const last = page.locator('.round-card').nth(7);
+  await last.getByRole('button', {name: '查看该轮画面'}).click();
+  await expect(last.getByRole('img', {name: '第 8 轮归档观察截图'})).toBeVisible();
+  expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(500);
+  await expect.poll(() => images.length).toBe(1);
+  expect(images).toEqual(['runs/fixture/round-7.png']);
+  const beforePoll = polls;
+  await expect.poll(() => polls).toBeGreaterThan(beforePoll);
+  await expect(last.getByRole('button', {name: '收起该轮画面'})).toHaveAttribute('aria-expanded', 'true');
+  expect(images).toHaveLength(1); expect(rawReads).toBe(0);
+  const previous = page.locator('.round-card').nth(6);
+  await previous.getByRole('button', {name: '查看该轮画面'}).click();
+  await expect(previous.getByRole('img')).toHaveAttribute('alt', '第 7 轮归档观察截图');
+  await expect(last.getByRole('img')).toHaveAttribute('alt', '第 8 轮归档观察截图');
+  await previous.getByRole('button', {name: '收起该轮画面'}).click();
+  await expect(previous.locator('img')).toHaveCount(0);
+  await page.setViewportSize({width: 960, height: 900});
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.setViewportSize({width: 1366, height: 1100});
+  await last.evaluate(node => node.scrollIntoView({block: 'center'}));
+  await last.screenshot({path: info.outputPath('inline-round-observation.png'), animations: 'disabled'});
+  await page.getByText('本次运行事实 · fixture · cua', {exact: true}).click();
+  await expect(page.locator('.run-facts').getByText('整个主显示器', {exact: true})).toBeVisible();
 });
 
 test('WAA narration review survives navigation and submits the edited transcript', async ({page}) => {

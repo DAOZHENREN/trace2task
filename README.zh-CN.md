@@ -78,9 +78,9 @@ uv run --extra desktop trace2task desktop --project-root "D:\Trace2TaskData"
 **录制 → 生成 → 审查 → 选择 → 执行 → 复盘**
 
 1. **录制示范。** 用 OpenCUA 记录主显示器上的操作，**F8** 完成、**F9** 取消。所需组件及采集边界见[录制说明](docs/opencua-recording.md)。
-2. **本地生成。** 完成官方动作整理后，生成只有动作的 **D**，或包含视觉证据的 **A**。这两种生成都不调用模型。
+2. **生成经验。** 本地生成只有动作的 **D** 或包含视觉证据的 **A**；由所选 Codex 编译模型生成待审查的方法 **B**，也可将 B 与其冻结证据组合为 **C**，组合不再次调用模型。
 3. **完整审查。** 点击「查看模型原文」，阅读实际保存的全部文本；A 还展示每张选中图片。原始文件和审计信息单独保留。
-4. **明确选用。** 为新任务选择某个版本，或不使用经验。新生成的版本不会自动启用。
+4. **选择参考方式。** 可由执行 Agent 检索已确认 B 的摘要、按需加载一份方法，也可手动固定版本或不使用经验。未保存草稿不会进入自动选择。
 5. **执行并复盘。** 根据当前画面，在所选范围内规划、执行、重新观察。检查运行证据，不把停止信号当作成功证明。
 
 ### 模型到底会收到什么？
@@ -90,31 +90,34 @@ uv run --extra desktop trace2task desktop --project-root "D:\Trace2TaskData"
 | **N · 无经验** | 不提供示范，只使用本次任务与当前观察 | 已实现 |
 | **D · 动作序列** | 按顺序排列的动作描述、持续时间、可见子动作与点击坐标 | 已实现 |
 | **A · 动作与视觉证据** | 与 D 相同的动作结构，加上**最多 8 张**历史截图及关联引用 | 已实现 |
-| **B · Procedure** | 从示范中语义编译、生成后冻结的任务方法 | 设计中 |
-| **C · 证据 + Procedure** | 与 A 相同的证据，加上与 B 完全相同的一份方法 | 设计中 |
+| **B · Procedure** | 编译后冻结、使用前审查的 Markdown 方法 | 已实现 |
+| **C · 证据 + Procedure** | 所选 B 的冻结 A 证据，加上该 B 的完整原文 | 已实现 |
+| **R · 固定改进器候选** | 保留父版本谱系的独立修订，需审查后允许试用 | 实验功能 |
 
 A 按时间顺序等距选取可用截图，包含首尾；不足 8 张全部选择。文件路径、哈希、视频时钟和原始事件日志只留在**审计归档**，不再塞入新版 A 的模型文本。图片仅近似对齐，不保证是严格前态，也不证明动作成功。
 
 原始录制与编译版本彼此独立。同一录制再次生成相同表示时，需要确认，旧版本保留；旧版 A 不会自动改写。
 
-**边界要分清：** 旧 Windows/WAA 状态图、带讲解编译和经审查的 Guidance 是另外一套流程，不直接改名为 B/C，也不混入新版 A/D 执行入口。[表示与版本管理细节 →](docs/workbench.md)
+已完成或停止的运行也可提炼为 B 草稿。若运行使用了经验，编译输入包含实际父方法与本次证据；审查保存后形成保留谱系的子版本，不覆盖原方法。人工干预明确标注来源，原样输出不宣称改进。
+
+**边界要分清：** 旧 Windows/WAA 状态图、带讲解编译和 Guidance 独立保留，不混入当前 A/B/C/D 执行入口。自动选择首版支持 Codex/视觉 API 通用代理，不支持本地 GUI 专用模型或 MobileForge。[表示与版本管理细节 →](docs/workbench.md)
 
 ## 选择运行方式
 
 | 路径 | 已接入能力 | 主要边界 |
 | --- | --- | --- |
-| **Codex CLI / 订阅** | 视觉执行、旧流程的编译与修订 | 需独立安装 CLI 并登录 |
+| **Codex CLI / 订阅** | 视觉执行、B 编译、运行提炼与修订 | 需独立安装 CLI 并登录 |
 | **视觉模型 API** | 自选 Chat Completions 服务 | 必须支持图片及所请求的 JSON 格式 |
 | **Qwen3-VL 8B** | 官方 Q4_K_M + F16 视觉投影，llama-server 推理 | 权重需单独准备并校验 |
 | **Qwen3-VL 2B / GUI-Owl 1.5 2B** | llama-server 或 Transformers | llama 路径需完成 GGUF 转换与配置 |
 | **MAI-UI 2B** | Transformers | 手机协议的 Windows 实验适配 |
-| **D-5970 研究模型** | 冻结的结构化动作模型协议 | 需独立可信模型包，**不接收 A/D 经验** |
+| **D-5970 研究模型** | 保留冻结协议与历史记录，当前模型选择已隐藏 | 需独立可信模型包，**不接收经验** |
 
 **D 经验表示**与 **D-5970 模型**不是同一个概念。
 
 没有保存明确设置时，本地推理默认使用 llama-server；已有选择保留。不兼容的模型/引擎组合会报错，不静默切换。已注册 GUI 模型共用常驻服务与任务会话。[本地模型配置 →](docs/llama-gui-backend.md)
 
-**实际操作：** Win32 控制前台桌面；实验性 Cua 支持明确选择窗口/应用。后台输入并非通用能力，模型选择和参考经验都不会扩大授权范围。[执行契约](docs/unified-execution-core.md) · [Cua 限制](docs/cua-experimental-backend.md)
+**实际操作：** 桌面/指定窗口使用 Cua；单个授权 Android 应用使用 ADB；Ancient Beast 可使用实验性独立浏览器。Win32 启动入口及其检查点恢复已停用，历史数据保留。后台输入并非通用能力，模型选择和参考经验都不会扩大授权范围。[Cua 限制](docs/cua-experimental-backend.md) · [Android 后端](docs/android-backend.md) · [独立浏览器](docs/ancientbeast-background-validation.md)
 
 ## 证据、隐私与限制
 
@@ -124,7 +127,11 @@ A 按时间顺序等距选取可用截图，包含首尾；不足 8 张全部选
 - **结论不越界。** 单元测试不是模型效果 benchmark；应用层审计也不能显示服务商隐藏的提示词或推理过程。
 - **运行数据不进 Git。** 不要提交录制、生成经验、检查点、权重、API Key 或未脱敏运行产物。
 
-### Android 开发预览
+### 从桌面控制 Android
+
+[ADB 后端](docs/android-backend.md)可发现已有连接、绑定单台设备与授权应用，支持有限单指操作、短时摇杆保持和实验性小地图纠偏。通用视觉代理支持追加指令及确认后的人工接管；停止/F9、设备身份、应用范围、动作和时间预算继续生效。这不是完整 3D 寻路，也不是游戏任务成功证明。[MobileForge](docs/mobileforge.md) 是能力范围更窄的独立固定版本策略接入。
+
+### 独立 Android 开发预览
 
 独立的 [Android 工程](android/README.md) 支持录制无障碍事件与抽样截图，通过自配云端视觉 API 编译经验，并操作**一个选定应用**；保留反馈版本与急停功能。
 
@@ -140,12 +147,13 @@ A 按时间顺序等距选取可用截图，包含首尾；不足 8 张全部选
 
 | 从这里开始 | 进一步了解 |
 | --- | --- |
-| [工作台与 A/D 经验](docs/workbench.md) | [动作投影契约](docs/research-D-visual-projection.md) |
+| [工作台与经验生命周期](docs/workbench.md) | [动作投影契约](docs/research-D-visual-projection.md) |
 | [桌面安装与打包](docs/desktop-app.md) | [源码开发](docs/desktop-development.md) |
 | [llama-server 模型配置](docs/llama-gui-backend.md) | [原生模型](docs/local-gui-models.md) · [D-5970](docs/trained-model-local.md) |
 | [OpenCUA 录制](docs/opencua-recording.md) | [讲解与证据](docs/narration-evidence.md) |
 | [运行记录与模型审计](docs/model-io-audit.md) | [任务会话](docs/task-conversations.md) · [上下文管理](docs/local-prefix-cache.md) |
-| [Android 预览](android/README.md) | [WAA 报告](docs/waa-report-format.md) · [Compiler 快照](docs/compiler-snapshots.md) |
+| [桌面连接 Android](docs/android-backend.md) · [MobileForge](docs/mobileforge.md) | [独立 Android 预览](android/README.md) |
+| [WAA 报告](docs/waa-report-format.md) | [Compiler 快照](docs/compiler-snapshots.md) |
 
 ## 开发与测试
 
@@ -157,8 +165,8 @@ npm ci --prefix frontend
 npm run build --prefix frontend
 
 uv run --extra dev pytest
-uv run --extra dev ruff check .
-node --test tests/*.test.cjs
+uv run --extra dev ruff check src tests scripts
+node --test tests/*.test.cjs scripts/*.test.mjs
 
 # 浏览器回归使用隔离、禁止写入的预览实例
 cd frontend
@@ -166,7 +174,7 @@ npx playwright install
 npm test
 ~~~
 
-离线测试不调用真实模型，也不控制桌面；缺少特定平台能力时，相关测试可能跳过。工作台构建资源随源码提交，修改前端后需同步重新构建。
+离线测试不调用真实模型，也不控制桌面。JDK 17+ 可运行 Android 辅助程序的模拟框架协议测试，不使用 ADB，也不等于真机兼容性验证；缺少特定平台能力时，相关测试可能跳过。工作台构建资源随源码提交，修改前端后需同步重新构建。`artifacts/` 和可选的本机 `android-model-profile.json` 不应进入 Git。
 
 ## 致谢与许可
 

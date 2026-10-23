@@ -131,6 +131,9 @@ def test_actual_model_api_transport_keeps_native_messages_and_full_image(tmp_pat
         assert "Prefer the temporary test window." in requests[0]["messages"][0]["content"]
         assert predicted["input_messages"][0]["content"] == requests[0]["messages"][0]["content"]
         assert "base64" not in json.dumps(predicted["input_messages"])
+        assert predicted['input_messages'][-1]['content'][1]['local_path'] == str(screenshot.resolve())
+        assert 'local_path' not in session.last_request_messages[-1]['content'][1]
+        assert 'local_path' not in requests[0]['messages'][-1]['content'][1]
         assert requests[0]["messages"][-1]["content"][1]["image_url"]["url"].startswith(
             "data:image/png;base64,")
         assert requests[0]["response_format"]["type"] == "json_schema"
@@ -178,6 +181,9 @@ def test_codex_and_api_session_formats_share_cua_loop_and_live_receipts(tmp_path
         if provider == "codex":
             assert "Open the temporary test." in session.requests[0]["prompt"]
             assert any(item.get("system_managed_externally") is True for item in live)
+            first_input = first_round['input']['messages'][0]['content']
+            assert first_input[0] == {'type': 'text', 'text': session.requests[0]['prompt']}
+            assert first_input[1] == {'type': 'localImage', 'path': str(session.requests[0]['image_path'].resolve())}
         assert result["audit_path"].endswith("events.jsonl")
 
 
@@ -280,3 +286,45 @@ def test_chat_multi_action_batch_keeps_order_and_reobserves_after_batch(tmp_path
     assert [call[1]["x"] for call in driver.calls] == [25, 75]
     assert len(driver.observations) == 3
     assert [entry["action"]["actions"][0] for entry in result["history"]] == [first, second]
+
+
+def test_readable_input_retains_attachment_order_without_inventing_history(tmp_path):
+    session = Session([])
+    adapter = ChatModelAdapter(session, selected_windows=False, provider='codex')
+    paths = (tmp_path / 'current.png', tmp_path / 'evidence-1.png', tmp_path / 'evidence-2.png')
+    messages = adapter._input_messages('exact\ntext', paths)
+    assert messages == [{'role': 'user', 'content': [
+        {'type': 'text', 'text': 'exact\ntext'},
+        *({'type': 'localImage', 'path': str(path.resolve())} for path in paths),
+    ]}]
+    assert session.requests == []
+
+
+def test_readable_input_does_not_map_previous_images_to_current_screenshot(tmp_path):
+    session = Session([])
+    session.last_request_messages = [
+        {'role': 'user', 'content': [{'type': 'image'}]},
+        {'role': 'assistant', 'content': 'earlier answer'},
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'now'}, {'type': 'image'}]},
+    ]
+    adapter = ChatModelAdapter(session, selected_windows=False, provider='api')
+    messages = adapter._input_messages('now', (tmp_path / 'current.png',))
+    assert messages[0]['content'] == [{'type': 'image'}]
+    assert messages[-1]['content'][1]['local_path'] == str((tmp_path / 'current.png').resolve())
+    assert session.last_request_messages[-1]['content'][1] == {'type': 'image'}
+
+
+def test_format_failure_keeps_codex_input_scope_and_actual_attachments(tmp_path):
+    class InvalidSession(Session):
+        def run_turn(self, **request):
+            self.requests.append(request)
+            raise RuntimeError('plan is not valid JSON')
+
+    screenshot = tmp_path / 'current.png'
+    screenshot.write_bytes(b'image')
+    session = InvalidSession([])
+    result = ChatModelAdapter(session, selected_windows=False, provider='codex').predict(
+        'test', screenshot=screenshot, history=[])
+    assert result['status'] == 'format_rejected'
+    assert result['system_managed_externally'] is True
+    assert result['input_messages'][0]['content'][1]['path'] == str(screenshot.resolve())

@@ -19,7 +19,7 @@ def test_installer_exports_a_evidence_dependencies_to_external_model_runtime():
         and any(isinstance(node, ast.Constant) and node.value == 'local_gui_client.py'
                 for node in item.generators[0].iter.elts)
     )
-    assert {'trace_evidence.py', 'trace_projection.py'} <= set(runtime_sources)
+    assert {'trace_evidence.py', 'trace_projection.py', 'model_text.py'} <= set(runtime_sources)
     assert all((root / 'src/trace2task' / name).is_file() for name in runtime_sources)
 
 

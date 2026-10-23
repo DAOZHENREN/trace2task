@@ -2,7 +2,9 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 root = Path(SPECPATH).parents[1]
-datas = collect_data_files('trace2task', includes=['web/*', 'web/workbench/**/*'])
+datas = collect_data_files('trace2task', includes=[
+    'web/*', 'web/workbench/**/*', 'android_touch/*.jar', 'android_touch/*.java',
+    'android_touch/build.json'])
 vendor = root / 'build/desktop-vendor'
 if not (vendor / 'uv.exe').is_file():
     raise RuntimeError('Run scripts/build-desktop.ps1 to prepare bundled runtime tools')
@@ -18,7 +20,7 @@ datas += [(str(root / 'src/trace2task' / name), 'src/trace2task')
                        'local_gui_client.py', 'local_gui_prefix_cache.py', 'gui_conversation.py',
                        'local_gui_memory.py', 'local_gui_llama.py', 'gui_summarization.py',
                        'local_process.py', 'components.py', 'model_registry.py',
-                       'trace_evidence.py', 'trace_projection.py']]
+                       'trace_evidence.py', 'trace_projection.py', 'model_text.py']]
 datas += [(str(root / 'integrations'), 'integrations'), (str(root / 'LICENSE'), '.')]
 hidden = []
 for package in ['langgraph', 'langgraph.checkpoint.sqlite', 'webview', 'clr_loader']:

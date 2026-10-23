@@ -99,7 +99,7 @@ def test_controller_journal_survives_restart_and_is_served_over_http(tmp_path, m
     controller = WebConsoleController(tmp_path)
     monkeypatch.setattr(controller, '_run_job', lambda *args: None)
     started = controller.start_job(task_path='', instruction='Journal integration fixture',
-        execute=False, execution_scope='desktop', use_experience=False)
+        execute=True, execution_scope='desktop', use_experience=False)
     key = started['job_id']
     assert controller.run_store.get(key)['session']['status'] == 'queued'
     job = controller._jobs[key]

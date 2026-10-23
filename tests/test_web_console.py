@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import queue
 import re
@@ -23,6 +24,29 @@ from trace2task.codex_app_server import CodexTurnTimeoutError
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
 from trace2task.windows_runner import WindowsAgentRunFailed
+
+
+def _mock_chat_runner(monkeypatch, calls):
+    from trace2task import chat_agent_runner
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        kwargs['status_callback']('Synthetic shared runner; no device input.')
+        return {'stop_reason': 'visual_completion_reviewed', 'task_complete': True, 'verified': False}
+
+    monkeypatch.setattr(chat_agent_runner, 'run_chat_agent', runner)
+
+
+def _run_legacy_worker(controller, *, task_path, instruction, execute, **options):
+    """Exercise retained archive/feedback internals, not the retired launch API."""
+    path = controller.project_root / task_path
+    job = ConsoleJob(job_id='legacy-worker-fixture', task_path=task_path,
+        task_id=web_console.load_windows_task(path).task.task_id,
+        instruction=' '.join(instruction.split()), mode='execute' if execute else 'plan',
+        executor_backend='win32', execution_scope='window', use_experience=False, **options)
+    controller._jobs[job.job_id] = job
+    controller._run_job(job, path, execute)
+    return job.snapshot()
 
 
 def _csrf_headers(opener: Any, base: str) -> dict[str, str]:
@@ -73,7 +97,7 @@ def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypat
     monkeypatch.setattr(controller, "route_instruction", lambda *args: pytest.fail("must not route"))
     monkeypatch.setattr(controller, "_run_job", lambda *args: calls.append(args))
     job = controller.start_job(task_path="nonexistent/task.yaml", instruction="打开记事本",
-                               execute=False, execution_scope="desktop", use_experience=False)
+                               execute=True, execution_scope="desktop", use_experience=False)
     deadline = time.monotonic() + 2
     while not calls and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -84,20 +108,16 @@ def test_desktop_baseline_needs_no_taskpack_and_never_routes(tmp_path, monkeypat
     assert job["execution_scope"] == "desktop"
 
 
-def test_langgraph_web_settings_and_resume_path_guard(tmp_path, monkeypatch):
+def test_retired_langgraph_launch_and_resume_fail_before_dispatch(tmp_path, monkeypatch):
     controller = WebConsoleController(tmp_path)
-    monkeypatch.setattr(controller, "_run_job", lambda *args: None)
-    with pytest.raises(ValueError, match="runs"):
-        controller.start_job(task_path="", instruction="test", execute=False,
-                             execution_scope="desktop", use_experience=False,
-                             orchestration="langgraph", resume_from="../outside")
-    with pytest.raises(ValueError, match="仅支持桌面"):
-        controller.start_job(task_path="", instruction="test", execute=False,
-                             orchestration="langgraph")
-    job = controller.start_job(task_path="", instruction="test", execute=False,
-                               execution_scope="desktop", use_experience=False,
-                               orchestration="langgraph")
-    assert job["orchestration"] == "langgraph"
+    monkeypatch.setattr(controller, '_run_job', lambda *args: pytest.fail('must not dispatch'))
+    for executor, expected in [('win32', 'Win32 执行后端已停用'), ('cua', '只支持独立任务执行')]:
+        for resume in ('', '../outside', 'runs/old-checkpoint'):
+            with pytest.raises(ValueError, match=expected):
+                controller.start_job(task_path='', instruction='test', execute=True,
+                    execution_scope='desktop', orchestration='langgraph',
+                    executor_backend=executor, resume_from=resume)
+    assert controller.active_job() is None
 
 
 def test_desktop_rejects_background(tmp_path):
@@ -118,8 +138,10 @@ def test_desktop_rejects_retired_graph_experience(tmp_path):
 def _write_sequence(root):
     directory = root / 'trace-library' / 'demo'
     directory.mkdir(parents=True)
+    body = json.dumps({'representation': 'D', 'source_kind': 'recording'}).encode('utf-8')
+    (directory/'body.json').write_bytes(body)
     (directory/'header.json').write_text(json.dumps({'trace_name': 'demo', 'description': 'demo',
-                                                   'representation': 'D'}), encoding='utf-8')
+        'representation': 'D', 'body_sha256': hashlib.sha256(body).hexdigest()}), encoding='utf-8')
     path = directory/'model-input.txt'
     path.write_text('Complete demonstration with every action', encoding='utf-8')
     return path
@@ -137,12 +159,12 @@ def test_local_gui_model_receives_selected_experience_without_changing_executor(
     job = controller.start_job(
         task_path=str(task), instruction="finish the task", execute=True,
         provider="trained_d", model="gui-owl-2b", execution_scope="desktop",
-        use_experience=True, continuous=True, executor_backend="win32",
+        use_experience=True, continuous=True, executor_backend="cua",
     )
     completed = controller.wait(job["job_id"])
 
     assert completed["status"] == "stopped"
-    assert calls[0]["executor_backend"] == "win32"
+    assert calls[0]["executor_backend"] == "cua"
     assert calls[0]["experience_context"]["task_id"] == job["task_id"]
     assert calls[0]["experience_context"]["model_input"] == task.read_text(encoding='utf-8')
     assert calls[0]["experience_context"]["kind"] == 'trace_sequence'
@@ -222,7 +244,7 @@ def test_desktop_task_rejected_by_window_entry(tmp_path):
     data = yaml.safe_load(task.read_text("utf-8"))
     data["environment"]["execution_scope"] = "desktop"
     task.write_text(yaml.safe_dump(data), encoding="utf-8")
-    with pytest.raises(ValueError, match="桌面执行范围"):
+    with pytest.raises(ValueError, match="只支持独立任务执行"):
         WebConsoleController(tmp_path).start_job(task_path=str(task), instruction="test", execute=True)
 
 
@@ -680,35 +702,29 @@ class FakeCompilation:
     review_status: str = "draft"
 
 
-def test_web_can_disable_experience_and_requires_explicit_target(tmp_path: Path) -> None:
-    task = _write_windows_task(tmp_path)
+def test_web_can_disable_experience_and_requires_explicit_target(tmp_path, monkeypatch):
     calls = []
-    controller = WebConsoleController(
-        tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
-    )
-    with pytest.raises(ValueError, match="手动选择"):
-        controller.start_job(
-            task_path="", instruction="Test.", execute=False, use_experience=False,
-        )
-    job = controller.start_job(
-        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
-        execute=False, use_experience=False,
-    )
-    completed = controller.wait(job["job_id"])
-    assert completed["status"] == "completed"
-    assert completed["use_experience"] is False
-    assert calls[0]["use_experience"] is False
+    _mock_chat_runner(monkeypatch, calls)
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match='只支持独立任务执行'):
+        controller.start_job(task_path='', instruction='Test.', execute=True, execution_scope='window')
+    job = controller.start_job(task_path='', instruction='Test.', execute=True,
+        execution_scope='desktop', use_experience=False, cua_target={'pid': 10, 'window_id': 20})
+    completed = controller.wait(job['job_id'])
+    assert completed['status'] == 'completed'
+    assert completed['use_experience'] is False
+    assert calls[0]['use_experience'] is False
+    assert calls[0]['task_path'] is None
+    assert calls[0]['cua_target']['targets'] == [{'pid': 10, 'window_id': 20}]
 
 
-def test_api_job_accepts_custom_model_and_keeps_key_out_of_snapshots(tmp_path: Path) -> None:
-    task = _write_windows_task(tmp_path)
+def test_api_job_accepts_custom_model_and_keeps_key_out_of_snapshots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
-    controller = WebConsoleController(
-        tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
-    )
+    _mock_chat_runner(monkeypatch, calls)
+    controller = WebConsoleController(tmp_path)
     job = controller.start_job(
-        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test API plan.",
-        execute=False, provider="api", model="deepseek-v4-flash-vision-exp",
+        task_path="", instruction="Test API plan.",
+        execute=True, execution_scope="desktop", provider="api", model="deepseek-v4-flash-vision-exp",
         reasoning_effort="default", api_options={
             "base_url": "https://provider.example/v1", "api_key": "test-private-key",
         },
@@ -717,15 +733,15 @@ def test_api_job_accepts_custom_model_and_keeps_key_out_of_snapshots(tmp_path: P
     assert completed["status"] == "completed"
     assert completed["provider"] == "api"
     assert calls[0]["api_config"].api_key == "test-private-key"
-    assert calls[0]["adaptive_reasoning"] is False
+    assert completed["adaptive_reasoning"] is False
     assert calls[0]["model"] == "deepseek-v4-flash-vision-exp"
     assert "test-private-key" not in json.dumps([job, completed])
     assert "api_config" not in completed
     assert "api_key" not in completed
     with pytest.raises(ValueError, match="Codex"):
         controller.start_job(
-            task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
-            execute=False, model="deepseek-v4-flash-vision-exp",
+            task_path="", instruction="Test.",
+            execute=True, execution_scope="desktop", model="deepseek-v4-flash-vision-exp",
         )
 
 
@@ -734,14 +750,14 @@ def test_api_job_requires_key_before_launch(
 ) -> None:
     monkeypatch.delenv("TRACE2TASK_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    task = _write_windows_task(tmp_path)
     controller = WebConsoleController(
         tmp_path, runner=lambda *args, **kwargs: pytest.fail("Must not launch without key"),
     )
+    monkeypatch.setattr(controller, "_run_job", lambda *args: pytest.fail("must not launch without key"))
     with pytest.raises(ValueError, match="API Key"):
         controller.start_job(
-            task_path=task.relative_to(tmp_path).as_posix(), instruction="Test.",
-            execute=False, provider="api", model="vision", api_options={},
+            task_path="", instruction="Test.",
+            execute=True, execution_scope="desktop", provider="api", model="vision", api_options={},
         )
 
 
@@ -755,8 +771,8 @@ def test_saved_api_key_is_reused_by_jobs_without_returning_it(
         api_settings, "_dpapi",
         lambda data, endpoint, decrypt=False: b"saved-key" if decrypt else b"opaque",
     )
-    task = _write_windows_task(tmp_path)
     calls = []
+    _mock_chat_runner(monkeypatch, calls)
     store = APISettingsStore(tmp_path / "profile.json")
     store.save(
         ModelAPIConfig(base_url="https://service.example/v1", api_key="saved-key"),
@@ -767,8 +783,8 @@ def test_saved_api_key_is_reused_by_jobs_without_returning_it(
         runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
     )
     job = controller.start_job(
-        task_path=task.relative_to(tmp_path).as_posix(), instruction="Test saved API.",
-        execute=False, provider="api", model="custom-vision", reasoning_effort="default",
+        task_path="", instruction="Test saved API.",
+        execute=True, execution_scope="desktop", provider="api", model="custom-vision", reasoning_effort="default",
         api_options={"base_url": "https://service.example/v1"},
     )
     completed = controller.wait(job["job_id"])
@@ -777,11 +793,11 @@ def test_saved_api_key_is_reused_by_jobs_without_returning_it(
     assert "saved-key" not in json.dumps(completed)
 
 
-def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Path) -> None:
+def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from urllib.error import HTTPError
 
-    task = _write_windows_task(tmp_path)
     calls = []
+    _mock_chat_runner(monkeypatch, calls)
     controller = WebConsoleController(
         tmp_path, runner=lambda *args, **kwargs: calls.append(kwargs) or FakeResult(),
     )
@@ -791,8 +807,8 @@ def test_api_http_endpoint_checks_origin_and_presents_configuration(tmp_path: Pa
     base = f"http://127.0.0.1:{server.server_address[1]}"
     opener = build_opener(ProxyHandler({}))
     body = json.dumps({
-        "task_path": task.relative_to(tmp_path).as_posix(), "instruction": "Test.",
-        "mode": "plan", "provider": "api", "model": "custom-vision",
+        "task_path": "", "instruction": "Test.",
+        "mode": "execute", "execution_scope": "desktop", "executor_backend": "cua", "provider": "api", "model": "custom-vision",
         "reasoning_effort": "default", "api": {"api_key": "test-private-key"},
     }).encode()
     try:
@@ -979,7 +995,7 @@ class SuccessfulResult:
     verification_receipt_path: str | None = None
 
 
-def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path: Path) -> None:
+def test_legacy_worker_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path: Path) -> None:
     task_path = _write_windows_task(tmp_path)
     calls: list[tuple[Path, dict[str, object]]] = []
 
@@ -999,7 +1015,7 @@ def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path
     assert taskpacks[0]["experience_intent"] == "微信发消息"
     assert taskpacks[0]["missing_message_capabilities"] == ["type_text", "press_key"]
 
-    job = controller.start_job(
+    job = _run_legacy_worker(controller,
         task_path=taskpacks[0]["path"],
         instruction="  给文件传输助手   发送：网页控制台测试  ",
         execute=False,
@@ -1022,56 +1038,38 @@ def test_web_controller_discovers_taskpacks_and_runs_single_instruction(tmp_path
     assert calls[0][1]["reasoning_effort"] == "high"
 
 
-def test_web_controller_requires_explicit_experience_selection(tmp_path: Path) -> None:
-    task_path = _write_windows_task(tmp_path)
-    calls: list[Path] = []
-
-    def runner(path: Path, **kwargs: object) -> FakeResult:
-        calls.append(path)
-        return FakeResult()
-
-    controller = WebConsoleController(tmp_path, runner=runner)
-    with pytest.raises(ValueError, match="手动选择"):
-        controller.route_instruction("整理桌面财务表格")
-    with pytest.raises(ValueError, match="手动选择"):
-        controller.start_job(task_path="", instruction="给文件传输助手发消息", execute=False)
+def test_web_controller_requires_explicit_experience_selection(tmp_path, monkeypatch):
+    task = _write_sequence(tmp_path)
+    calls = []
+    _mock_chat_runner(monkeypatch, calls)
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match='手动选择'):
+        controller.route_instruction('整理桌面财务表格')
+    with pytest.raises(ValueError, match='手动选择'):
+        controller.start_job(task_path='', instruction='test', execute=True,
+            execution_scope='desktop', use_experience=True)
     assert not calls
-    job = controller.start_job(
-        task_path=task_path.relative_to(tmp_path).as_posix(),
-        instruction="给文件传输助手发消息", execute=False,
-    )
-    assert controller.wait(job["job_id"])["selection_mode"] == "manual"
-    assert calls == [task_path]
+    job = controller.start_job(task_path=str(task), instruction='test', execute=True,
+        execution_scope='desktop', use_experience=True)
+    assert controller.wait(job['job_id'])['selection_mode'] == 'manual'
+    assert calls[0]['task_path'] == task
 
 
-def test_web_controller_forwards_background_and_adaptive_execution_settings(
-    tmp_path: Path,
-) -> None:
-    task_path = _write_windows_task(tmp_path)
-    calls: list[dict[str, object]] = []
-
-    def runner(path: Path, **kwargs: object) -> FakeResult:
-        calls.append(kwargs)
-        return FakeResult()
-
-    controller = WebConsoleController(tmp_path, runner=runner)
-    job = controller.start_job(
-        task_path=task_path.relative_to(tmp_path).as_posix(),
-        instruction="后台规划测试",
-        execute=False,
-        background=True,
-        adaptive_reasoning=False,
-    )
-    completed = controller.wait(job["job_id"])
-
-    assert completed["input_mode"] == "background"
-    assert completed["adaptive_reasoning"] is False
-    assert calls[0]["background"] is True
-    assert calls[0]["adaptive_reasoning"] is False
-    assert calls[0]["focus"] is False
+def test_web_controller_uses_scoped_cua_without_adaptive_reasoning(tmp_path, monkeypatch):
+    calls = []
+    _mock_chat_runner(monkeypatch, calls)
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(task_path='', instruction='scope fixture', execute=True,
+        execution_scope='desktop', executor_backend='cua', adaptive_reasoning=True,
+        cua_target={'pid': 10, 'window_id': 20})
+    completed = controller.wait(job['job_id'])
+    assert completed['input_mode'] == 'background_preferred'
+    assert completed['adaptive_reasoning'] is False
+    assert calls[0]['executor_backend'] == 'cua'
+    assert calls[0]['cua_target']['targets'] == [{'pid': 10, 'window_id': 20}]
 
 
-def test_successful_execution_creates_a_pending_candidate_experience(
+def test_legacy_worker_successful_execution_creates_a_pending_candidate_experience(
     tmp_path: Path,
 ) -> None:
     task_path = _write_windows_task(tmp_path)
@@ -1090,7 +1088,7 @@ def test_successful_execution_creates_a_pending_candidate_experience(
             trace_path=str(trace_path),
         ),
     )
-    job = controller.start_job(
+    job = _run_legacy_worker(controller,
         task_path=task_path.relative_to(tmp_path).as_posix(),
         instruction="给文件传输助手发送候选经验测试",
         execute=True,
@@ -1146,7 +1144,7 @@ def test_successful_execution_creates_a_pending_candidate_experience(
     }
 
 
-def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
+def test_legacy_worker_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
     task_path = _write_windows_task(tmp_path)
     root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
     root["actions"].extend(["type_text", "press_key"])
@@ -1163,7 +1161,7 @@ def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Pat
             trace_path=str(trace_path),
         ),
     )
-    job = controller.start_job(
+    job = _run_legacy_worker(controller,
         task_path=task_path.relative_to(tmp_path).as_posix(),
         instruction="尝试一次并记录跑偏原因",
         execute=True,
@@ -1171,7 +1169,7 @@ def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Pat
     completed = controller.wait(job["job_id"])
     candidates = controller.list_candidates()
 
-    assert completed["status"] == "completed"
+    assert completed["status"] == "stopped"
     assert completed["result"]["candidate_experience"]["status"] == "pending_review"
     assert candidates[0]["outcome"] == {
         "task_complete": False,
@@ -1179,7 +1177,7 @@ def test_incomplete_execution_with_trace_is_available_for_feedback(tmp_path: Pat
     }
 
 
-def test_feedback_candidate_preserves_effect_verification_outcome(tmp_path: Path) -> None:
+def test_legacy_worker_feedback_candidate_preserves_effect_verification_outcome(tmp_path: Path) -> None:
     task_path = _write_windows_task(tmp_path)
     task = yaml.safe_load(task_path.read_text(encoding="utf-8"))
     task["actions"].extend(["type_text", "press_key"])
@@ -1201,7 +1199,7 @@ def test_feedback_candidate_preserves_effect_verification_outcome(tmp_path: Path
         ),
     )
 
-    job = controller.start_job(
+    job = _run_legacy_worker(controller,
         task_path=task_path.relative_to(tmp_path).as_posix(),
         instruction="执行并保存独立验证结果",
         execute=True,
@@ -1214,7 +1212,7 @@ def test_feedback_candidate_preserves_effect_verification_outcome(tmp_path: Path
     assert candidate["outcome"]["verification_receipt_path"] == str(receipt_path)
 
 
-def test_failed_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
+def test_legacy_worker_failed_execution_with_trace_is_available_for_feedback(tmp_path: Path) -> None:
     task_path = _write_windows_task(tmp_path)
     root = yaml.safe_load(task_path.read_text(encoding="utf-8"))
     root["actions"].extend(["type_text", "press_key"])
@@ -1234,7 +1232,7 @@ def test_failed_execution_with_trace_is_available_for_feedback(tmp_path: Path) -
         raise WindowsAgentRunFailed(result, RuntimeError(failure_message))
 
     controller = WebConsoleController(tmp_path, runner=runner)
-    job = controller.start_job(
+    job = _run_legacy_worker(controller,
         task_path=task_path.relative_to(tmp_path).as_posix(),
         instruction="尝试一次并反馈失败原因",
         execute=True,
@@ -1297,44 +1295,27 @@ def test_web_revision_job_uses_separate_revision_agent_defaults(
 
     assert completed["status"] == "completed"
     assert completed["kind"] == "revision"
-    assert completed["model"] == "gpt-6-sol"
+    assert completed["model"] == "gpt-6.1-sol"
     assert completed["reasoning_effort"] == "high"
     assert calls[0]["feedback"] == "发送后不要立即重新规划，先等待消息出现。"
 
 
-def test_web_controller_rejects_empty_instruction_and_outside_task(tmp_path: Path) -> None:
-    task_path = _write_windows_task(tmp_path)
-    controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
-    relative = task_path.relative_to(tmp_path).as_posix()
-
-    with pytest.raises(ValueError, match="请输入"):
-        controller.start_job(task_path=relative, instruction="   ", execute=False)
-    with pytest.raises(ValueError, match="taskpacks"):
-        controller.start_job(
-            task_path="outside/task.yaml",
-            instruction="测试",
-            execute=False,
-        )
-    with pytest.raises(ValueError, match="缺少文本输入能力"):
-        controller.start_job(
-            task_path=relative,
-            instruction="给文件传输助手发送测试消息",
-            execute=True,
-        )
-    with pytest.raises(ValueError, match="不支持的模型"):
-        controller.start_job(
-            task_path=relative,
-            instruction="测试",
-            execute=False,
-            model="not-a-model",
-        )
-    with pytest.raises(ValueError, match="不支持的思考强度"):
-        controller.start_job(
-            task_path=relative,
-            instruction="测试",
-            execute=False,
-            reasoning_effort="extreme",
-        )
+def test_web_controller_rejects_empty_instruction_and_outside_task(tmp_path, monkeypatch):
+    controller = WebConsoleController(tmp_path)
+    monkeypatch.setattr(controller, '_run_job', lambda *args: pytest.fail('must not dispatch'))
+    kwargs = {'task_path': '', 'instruction': 'test', 'execute': True, 'execution_scope': 'desktop'}
+    with pytest.raises(ValueError, match='请输入'):
+        controller.start_job(**{**kwargs, 'instruction': '   '})
+    with pytest.raises(ValueError, match='taskpacks'):
+        controller.start_job(**{**kwargs, 'task_path': 'outside/task.yaml', 'use_experience': True})
+    task = _write_windows_task(tmp_path)
+    with pytest.raises(ValueError, match='旧状态图'):
+        controller.start_job(**{**kwargs, 'task_path': str(task), 'use_experience': True})
+    with pytest.raises(ValueError, match='不支持的模型'):
+        controller.start_job(**{**kwargs, 'model': 'not-a-model'})
+    with pytest.raises(ValueError, match='不支持的思考强度'):
+        controller.start_job(**{**kwargs, 'reasoning_effort': 'extreme'})
+    assert controller.active_job() is None
 
 
 def test_web_controller_lists_recordings_and_upgrades_then_confirms_taskpack(
@@ -1704,7 +1685,8 @@ def test_web_controller_starts_and_releases_a_narrated_waa_recording(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    waa_root = tmp_path / "WindowsAgentArena"
+    # Keep nested recorder receipts below Windows MAX_PATH in deep worktrees.
+    waa_root = tmp_path / "waa"
     client_root = waa_root / "src" / "win-arena-container" / "client"
     example_path = client_root / "evaluation_examples_windows" / "example.json"
     example_path.parent.mkdir(parents=True)
@@ -1826,6 +1808,16 @@ def test_web_controller_starts_and_releases_a_narrated_waa_recording(
         def finish(self) -> None:
             self.host_run_dir.mkdir(parents=True)
             self.host_trace_path.write_text('{"seq":0}\n', encoding="utf-8")
+            (self.host_run_dir / "reset-receipt.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "0.1",
+                        "status": "verified",
+                        "task_id": "waa-example",
+                    }
+                ),
+                encoding="utf-8",
+            )
             (self.host_run_dir / "metadata.json").write_text(
                 json.dumps(
                     {
@@ -1835,16 +1827,6 @@ def test_web_controller_starts_and_releases_a_narrated_waa_recording(
                         "started_at": "2026-08-31T00:00:00+00:00",
                         "stop_reason": "success_marked",
                         "input_event_count": 1,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (self.host_run_dir / "reset-receipt.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": "0.1",
-                        "status": "verified",
-                        "task_id": "waa-example",
                     }
                 ),
                 encoding="utf-8",
@@ -2645,7 +2627,7 @@ def test_web_compilation_job_gives_immediate_feedback_and_rejects_duplicates(
         status_callback: object,
     ) -> dict[str, object]:
         assert source == trace_path
-        assert model == "gpt-6-sol"
+        assert model == "gpt-6.1-sol"
         assert reasoning_effort == "high"
         assert callable(status_callback)
         status_callback("Compiler Agent 正在分析。")
@@ -3046,6 +3028,7 @@ def test_web_server_serves_console_state_and_job_api(
 ) -> None:
     from urllib.error import HTTPError
     _write_windows_task(tmp_path, semantic=True)
+    _mock_chat_runner(monkeypatch, [])
     controller = WebConsoleController(tmp_path, runner=lambda *args, **kwargs: FakeResult())
     summary_updates: list[tuple[str, str]] = []
 
@@ -3099,9 +3082,9 @@ def test_web_server_serves_console_state_and_job_api(
         error.value.close()
         payload = json.dumps(
             {
-                "task_path": state["taskpacks"][0]["path"],
+                "task_path": "",
                 "instruction": "给文件传输助手发送测试消息",
-                "mode": "plan",
+                "mode": "execute", "execution_scope": "desktop", "executor_backend": "cua",
                 "model": "gpt-5.6-luna",
                 "reasoning_effort": "medium",
             }
@@ -3203,19 +3186,19 @@ def test_web_server_serves_console_state_and_job_api(
     assert summary_result["summary"] == "人工微调后的摘要"
     assert summary_updates == [("runs/candidates/example", "人工微调后的摘要")]
     assert state["agent_options"]["models"] == [
-        "gpt-6-sol",
+        "gpt-6.1-sol",
         "gpt-6-luna",
     ]
     assert state["agent_options"]["defaults"] == {
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "low",
     }
     assert state["agent_options"]["compiler_defaults"] == {
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
     }
     assert state["agent_options"]["revision_defaults"] == {
-        "model": "gpt-6-sol",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
     }
     assert completed["status"] == "completed"

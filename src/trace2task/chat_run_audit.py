@@ -32,16 +32,29 @@ class ChatRunAudit:
     def predict(self, predictor, stop, model, task, screenshot, history, step, context=None,
                 previous_screenshot=None, execution_feedback=None,
                 experience_context=None, **_unused):
+        from trace2task.run_memory import freeze_experience
+
+        snapshot = freeze_experience(self.root, experience_context)
+        if snapshot:
+            self.result['experience_snapshot'] = snapshot
         entry = {"step_index": step, "status": "pending", "screenshot": str(screenshot),
+                 "experience_sha256": (experience_context or {}).get("sha256"),
+                 "experience_snapshot": snapshot,
                  "previous_screenshot": str(previous_screenshot) if previous_screenshot else None,
                  "purpose": (context or {}).get("purpose", "plan")}
+        intervention = (context or {}).get('human_intervention')
+        if intervention is not None:
+            entry.update(intervention_revision=intervention['revision'],
+                         intervention_command_ids=[c['id'] for c in intervention['commands']])
         self.result["model_io"].append(entry)
         self._publish(entry)
         self.record("model_input", step_index=step, screenshot=str(screenshot),
                     previous_screenshot=entry["previous_screenshot"],
                     history=history, context=context, experience_context=experience_context,
                     execution_feedback=execution_feedback)
-        self.status(f"[plan {step + 1}] {model} 正在返回动作；可随时停止后续输入。")
+        label = 'memory' if entry['purpose'] == 'memory' else 'plan'
+        activity = '正在选择经验（不发送操作输入）' if label == 'memory' else '正在返回动作'
+        self.status(f"[{label} {step + 1}] {model} {activity}；可随时停止后续输入。")
         started = time.perf_counter()
         try:
             stop.raise_if_requested()
@@ -49,12 +62,14 @@ class ChatRunAudit:
 
             output = interruptible_prediction(
                 predictor, stop, task,
+                on_poll=_unused.get('on_poll'),
                 on_progress=lambda seconds: self.status(
-                    f"[plan {step + 1}] 模型已等待 {seconds:.0f} 秒；可停止，迟到回答不会执行。"),
+                    f"[{label} {step + 1}] 模型已等待 {seconds:.0f} 秒；可停止，迟到回答不会执行。"),
                 screenshot=screenshot, history=history, context=context,
                 previous_screenshot=previous_screenshot,
                 experience_context=experience_context,
                 execution_feedback=execution_feedback,
+                **({'on_request': _unused['on_request']} if _unused.get('on_request') else {}),
             )
             stop.raise_if_requested()
             entry.update(status=output["status"], prompt=output.get("prompt"),
@@ -81,7 +96,7 @@ class ChatRunAudit:
             entry["model_roundtrip_ms"] = self.elapsed("model_roundtrip_ms", started)
             self.result["performance"]["planning_ms"] = self.result["performance"]["model_roundtrip_ms"]
             self._publish(entry)
-            self.status(f"[plan {step + 1}] {entry['status']} · 模型 {entry['model_roundtrip_ms']/1000:.2f} 秒")
+            self.status(f"[{label} {step + 1}] {entry['status']} · 模型 {entry['model_roundtrip_ms']/1000:.2f} 秒")
 
     def execution(self, value):
         if not self.result["model_io"]:

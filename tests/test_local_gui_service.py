@@ -33,6 +33,32 @@ def test_cancel_before_claim_is_preserved(service_module, tmp_path):
     assert engine.claim_cancellation(request_id).is_set()
 
 
+def test_health_uses_live_worker_not_stale_engine_key(service_module, tmp_path):
+    engine = service_module.Engine(tmp_path, tmp_path / 'output', backend='llama-server')
+    engine.key = 'old-model'
+    engine.llama.process_key = 'gui-owl-2b'
+    engine.llama.process = types.SimpleNamespace(poll=lambda: None)
+    assert engine.runtime_status()['model'] == 'gui-owl-2b'
+    assert engine.runtime_status()['status'] == 'running'
+    with engine.lock:
+        assert engine.runtime_status()['status'] == 'busy'
+    engine.llama.process = types.SimpleNamespace(poll=lambda: 1)
+    assert engine.runtime_status()['model'] is None
+    assert engine.runtime_status()['status'] == 'idle'
+    with engine.lock:
+        assert engine.runtime_status()['status'] == 'loading'
+    engine.llama.process = None
+
+
+def test_health_transformers_model_and_pid(service_module, tmp_path):
+    engine = service_module.Engine(tmp_path, tmp_path / 'output')
+    assert engine.runtime_status()['status'] == 'idle'
+    engine.key, engine.model = 'gui-owl-2b', object()
+    status = engine.runtime_status()
+    assert status['status'] == 'running' and status['model'] == 'gui-owl-2b'
+    assert status['pid'] > 0
+
+
 def test_active_cancel_sets_same_event(service_module, tmp_path):
     engine = service_module.Engine(tmp_path, tmp_path / "output")
     request_id = "request-active-predict"

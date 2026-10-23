@@ -540,6 +540,8 @@ class ConsoleJob:
     background: bool = False
     adaptive_reasoning: bool = False
     use_experience: bool = True
+    memory_mode: str = 'off'
+    memory_selection: dict = field(default_factory=dict)
     execution_scope: str = "window"
     orchestration: str = "legacy"
     resume_from: str = ""
@@ -554,6 +556,10 @@ class ConsoleJob:
     continuous: bool = False
     executor_backend: str = "win32"
     cua_target: dict | None = None
+    android_config: dict | None = None
+    android_budget: dict | None = None
+    mobileforge: str = ""
+    android_model_profile: str = ""
     approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
     pending_batch: dict[str, Any] | None = None
     prompt_profile: dict[str, str] | None = field(default=None, repr=False)
@@ -561,6 +567,8 @@ class ConsoleJob:
     model_io: list[dict[str, Any]] = field(default_factory=list)
     run_facts: dict[str, Any] = field(default_factory=dict)
     observed_inference: dict[str, Any] = field(default_factory=dict)
+    interventions: dict[str, Any] = field(default_factory=dict)
+    intervention_control: Any = field(default=None, repr=False)
 
     def snapshot(self, *, details=True) -> dict[str, Any]:
         from trace2task.run_session import operation_scope
@@ -579,6 +587,7 @@ class ConsoleJob:
             "operation_scope": scope,
             "run_facts": dict(self.run_facts),
             "observed_inference": dict(self.observed_inference),
+            "interventions": dict(self.interventions),
             "orchestration": self.orchestration,
             "resume_from": self.resume_from,
             "selection_confidence": self.selection_confidence,
@@ -586,10 +595,13 @@ class ConsoleJob:
             "kind": self.kind,
             "narrated": self.narrated,
             "defer_compilation": self.defer_compilation,
-            "input_mode": ("background_preferred" if self.executor_backend == "cua" and scope == "selected_windows"
+            "input_mode": ("remote_android" if self.executor_backend == "android" else "isolated_browser" if self.executor_backend == "browser" else
+                           "background_preferred" if self.executor_backend == "cua" and scope == "selected_windows"
                            else "background" if self.background else "foreground"),
             "adaptive_reasoning": self.adaptive_reasoning,
             "use_experience": self.use_experience,
+            "memory_mode": self.memory_mode,
+            "memory_selection": dict(self.memory_selection),
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -600,6 +612,10 @@ class ConsoleJob:
             "pending_batch": self.pending_batch,
             "executor_backend": self.executor_backend,
             "cua_target": self.cua_target,
+            "android_config": self.android_config,
+            "android_budget": self.android_budget,
+            "mobileforge": self.mobileforge,
+            "android_model_profile": self.android_model_profile,
             "model_io": list(self.model_io) if details else [],
         }
 
@@ -912,12 +928,26 @@ class WebConsoleController:
     def restore_trashed_asset(self, raw_path: str) -> dict[str, Any]:
         with self._lock:
             self._require_idle()
+            if raw_path.startswith('workbench-run/'):
+                return self.run_store.trash_action(raw_path.removeprefix('workbench-run/'), 'restore')
             return self.trash.restore(raw_path)
 
     def purge_trashed_asset(self, raw_path: str, *, confirmed=False) -> dict[str, Any]:
         with self._lock:
             self._require_idle()
+            if raw_path.startswith('workbench-run/'):
+                run_id = raw_path.removeprefix('workbench-run/')
+                result = self.run_store.trash_action(run_id, 'purge', confirmed=confirmed)
+                if self._active_job_id == run_id:
+                    self._active_job_id = None
+                self._jobs.pop(run_id, None)
+                return result
             return self.trash.purge(raw_path, confirmed=confirmed)
+
+    def delete_run_record(self, run_id):
+        with self._lock:
+            self._require_idle()
+            return self.run_store.trash_action(run_id, 'move')
 
     def list_taskpacks(self) -> list[dict[str, Any]]:
         if not self.task_root.is_dir():
@@ -1367,18 +1397,77 @@ class WebConsoleController:
         adaptive_reasoning: bool = False,
         provider: str = "codex",
         use_experience: bool = False,
+        memory_mode: str | None = None,
         execution_scope: str = "window",
         orchestration: str = "legacy",
         resume_from: str = "",
         api_options: dict[str, Any] | None = None,
         continuous: bool = False,
-        executor_backend: str = "win32",
+        executor_backend: str = "cua",
         cua_target: dict | None = None,
         inference_backend: str | None = None,
+        android_config: dict | None = None,
+        android_budget: dict | None = None,
+        mobileforge: str = "",
+        android_model_profile: str = "",
     ) -> dict[str, Any]:
         normalized_instruction = " ".join(instruction.split())
-        if executor_backend not in {"win32", "cua"}:
+        memory_mode = memory_mode if memory_mode is not None else ('manual' if use_experience else 'off')
+        if not isinstance(memory_mode, str) or memory_mode not in {'off', 'manual', 'auto'}:
+            raise ValueError('经验模式必须是 off / manual / auto')
+        if (memory_mode == 'manual') != use_experience:
+            raise ValueError('经验模式与手动经验选择不一致')
+        if memory_mode == 'auto' and (provider not in {'codex', 'api'} or mobileforge
+                or orchestration != 'legacy' or resume_from or not execute or task_path
+                or execution_scope not in {'desktop', 'browser', 'android'}):
+            raise ValueError('自动经验仅支持 Codex / 视觉 API 通用代理的独立任务；请清空手动路径或关闭自动经验')
+        if executor_backend == "win32":
+            raise ValueError("Win32 执行后端已停用，请选择 Cua；Android 范围请使用 ADB")
+        if executor_backend not in {"cua", "browser", "android"}:
             raise ValueError("不支持的执行后端")
+        if executor_backend == 'android' or execution_scope == 'android':
+            if (executor_backend != 'android' or execution_scope != 'android'
+                    or provider not in {'codex', 'api'} or not execute
+                    or orchestration != 'legacy' or resume_from or background or cua_target is not None):
+                raise ValueError('Android 需要配对范围、Codex/API 和独立执行；不支持桌面经验或回退')
+            if mobileforge and use_experience:
+                raise ValueError('MobileForge 暂不支持经验；请使用通用视觉代理')
+            from trace2task.android_workbench import validate_config
+            android_config = validate_config(android_config)
+            from trace2task.execution_budget import android_budget as validate_budget
+            android_budget = validate_budget(android_budget)
+        elif android_config is not None or mobileforge or android_budget is not None:
+            raise ValueError('Android/MobileForge 配置只能用于 Android 执行')
+        if not isinstance(mobileforge, str):
+            raise TypeError('MobileForge upstream must be a path string')
+        if not isinstance(android_model_profile, str):
+            raise TypeError('Android model profile must be a string')
+        if android_model_profile:
+            from trace2task.android_model_connection import status, validate_selection
+            if not isinstance(api_options, dict):
+                raise ValueError('3090 云手机需要明确的 API 配置')
+            validate_selection(android_model_profile, provider=provider, executor=executor_backend,
+                               model=model, base_url=(api_options or {}).get('base_url', ''),
+                               mobileforge=mobileforge)
+            connection = status()
+            if not connection['connected']:
+                raise ValueError(connection['error'])
+            # Never reuse a saved/cloud credential for this owned local SSH endpoint.
+            api_options = {**api_options, 'api_key': 'local-only',
+                           'context_window_tokens': 4096, 'timeout_seconds': 180}
+        if mobileforge:
+            from trace2task.mobileforge_adapter import MobileForgeSource
+            MobileForgeSource(mobileforge)
+            if provider == 'api':
+                from trace2task.mobileforge_pipeline import require_local_endpoint
+                require_local_endpoint((api_options or {}).get('base_url', ''))
+        if executor_backend == 'browser' or execution_scope == 'browser':
+            if (executor_backend != 'browser' or execution_scope != 'browser'
+                    or provider not in {'codex', 'api'} or not execute
+                    or orchestration != 'legacy' or resume_from or background or cua_target is not None):
+                raise ValueError('浏览器首版仅支持 Codex/API、browser 范围的独立执行；不支持本地模型、前台回退或检查点恢复')
+            from trace2task.browser_execution import browser_runtime
+            browser_runtime()
         if (executor_backend == "cua" and provider != "trained_d"
                 and (execution_scope != "desktop" or orchestration != "legacy"
                      or not execute or resume_from)):
@@ -1386,6 +1475,8 @@ class WebConsoleController:
         if executor_backend == "cua":
             from trace2task.cua_desktop import DESKTOP_TARGET
             from trace2task.cua_scope import normalize_scope
+            if cua_target is None and execution_scope == "desktop":
+                cua_target = dict(DESKTOP_TARGET)
             if cua_target != DESKTOP_TARGET:
                 cua_target = normalize_scope(cua_target)
             elif execution_scope != "desktop":
@@ -1406,7 +1497,7 @@ class WebConsoleController:
             resume_from = str(resumed)
         if not isinstance(use_experience, bool):
             raise TypeError("使用经验必须是布尔值")
-        if execution_scope not in {"window", "desktop"}:
+        if execution_scope not in {"window", "desktop", "browser", "android"}:
             raise ValueError("不支持的执行范围")
         if execution_scope == "desktop" and background:
             raise ValueError("桌面 Baseline 仅支持前台执行")
@@ -1459,11 +1550,15 @@ class WebConsoleController:
         allowed_efforts = API_REASONING_EFFORTS if provider == "api" else CODEX_REASONING_EFFORTS
         if reasoning_effort not in allowed_efforts:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
-        if execution_scope == "desktop" and not use_experience:
+        if execution_scope in {"desktop", "browser", "android"} and not use_experience:
             resolved_task = None
-            task_id = "桌面 · 无经验 Baseline"
+            task_id = ("Ancient Beast 浏览器 · 无经验 Baseline" if execution_scope == 'browser'
+                       else "Android · MobileForge" if mobileforge else "Android · ADB" if execution_scope == 'android' else "桌面 · 无经验 Baseline")
             adaptive_reasoning = False
-            selection_mode, selection_confidence, selection_reason = "desktop", None, "不读取经验"
+            selection_mode, selection_confidence, selection_reason = execution_scope, None, "不读取经验"
+            if memory_mode == 'auto':
+                task_id = 'Agent 自动选择方法 B'
+                selection_mode, selection_reason = 'agent_memory', '由执行 Agent 检索摘要、按需加载方法 B'
         elif isinstance(task_path, str) and task_path.strip():
             resolved_task = self._resolve_execution_experience(task_path)
             selection_mode = "manual"
@@ -1474,9 +1569,14 @@ class WebConsoleController:
         if resolved_task is not None and resolved_task.name == "model-input.txt":
             from trace2task.trace_library import execution_context
 
-            if execution_scope != "desktop" or orchestration != "legacy" or not execute:
-                raise ValueError("A/D 经验支持独立任务执行，请使用桌面或 Cua 执行入口")
+            if execution_scope not in {"desktop", "browser", "android"} or orchestration != "legacy" or not execute:
+                raise ValueError("A/B/C/D 经验支持独立任务执行，请使用桌面或 Cua 执行入口")
             task_id = execution_context(resolved_task)["task_id"]
+            from trace2task.run_experience import validate_experience_scope
+            from trace2task.run_session import operation_scope
+            validate_experience_scope(self.project_root, resolved_task,
+                operation_scope(executor_backend, execution_scope, cua_target),
+                (android_config or {}).get('package', ''))
         elif resolved_task is not None:
             if use_experience:
                 raise ValueError("旧状态图经验已退出执行入口，请选择原始证据 A 或精简序列 D")
@@ -1497,6 +1597,9 @@ class WebConsoleController:
                 raise ValueError("这份微信示范缺少文本输入能力，目前只能生成计划")
         with self._lock:
             self._require_idle()
+            if executor_backend == 'android':
+                from trace2task.android_workbench import prepare
+                prepare(android_config)
             job = ConsoleJob(
                 job_id=uuid.uuid4().hex,
                 task_path=resolved_task.relative_to(self.project_root).as_posix() if resolved_task else "",
@@ -1512,12 +1615,17 @@ class WebConsoleController:
                 background=background,
                 adaptive_reasoning=adaptive_reasoning,
                 use_experience=use_experience,
+                memory_mode=memory_mode,
                 execution_scope=execution_scope,
                 orchestration=orchestration,
                 resume_from=resume_from,
                 continuous=continuous,
                 executor_backend=executor_backend,
                 cua_target=cua_target,
+                android_config=android_config,
+                android_budget=android_budget,
+                mobileforge=mobileforge,
+                android_model_profile=android_model_profile,
                 prompt_profile=prompt_profile if provider == "trained_d" else None,
                 prompt_guidance=prompt_guidance,
             )
@@ -1525,6 +1633,11 @@ class WebConsoleController:
             job.run_facts = RunSession.for_job(job, self.project_root,
                 api_url=api_config.base_url if api_config else "",
                 requested_backend=inference_backend).public()
+            if executor_backend == 'android' and not mobileforge and execute:
+                from trace2task.run_interventions import RunInterventions
+                job.intervention_control = RunInterventions(
+                    on_change=lambda state: self._intervention_update(job, state))
+                job.interventions = job.intervention_control.snapshot()
             if selection_mode == "auto":
                 job.logs.append(
                     f"自动选择经验：{contract.task.task_id}（置信度 "
@@ -2050,6 +2163,13 @@ class WebConsoleController:
                     "created_at_source": time_source}],
                 "message": "同一原始录制已有语义编译任务包。继续会在已有任务包重新生成语义层，请核对后确认。"}
 
+    def generate_trace_c(self, b_id: str, *, confirm_duplicate=False) -> dict[str, Any]:
+        from trace2task.trace_combined import generate_c
+
+        with self._lock:
+            self._require_idle()
+            return generate_c(self.project_root, b_id, confirm_duplicate=confirm_duplicate)
+
     def generate_trace_d(self, raw_path: str, *, confirm_duplicate=False) -> dict[str, Any]:
         from trace2task.trace_library import generate_d
 
@@ -2105,6 +2225,162 @@ class WebConsoleController:
         )
         thread.start()
         return job.snapshot()
+
+    def start_procedure_compilation(self, raw_path: str, *, model: str = DEFAULT_COMPILER_MODEL,
+                                    reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+                                    confirm_duplicate: bool = False) -> dict[str, Any]:
+        from trace2task.trace_library import duplicate_confirmation, recording_source
+
+        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError('不支持的 Agent 编译模型或思考强度')
+        with self._lock:
+            self._require_idle()
+            _, trace_path, _ = recording_source(self.project_root, raw_path)
+            confirmation = duplicate_confirmation(self.project_root, trace_path, 'B')
+            if confirmation and confirm_duplicate is not True:
+                return confirmation
+            sidecar = json.loads(trace_path.with_name('trace2task.json').read_text(encoding='utf-8'))
+            job = ConsoleJob(job_id=uuid.uuid4().hex, task_path='', task_id=sidecar['task_id'],
+                instruction=f"Agent 编译 Procedure B：{sidecar['task_id']}", mode='compile', kind='compilation',
+                model=model, reasoning_effort=reasoning_effort)
+            job.run_facts = {'run_id': job.job_id, 'model': model, 'profile': 'procedure-compiler',
+                'inference_backend': 'codex-app-server', 'execution_backend': 'none',
+                'operation_scope': 'none', 'input_mode': 'none', 'data_flow': 'remote',
+                'destination': 'Codex 订阅 · Agent 编译', 'experience_path': '',
+                'context_description': '仅编译历史证据为 Markdown Procedure，不执行桌面动作，不自动启用结果。'}
+            job.logs.append('Agent 编译请求已接收：动作序列与选中截图将交给所选 Codex 模型。')
+            self._register_job(job)
+        threading.Thread(target=self._run_procedure_compilation, args=(job, trace_path),
+                         name=f'trace2task-procedure-{job.job_id[:8]}', daemon=True).start()
+        return job.snapshot()
+
+    def _run_procedure_compilation(self, job: ConsoleJob, trace_path: Path) -> None:
+        from trace2task.trace_procedure import ProcedureCompileCancelled, compile_b
+
+        self._update(job, status='running', log='正在准备 Agent 编译证据。')
+        try:
+            result = compile_b(self.project_root, trace_path, model=job.model, reasoning_effort=job.reasoning_effort,
+                confirm_duplicate=True, stop_event=job.stop_event, publish_lock=self._lock,
+                progress=lambda message: self._update(job, log=message),
+                on_round=lambda entry: self._model_round_update(job, entry))
+            self._update(job, status='completed', result={**result, 'compiled_trace_id': result['id']},
+                         log='Procedure B 已生成独立版本；请到经验库查看模型原文并核对，未自动启用为任务经验。')
+        except ProcedureCompileCancelled:
+            self._update(job, status='stopped', result={'representation': 'B', 'stop_reason': 'user_cancelled'},
+                         log='Agent 编译已停止；未发布 B 版本，原始录制和已有版本保留。')
+        except Exception as error:  # noqa: BLE001 - failures must remain visible and never publish a draft
+            self._update(job, status='failed', error=f'{type(error).__name__}: {error}',
+                         result={'representation': 'B'},
+                         log='Agent 编译失败，未发布 B 版本。已取得的模型原文可在逐轮记录中查看；原始录制保留。')
+
+    def start_run_experience(self, run_id: str, *, source_sha256: str,
+                             model: str = DEFAULT_COMPILER_MODEL,
+                             reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+                             confirm_duplicate: bool = False) -> dict[str, Any]:
+        from trace2task.run_experience import prepare_run_experience, preview_run_experience
+
+        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError('不支持的经验提炼模型或思考强度')
+        with self._lock:
+            self._require_idle()
+            prepared = prepare_run_experience(self.project_root, self.run_store, run_id)
+            if prepared['source_sha256'] != source_sha256:
+                raise ValueError('来源轨迹或截图已变化，请重新预览后提炼')
+            previous = preview_run_experience(self.project_root, self.run_store, run_id)['drafts']
+            if previous and confirm_duplicate is not True:
+                return {'confirmation_required': True, 'representation': 'B', 'existing_versions': previous,
+                        'message': '这次运行已有经验草稿。再次提炼会调用模型并保存独立草稿，不覆盖已有内容。'}
+            job = ConsoleJob(job_id=uuid.uuid4().hex, task_path='', task_id=run_id,
+                instruction=f"{'反馈修订经验' if prepared['lineage'] else '提炼运行经验'}：{prepared['summary']['instruction']}", mode='compile',
+                kind='experience_compilation', model=model, reasoning_effort=reasoning_effort)
+            job.run_facts = {'run_id': job.job_id, 'model': model, 'profile': 'run-experience-compiler',
+                'inference_backend': 'codex-app-server', 'execution_backend': 'none',
+                'operation_scope': 'none', 'input_mode': 'none', 'data_flow': 'remote',
+                'destination': 'Codex 订阅 · 经验提炼', 'experience_path': '',
+                'context_description': '一次模型调用，发送本次实际使用的原经验（如有）、轨迹投影与最多 8 张历史截图；生成草稿，不入库、不执行。'}
+            self._register_job(job)
+        threading.Thread(target=self._run_experience_compilation, args=(job, prepared),
+                         name=f'trace2task-experience-{job.job_id[:8]}', daemon=True).start()
+        return job.snapshot()
+
+    def _run_experience_compilation(self, job: ConsoleJob, prepared: dict[str, Any]) -> None:
+        from trace2task.run_experience import compile_run_draft
+        from trace2task.trace_procedure import ProcedureCompileCancelled
+
+        self._update(job, status='running', log='正在冻结源运行，提炼为经验草稿。')
+        try:
+            result = compile_run_draft(self.project_root, prepared, model=job.model,
+                reasoning_effort=job.reasoning_effort, stop_event=job.stop_event, publish_lock=self._lock,
+                progress=lambda text: self._update(job, log=text),
+                on_round=lambda entry: self._model_round_update(job, entry))
+            self._update(job, status='completed', result=result, log='经验草稿已生成。核对后可保存到经验库，未自动选用。')
+        except ProcedureCompileCancelled:
+            self._update(job, status='stopped', result={'stop_reason': 'user_cancelled'},
+                         log='提炼已停止，未发布草稿，源运行保留。')
+        except Exception as error:  # noqa: BLE001 - expose failure without publishing a partial draft
+            self._update(job, status='failed', error=f'{type(error).__name__}: {error}',
+                         log='未发布经验草稿；模型已返回的原文保留在逐轮记录中。')
+
+    def save_run_experience(self, draft_id: str, *, draft_sha256: str, confirmed: bool) -> dict[str, Any]:
+        from trace2task.run_experience import save_draft
+        with self._lock:
+            self._require_idle()
+            return save_draft(self.project_root, draft_id, draft_sha256=draft_sha256, confirmed=confirmed)
+
+    def start_procedure_evolution(self, run_id: str, *, model: str = DEFAULT_COMPILER_MODEL,
+                                  reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
+                                  confirm_duplicate: bool = False) -> dict[str, Any]:
+        from trace2task.procedure_evolution import evolution_confirmation, prepare_evolution
+
+        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
+            raise ValueError('不支持的改进模型或思考强度')
+        with self._lock:
+            self._require_idle()
+            prepared = prepare_evolution(self.project_root, self.run_store, run_id)
+            confirmation = evolution_confirmation(self.project_root, prepared,
+                                                   confirm_duplicate=confirm_duplicate)
+            if confirmation:
+                return confirmation
+            source = self.run_store.get(run_id)['session']
+            job = ConsoleJob(job_id=uuid.uuid4().hex, task_path='', task_id=source['task_id'],
+                instruction=f"生成方法改进候选：{source['instruction']}", mode='compile', kind='improvement',
+                model=model, reasoning_effort=reasoning_effort)
+            job.run_facts = {'run_id': job.job_id, 'model': model, 'profile': 'fixed-procedure-updater',
+                'inference_backend': 'codex-app-server', 'execution_backend': 'none',
+                'operation_scope': 'none', 'input_mode': 'none', 'data_flow': 'remote',
+                'destination': 'Codex 订阅 · 固定改进器', 'experience_path': '',
+                'context_description': '一次模型调用；父方法、执行反馈与最多 8 张历史观察。只生成 R 候选，不执行或证明改进。'}
+            self._register_job(job)
+        threading.Thread(target=self._run_procedure_evolution, args=(job, prepared),
+                         name=f'trace2task-evolution-{job.job_id[:8]}', daemon=True).start()
+        return job.snapshot()
+
+    def _run_procedure_evolution(self, job: ConsoleJob, prepared: dict[str, Any]) -> None:
+        from trace2task.procedure_evolution import evolve_procedure
+        from trace2task.trace_procedure import ProcedureCompileCancelled
+
+        self._update(job, status='running', log='已绑定父方法与源运行，正在冻结改进证据。')
+        try:
+            result = evolve_procedure(self.project_root, prepared, model=job.model,
+                reasoning_effort=job.reasoning_effort, stop_event=job.stop_event, publish_lock=self._lock,
+                progress=lambda text: self._update(job, log=text),
+                on_round=lambda entry: self._model_round_update(job, entry))
+            self._update(job, status='completed', result={**result, 'compiled_trace_id': result['id']},
+                         log='R 改进候选已归档；需审查后才可试用。原方法保留，效果尚未评测。')
+        except ProcedureCompileCancelled:
+            self._update(job, status='stopped', result={'representation': 'R', 'stop_reason': 'user_cancelled'},
+                         log='改进已停止，未发布候选，原经验和运行证据保留。')
+        except Exception as error:  # noqa: BLE001 - preserve diagnostics without publishing a candidate
+            self._update(job, status='failed', error=f'{type(error).__name__}: {error}',
+                         result={'representation': 'R'}, log='未发布改进候选；已取得的输出保留供审查。')
+
+    def review_procedure_evolution(self, identifier: str, *, candidate_sha256: str,
+                                   decision: str) -> dict[str, Any]:
+        from trace2task.procedure_evolution import review_evolution
+        with self._lock:
+            self._require_idle()
+            return review_evolution(self.project_root, identifier,
+                                    candidate_sha256=candidate_sha256, decision=decision)
 
     def start_revision(
         self,
@@ -3060,6 +3336,29 @@ class WebConsoleController:
         with self._lock:
             return {"runs": self.run_store.list(), "active_job_id": self._active_job_id}
 
+    def _intervention_update(self, job, state):
+        with self._lock:
+            job.interventions = state
+            job.updated_at = _now()
+            self.run_store.save(job.snapshot(details=False))
+
+    def intervene_job(self, job_id, payload):
+        if not isinstance(payload, dict) or set(payload) - {'request_id', 'kind', 'text'}:
+            raise ValueError('干预请求只能包含 request_id、kind 和 text')
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError('找不到本次运行')
+            if job.kind != 'agent' or job.status != 'running' or job.stop_requested:
+                raise RuntimeError('只有正在运行且未请求停止的任务可以干预')
+            control = job.intervention_control
+            if control is None:
+                raise ValueError('运行中干预目前仅支持 Android 通用视觉代理，MobileForge 暂不支持')
+        # Never enter the intervention lock under the console lock: its publish
+        # callback persists snapshots through _intervention_update.
+        return control.request(request_id=payload.get('request_id'), kind=payload.get('kind'),
+                               text=payload.get('text', ''))
+
     def stop_job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -3766,10 +4065,12 @@ class WebConsoleController:
         self, job: ConsoleJob, task_path: Path | None, execute: bool,
         api_config: ModelAPIConfig | None = None,
     ) -> None:
-        desktop = job.execution_scope == "desktop"
+        desktop = job.execution_scope in {"desktop", "browser", "android"}
+        if job.executor_backend == 'android':
+            self._update(job, log=f"Android · {(job.android_config or {}).get('serial')} · {(job.android_config or {}).get('package')} · {'MobileForge' if job.mobileforge else '通用视觉代理'}")
         self._update(job, status="running", log=(
-            f"任务已启动 · {'指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
-            f"{'使用经验' if job.use_experience else '无经验 Baseline'}。"
+            f"任务已启动 · {'Android 远程手机' if job.executor_backend == 'android' else 'Ancient Beast 独立浏览器' if job.executor_backend == 'browser' else '指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
+            f"{'Agent 自动选择经验' if job.memory_mode == 'auto' else '使用经验' if job.use_experience else '无经验 Baseline'}。"
         ))
         try:
             kwargs: dict[str, Any] = {
@@ -3821,11 +4122,31 @@ class WebConsoleController:
                     )
                     job.pending_batch = None
                 elif (desktop and execute and job.orchestration == "legacy"
-                      and (not job.use_experience or job.executor_backend == "cua"
+                      and (not job.use_experience or job.executor_backend in {"cua", "browser"}
                            or (task_path is not None and task_path.name == "model-input.txt"))):
                     from trace2task.chat_agent_runner import run_chat_agent
 
-                    result = run_chat_agent(
+                    runner = run_chat_agent
+                    android_options = {}
+                    if job.executor_backend == 'android':
+                        from trace2task.execution_budget import android_budget as validate_budget
+                        android_options = {'android_config': job.android_config, **validate_budget(job.android_budget)}
+                        if job.intervention_control is not None:
+                            android_options['interventions'] = job.intervention_control
+                        if job.mobileforge:
+                            from trace2task.android_workbench import run_mobileforge
+                            runner = run_mobileforge
+                            android_options['upstream'] = job.mobileforge
+                    if job.memory_mode == 'auto':
+                        def memory_selected(selection):
+                            with self._lock:
+                                job.memory_selection = selection
+                                job.use_experience = selection.get('status') == 'loaded'
+                            self._update(job)
+
+                        android_options.update(memory_mode='auto', memory_root=self.project_root,
+                                               on_memory_selection=memory_selected)
+                    result = runner(
                         instruction=job.instruction, model=job.model,
                         reasoning_effort=job.reasoning_effort,
                         output_root=self.project_root / "runs",
@@ -3836,6 +4157,7 @@ class WebConsoleController:
                         task_path=task_path, use_experience=job.use_experience,
                         prompt_guidance=job.prompt_guidance,
                         on_model_round=lambda entry: self._model_round_update(job, entry),
+                        **android_options,
                     )
                 elif desktop:
                     from trace2task.desktop_runner import run_desktop_baseline
@@ -3854,7 +4176,9 @@ class WebConsoleController:
             payload["execution_scope"] = job.execution_scope
             payload["operation_scope"] = job.snapshot(details=False)["operation_scope"]
             payload["run_facts"] = job.run_facts
-            payload["use_experience"] = job.use_experience
+            payload["use_experience"] = (payload.get('use_experience', False)
+                                         if job.memory_mode == 'auto' else job.use_experience)
+            payload['memory_mode'] = job.memory_mode
             payload["executor_backend"] = job.executor_backend
             if (job.provider in {"codex", "api"} and not payload.get("model_io")
                     and isinstance(payload.get("trace_path"), str)):
@@ -3906,6 +4230,7 @@ class WebConsoleController:
                 return
             final_status = "stopped" if payload.get("stop_reason") == "emergency_stop" else "completed"
             if payload.get("stop_reason") in {
+                "action_limit", "time_limit",
                 "no_progress",
                 "model_done_unverified",
                 "effect_unverifiable",
@@ -3917,11 +4242,15 @@ class WebConsoleController:
             }:
                 final_status = "stopped"
             if payload.get("stop_reason") == "error" or (
-                desktop and payload.get("stop_reason") == "action_limit"
+                desktop and job.executor_backend != 'android' and payload.get("stop_reason") == "action_limit"
             ):
                 final_status = "failed"
             completion_note = ""
-            if payload.get("stop_reason") == "background_unavailable":
+            if payload.get('error'):
+                completion_note = '任务失败：' + str(payload['error'])
+            elif payload.get("stop_reason") in {'action_limit', 'time_limit'}:
+                completion_note = ('动作' if payload['stop_reason'] == 'action_limit' else '时间') + '预算耗尽，任务未完成；未自动续跑。'
+            elif payload.get("stop_reason") == "background_unavailable":
                 completion_note = "驱动拒绝后台输入；前台重试未能确认交付，已停止。"
             elif payload.get("stop_reason") == "foreground_unavailable":
                 completion_note = "驱动拒绝后台输入，Windows 又不允许安全切到目标前台；未发送全局输入，任务已停止。"
@@ -3937,7 +4266,7 @@ class WebConsoleController:
                 completion_note = "动作已送达，但效果无法确认；任务已停止。"
             elif payload.get("stop_reason") == "capability_rejection_limit":
                 completion_note = "连续三次操作能力预检未通过；这些动作未执行，任务已停止。"
-            elif desktop:
+            elif desktop and payload.get('task_complete'):
                 completion_note = "模型完成声明未经独立验证。"
             self._update(
                 job,
@@ -3953,6 +4282,9 @@ class WebConsoleController:
                 error=f"{type(error).__name__}: {error}",
                 log=f"运行失败：{type(error).__name__}: {error}",
             )
+        finally:
+            if job.intervention_control is not None:
+                job.intervention_control.close((job.result or {}).get('stop_reason') or job.status)
 
     def _save_candidate(
         self,
@@ -4102,6 +4434,15 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/local-model/status":
+            from trace2task.local_model_service import service_status
+            snapshot = service_status()
+            try:
+                self._json(snapshot)
+            except ConnectionError:
+                # A page closing/reloading cancels its read-only status poll.
+                pass
+            return
         if parsed.path == "/api/runtime-catalog":
             from trace2task.run_session import runtime_catalog
             self._json(runtime_catalog(self.controller.project_root))
@@ -4211,6 +4552,10 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             values = parse_qs(parsed.query)
             self._json(self.controller.chat_prompt_profile((values.get("provider") or [""])[0]))
             return
+        if parsed.path == "/api/android/model-profile":
+            from trace2task.android_model_connection import profile
+            self._json(profile())
+            return
         if parsed.path == "/api/state":
             self._json(
                 {
@@ -4238,7 +4583,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
                     "trace_representations": list_traces(self.controller.project_root),
-                    "trash": self.controller.trash.list(),
+                    "trash": self.controller.trash.list() + self.controller.run_store.trash_list(),
                     "candidates": self.controller.list_candidates(),
                     "active_job": (self.controller._jobs[self.controller._active_job_id].snapshot(details=False)
                                    if parsed.query == "compact=1" and self.controller._active_job_id
@@ -4380,6 +4725,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/trash/restore":
                 self._json(self.controller.restore_trashed_asset(payload.get("path", "")))
                 return
+            if parsed.path == "/api/workbench/runs/delete":
+                self._json(self.controller.delete_run_record(payload.get("id", "")))
+                return
             if parsed.path == "/api/trash/delete":
                 self._json(self.controller.purge_trashed_asset(
                     payload.get("path", ""), confirmed=payload.get("confirmed", False)))
@@ -4486,6 +4834,40 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                         reasoning_effort=payload.get("reasoning_effort", "default"),
                     ))
                 return
+            if parsed.path == "/api/android/model-connection":
+                from trace2task.android_model_connection import PROFILE_ID, connect, status
+                if payload.get('profile') != PROFILE_ID or payload.get('action') not in {'check', 'connect'}:
+                    raise ValueError('Unknown Android model connection action/profile')
+                if payload['action'] == 'connect':
+                    with self.controller._lock:
+                        self.controller._require_idle()
+                        self._json(connect())
+                else:
+                    self._json(status())
+                return
+            if parsed.path in {'/api/android/devices', '/api/android/device-apps'}:
+                from trace2task.android_discovery import attach_redfinger, discover, inspect_device
+                with self.controller._lock:
+                    self.controller._require_idle()
+                    action = discover if parsed.path.endswith('/devices') else (
+                        attach_redfinger if payload.get('source') == 'redfinger' else inspect_device)
+                    self._json(action(
+                        payload.get('android_config') or {}))
+                return
+            if parsed.path == '/api/android/prepare':
+                from trace2task.android_workbench import prepare
+                if payload.get('action') not in {'connect', 'check'}:
+                    raise ValueError('Unknown Android preparation action')
+                with self.controller._lock:
+                    self.controller._require_idle()
+                    self._json(prepare(payload.get('android_config'), connect=payload['action'] == 'connect'))
+                return
+            if parsed.path == "/api/android/probe":
+                from trace2task.android_workbench import probe
+                with self.controller._lock:
+                    self.controller._require_idle()
+                    self._json(probe(payload.get('android_config')))
+                return
             if parsed.path == "/api/jobs":
                 from trace2task.local_model_service import service_busy
                 if service_busy():
@@ -4501,15 +4883,20 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     background=payload.get("input_mode") == "background",
                     adaptive_reasoning=False,
                     use_experience=payload.get("use_experience", False),
+                    memory_mode=payload.get('memory_mode'),
                     execution_scope=payload.get("execution_scope", "window"),
                     orchestration=payload.get("orchestration", "legacy"),
                     resume_from=payload.get("resume_from", ""),
                     provider=payload.get("provider", "codex"),
                     api_options=payload.get("api"),
                     continuous=payload.get("continuous", False),
-                    executor_backend=payload.get("executor_backend", "win32"),
+                    executor_backend=payload.get("executor_backend", "android" if payload.get("execution_scope") == "android" else "cua"),
                     cua_target=payload.get("cua_target"),
                     inference_backend=payload.get("inference_backend"),
+                    android_config=payload.get("android_config"),
+                    android_budget=payload.get("android_budget"),
+                    mobileforge=payload.get("mobileforge", ""),
+                    android_model_profile=payload.get("android_model_profile", ""),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
@@ -4628,6 +5015,49 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 self._json(self.controller.generate_trace_d(payload.get("trace_path", ""),
                     confirm_duplicate=payload.get("confirm_duplicate", False)))
                 return
+            if parsed.path == '/api/traces/generate-b':
+                result = self.controller.start_procedure_compilation(payload.get('trace_path', ''),
+                    model=payload.get('model', DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT),
+                    confirm_duplicate=payload.get('confirm_duplicate', False))
+                self._json(result, status=HTTPStatus.OK if result.get('confirmation_required') else HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == '/api/traces/generate-c':
+                self._json(self.controller.generate_trace_c(payload.get('b_id', ''),
+                    confirm_duplicate=payload.get('confirm_duplicate', False)))
+                return
+            if parsed.path == '/api/run-experience/preview':
+                from trace2task.run_experience import preview_run_experience
+                self._json(preview_run_experience(self.controller.project_root, self.controller.run_store,
+                                                 payload.get('run_id', '')))
+                return
+            if parsed.path == '/api/run-experience/generate':
+                result = self.controller.start_run_experience(payload.get('run_id', ''),
+                    source_sha256=payload.get('source_sha256', ''),
+                    model=payload.get('model', DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT),
+                    confirm_duplicate=payload.get('confirm_duplicate', False))
+                self._json(result, status=HTTPStatus.OK if result.get('confirmation_required') else HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == '/api/run-experience/draft':
+                from trace2task.run_experience import read_draft
+                self._json(read_draft(self.controller.project_root, payload.get('draft_id', '')))
+                return
+            if parsed.path == '/api/run-experience/save':
+                self._json(self.controller.save_run_experience(payload.get('draft_id', ''),
+                    draft_sha256=payload.get('draft_sha256', ''), confirmed=payload.get('confirmed', False)))
+                return
+            if parsed.path == '/api/traces/evolve':
+                result = self.controller.start_procedure_evolution(payload.get('run_id', ''),
+                    model=payload.get('model', DEFAULT_COMPILER_MODEL),
+                    reasoning_effort=payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT),
+                    confirm_duplicate=payload.get('confirm_duplicate', False))
+                self._json(result, status=HTTPStatus.OK if result.get('confirmation_required') else HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == '/api/traces/evolution/review':
+                self._json(self.controller.review_procedure_evolution(payload.get('id', ''),
+                    candidate_sha256=payload.get('candidate_sha256', ''), decision=payload.get('decision', '')))
+                return
             if parsed.path == '/api/traces/generate-a':
                 self._json(self.controller.generate_trace_a(payload.get('trace_path', ''),
                     confirm_duplicate=payload.get('confirm_duplicate', False)))
@@ -4714,6 +5144,10 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/open-local":
                 self._json(self.controller.open_local(payload.get("path", "")))
+                return
+            if parsed.path.startswith('/api/jobs/') and parsed.path.endswith('/interventions'):
+                job_id = parsed.path.removeprefix('/api/jobs/').removesuffix('/interventions')
+                self._json(self.controller.intervene_job(job_id, payload))
                 return
             if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/stop"):
                 job_id = parsed.path.removeprefix("/api/jobs/").removesuffix("/stop")

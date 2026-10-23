@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import statistics
+import threading
 import time
 from collections.abc import Callable
 from ctypes import wintypes
@@ -113,8 +114,12 @@ class Win32EmergencyStop:
             wintypes.UINT,
         ]
         self.user32.PeekMessageW.restype = wintypes.BOOL
+        self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        self.user32.GetAsyncKeyState.restype = ctypes.c_short
         self.clock = clock
         self._started = False
+        self._owner_thread = None
+        self._requested = threading.Event()
 
     def start(self) -> None:
         if self._started:
@@ -126,11 +131,23 @@ class Win32EmergencyStop:
             VK_F9,
         ):
             raise RuntimeError("Could not reserve F9 as the Windows Agent emergency stop")
+        self._owner_thread = threading.get_ident()
+        self._requested.clear()
         self._started = True
 
     def raise_if_requested(self) -> None:
         if not self._started:
             raise RuntimeError("Emergency stop must be started before polling")
+        # WM_HOTKEY belongs to the registering thread. A navigation watchdog
+        # cannot pump that queue while its owner is waiting on a screenshot.
+        # Poll only our reserved F9 key on workers and latch the request so the
+        # execution thread will still observe it after the key is released.
+        if self.user32.GetAsyncKeyState(VK_F9) & 0x8000:
+            self._requested.set()
+        if self._requested.is_set():
+            raise EmergencyStopRequested("F9 emergency stop requested")
+        if threading.get_ident() != self._owner_thread:
+            return
         message = wintypes.MSG()
         while self.user32.PeekMessageW(
             ctypes.byref(message),
@@ -140,6 +157,7 @@ class Win32EmergencyStop:
             PM_REMOVE,
         ):
             if message.wParam == EMERGENCY_HOTKEY_ID:
+                self._requested.set()
                 raise EmergencyStopRequested("F9 emergency stop requested")
 
     def sleep(self, seconds: float) -> None:

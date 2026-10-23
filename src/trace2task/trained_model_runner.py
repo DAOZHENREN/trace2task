@@ -20,7 +20,7 @@ from trace2task.windows_control import Win32Backend, WindowsMotorExecutor, physi
 from trace2task.windows_runner import EmergencyStopRequested
 
 
-def interruptible_prediction(predictor, stop, instruction, *, on_cancel=None, on_progress=None,
+def interruptible_prediction(predictor, stop, instruction, *, on_cancel=None, on_progress=None, on_poll=None,
                              cancel_wait_seconds=30, **kwargs):
     """Stopping discards the eventual response, never executes a late plan."""
     mailbox = queue.Queue(maxsize=1)
@@ -37,6 +37,8 @@ def interruptible_prediction(predictor, stop, instruction, *, on_cancel=None, on
     while True:
         try:
             stop.raise_if_requested()
+            if on_poll is not None:
+                on_poll()
         except EmergencyStopRequested as stopped:
             if on_cancel is not None:
                 cancellation_started = time.perf_counter()

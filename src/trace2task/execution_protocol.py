@@ -23,7 +23,10 @@ class UnifiedAction:
                 or not isinstance(payload['skill'], str) or not isinstance(payload['args'], dict)):
             raise ValueError('Action requires exactly skill and args')
         skill, args = payload['skill'], deepcopy(payload['args'])
-        if skill == 'type_text' and ('x' in args or 'y' in args):
+        if skill in ('joystick_move', 'navigate_to'):
+            from trace2task.android_navigation import validate_navigation_action
+            args = validate_navigation_action(skill, args)
+        elif skill == 'type_text' and ('x' in args or 'y' in args):
             if set(args) != {'text', 'x', 'y'}:
                 raise ValueError('Coordinate text input requires text, x and y only')
             text = ActionCall('type_text', {'text': args['text']}).args

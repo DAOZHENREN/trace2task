@@ -39,3 +39,7 @@ models/
 /frontend/test-results/
 /frontend/playwright-report/
 /trace-library/
+
+# Local verification evidence, recordings, and experiment outputs.
+/artifacts/
+/android-model-profile.json

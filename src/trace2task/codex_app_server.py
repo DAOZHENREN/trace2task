@@ -14,9 +14,10 @@ from typing import Any, Protocol, TextIO
 
 from trace2task import __version__
 
-CODEX_SELECTABLE_MODELS = ("gpt-6-sol", "gpt-6-luna")
+CODEX_SELECTABLE_MODELS = ("gpt-6.1-sol", "gpt-6-luna")
 # Accept explicitly pinned historical jobs without offering old models in new jobs.
 CODEX_MODELS = CODEX_SELECTABLE_MODELS + (
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -66,7 +67,7 @@ def is_codex_connectivity_error(error: BaseException) -> bool:
 
 
 CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
-DEFAULT_CODEX_MODEL = "gpt-6-sol"
+DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
 
 

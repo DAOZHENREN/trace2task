@@ -27,7 +27,7 @@ export function Settings({state, catalog, config, setConfig, busy, section, setS
 type Prompt = {guidance?: string; customized?: boolean; effective?: {system_prompt: string; turn_template: string}};
 function PromptEditor({catalog, busy, visible, onError, onDirty}: {catalog: Catalog; busy: boolean; visible: boolean; onError: (text: string) => void; onDirty: (key: string, dirty: boolean) => void}) {
   const confirm = useConfirm();
-  const [target, setTarget] = useState('codex'); const [backend, setBackend] = useState('win32');
+  const [target, setTarget] = useState('codex'); const [backend, setBackend] = useState('cua');
   const [guidance, setGuidance] = useState(''); const [system, setSystem] = useState(''); const [template, setTemplate] = useState('');
   const [loaded, setLoaded] = useState(''); const [dirty, setDirty] = useState(false); const [message, setMessage] = useState('');
   const {pending, perform} = useAction(onError); const local = !['codex', 'api'].includes(target);
@@ -54,7 +54,7 @@ function PromptEditor({catalog, busy, visible, onError, onDirty}: {catalog: Cata
   }
   return <section className="surface workflow-card"><h2>模型提示词</h2><p className="quiet">本地保存，不要写入密钥。不会修改固定安全约束、动作校验或运行中的任务。</p>
     <div className="two-fields spaced"><Field label="提示词对象"><Choice value={target} disabled={busy || !!pending} onChange={e => select(e.target.value)}><option value="codex">Codex 执行指导</option><option value="api">视觉 API 执行指导</option>
-      {catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field>{local && <Field label="提示词执行后端"><Choice value={backend} disabled={busy || !!pending} onChange={e => select(e.target.value, true)}><option value="win32">Win32</option><option value="cua">Cua</option></Choice></Field>}</div>
+      {catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field>{local && <Field label="提示词执行后端"><Choice value={backend} disabled={busy || !!pending} onChange={e => select(e.target.value, true)}><option value="cua">Cua</option></Choice></Field>}</div>
     {target === 'codex' && <p className="notice">这里编辑本程序发送的执行指导，不是 Codex 内置系统提示词。</p>}
     {local ? <><Field label="系统提示词"><Textarea rows={10} resize="vertical" spellCheck={false} value={system} disabled={busy || !!pending || loaded !== key} onChange={(_, d) => {setSystem(d.value); changeDirty(true);}}/></Field>
       <Field label="每轮任务模板" hint="必须保留 {{task}}、{{history}}、{{experience_block}}、{{execution_feedback_block}}。执行范围仍由程序校验。"><Textarea rows={7} resize="vertical" spellCheck={false} value={template} disabled={busy || !!pending || loaded !== key} onChange={(_, d) => {setTemplate(d.value); changeDirty(true);}}/></Field></>
@@ -67,7 +67,7 @@ type ComponentsStatus = {status: string; message: string; default_directory: str
 function Components({catalog, busy, visible, onError}: {catalog: Catalog; busy: boolean; visible: boolean; onError: (text: string) => void}) {
   const confirm = useConfirm();
   const [status, setStatus] = useState<ComponentsStatus | null>(null); const [directory, setDirectory] = useState('');
-  const [bundle, setBundle] = useState(''); const [model, setModel] = useState(catalog.models[0]?.id || '');
+  const [model, setModel] = useState(catalog.models[0]?.id || '');
   const {pending, perform} = useAction(onError);
   async function refresh(signal?: AbortSignal) {const next = await api<ComponentsStatus>('/api/components', undefined, signal); setStatus(next); setDirectory(value => value || next.default_directory);}
   useEffect(() => {
@@ -78,10 +78,9 @@ function Components({catalog, busy, visible, onError}: {catalog: Catalog; busy: 
   }, [visible]);
   async function action(name: string) {
     const prompt = name === 'runtime' ? '下载并安装独立 GPU 环境？可能占用十余 GB。不会修改系统 Python 或删除已有模型。'
-      : name === 'model' ? `从 Hugging Face 下载 ${model}？需要数 GB 空间和网络流量，已有模型不会被自动删除。`
-      : '校验并登记已有 D 模型包？不会修改包内文件。';
-    if (name !== 'cancel' && !await confirm({title: name === 'import_d' ? '登记已有模型？' : '下载并安装组件？', body: prompt, confirmLabel: name === 'import_d' ? '校验并登记' : '开始下载'})) return;
-    await perform(name, async () => {await api('/api/components', {action: name, directory: name === 'import_d' ? bundle : directory, model}); await refresh();});
+      : `从 Hugging Face 下载 ${model}？需要数 GB 空间和网络流量，已有模型不会被自动删除。`;
+    if (name !== 'cancel' && !await confirm({title: '下载并安装组件？', body: prompt, confirmLabel: '开始下载'})) return;
+    await perform(name, async () => {await api('/api/components', {action: name, directory, model}); await refresh();});
   }
   const disabled = busy || !!pending || status?.status === 'running' || !status;
   return <section className="surface workflow-card"><div className="row-between"><h2>组件与模型文件</h2><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/></div>
@@ -90,8 +89,6 @@ function Components({catalog, busy, visible, onError}: {catalog: Catalog; busy: 
       <Field label="下载模型"><Choice value={model} disabled={disabled} onChange={e => setModel(e.target.value)}>{catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field></div>
     <div className="button-row"><Button disabled={disabled || !directory} onClick={() => void action('runtime')}>安装 GPU 环境</Button><Button appearance="primary" disabled={disabled || !directory || !model} onClick={() => void action('model')}>下载所选模型</Button>
       <Button disabled={!!pending || status?.status !== 'running'} onClick={() => void action('cancel')}>取消安装 / 下载</Button></div>
-    <div className="revision-block"><h3>登记已有 D 模型包</h3><Field label="D 模型包目录"><Input value={bundle} disabled={disabled} onChange={(_, d) => setBundle(d.value)}/></Field>
-      <Button className="spaced" disabled={disabled || !bundle.trim()} onClick={() => void action('import_d')}>校验并登记</Button></div>
     <dl className="facts-list"><dt>Python</dt><dd>{status?.python || '—'}</dd><dt>模型目录</dt><dd>{status?.models || '—'}</dd></dl>
     <details className="data-disclosure"><summary>安装日志</summary><pre>{status?.log || '尚无安装日志'}</pre></details></section>;
 }
@@ -102,7 +99,7 @@ function Recovery({config, busy, visible, onRun, onError}: {config: Config; busy
   const [items, setItems] = useState<Checkpoint[]>([]); const {pending, perform} = useAction(onError);
   async function refresh(signal?: AbortSignal) {setItems((await api<{runs: Checkpoint[]}>('/api/desktop-checkpoints', undefined, signal)).runs);}
   useEffect(() => {if (!visible) return; const abort = new AbortController(); void refresh(abort.signal).catch(e => {if (!abort.signal.aborted) onError(String(e));}); return () => abort.abort();}, [visible]);
-  const compatible = config.provider !== 'local' && config.executor === 'win32' && config.scope === 'desktop' && !config.experience;
+  const compatible = false; // Legacy checkpoints require the retired Win32 executor.
   async function resume(item: Checkpoint) {
     if (!compatible) return;
     if (!await confirm({title: '恢复这个任务？', body: `“${item.instruction}”\n将使用当前所选模型 ${config.provider === 'codex' ? config.model : config.apiModel}，重新控制主显示器。${item.uncertain ? '\n有未确认的动作边界，程序会先重新观察，不盲目重放。' : ''}`, confirmLabel: '确认恢复', note: '请核对目标应用并关闭敏感内容。按 F9 停止。'})) return;
@@ -110,7 +107,7 @@ function Recovery({config, busy, visible, onRun, onError}: {config: Config; busy
   }
   return <section className="surface workflow-card"><div className="row-between"><h2>显式恢复未完成任务</h2><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/></div>
     <p className="quiet">只列出已有 LangGraph 检查点。运行记录本身不是可重放脚本，打开此页不会触发任何操作。</p>
-    {!compatible && <p className="inline-warning">恢复入口需要任务工作台选择 Codex / API、Win32、全桌面、无序列经验；不会替你扩大授权范围。</p>}
+    {!compatible && <p className="inline-warning">Win32 执行后端已停用，旧检查点暂不支持恢复；历史记录仍可查看。请在任务工作台重新发起任务。</p>}
     {items.map(item => <article className="checkpoint-row" key={item.path}><div><h3>{item.instruction}</h3><p className="quiet">{item.name} · {item.uncertain ? '存在待核对动作' : '已保存检查点'}</p></div><Button disabled={busy || !!pending || !compatible} onClick={() => void resume(item)}>确认后恢复</Button></article>)}
     {!items.length && <Empty icon="history" title="没有待恢复检查点" text="普通运行记录仍可在历史页面回看；不会自动生成或重放任务。"/>}</section>;
 }

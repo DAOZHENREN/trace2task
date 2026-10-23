@@ -1,0 +1,8 @@
+{
+  "protocol": "T2T1",
+  "source_sha256": "001eb3a966ae3fab81b6cfcd24359b46eda8ab3349f3169dca7feccd516afa41",
+  "jar_sha256": "35f89ddd88105c9773b3a830aac6e572e798b8c1470bffa5c019767175d12145",
+  "compiler_sha256": "38a9ffaaebbd17d1514e3ecbff5a85b989bb13c551b9e224c7409514eea84ff5",
+  "min_api": 29,
+  "max_duration_ms": 1500
+}

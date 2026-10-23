@@ -1,5 +1,42 @@
 # Cua experimental backend
 
+## 2026-10-19 official 0.36.0 update and Wesnoth retest
+
+The official Windows x86_64 binary is installed separately at
+`D:/Tools/cua-driver-probe/v0.36.0/bin/cua-driver.exe`; older installations remain
+available. The source default now points to this version. Restart existing
+processes to pick up a changed user-level `TRACE2TASK_CUA_DRIVER` setting.
+
+- Official release: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.36.0
+- Binary ZIP SHA-256, matched to GitHub asset metadata:
+  `f8c47024b626f4e0e70f8428d2998df39e4879110c5722a29d5fd03e367353ad`.
+- Extracted executable SHA-256:
+  `99291d8d6a4851d9df96da5813a1ef2761f2c9d3a59d2a7036c0bf4d09652f4f`.
+- GitHub issue #5071 and PR #5076 were still open; PR head was
+  `f5c9c5e3acb491f2639659ae07dc9e495d2f55c3`, not merged. The updated PR proposes
+  suspending a target GUI thread around posted click messages. It is not the
+  old remove-delay-only candidate tested on October 13, and was not installed.
+- The tagged 0.36.0 Windows `input/mouse.rs` still has the 35 ms delay between
+  posted press and release. Updating to this release is not deploying #5076.
+
+Real test: unchanged Wesnoth 1.18.8 isolated `Trace2Task_Probe` scenario. Fresh
+1026x813 window screenshots were used for a blank-area click and an End Turn
+click. Both requested background delivery, returned `synthetic_events` /
+`effect=unverifiable`, and produced no observed task progress: the introductory
+overlay remained, and the game log had START but no MOVE, victory or defeat.
+Both before/after samples kept Chrome foreground and the real cursor unchanged.
+This is sampled evidence, not continuous focus/input monitoring. The probe
+explicitly disabled foreground retries and did not patch the game or SDL DLL.
+
+Evidence directory: `runs/cua-0360-validation-20261019/wesnoth-interactive/`.
+Game log: `runs/wesnoth-validation-20261008/userdata/logs/wesnoth-20261019-151808-4128141737.log`.
+The private test daemon and owned game fixture are closed after validation.
+102 existing Cua backend/scope/window/motion/desktop tests passed. This is not a
+successful game qualification; no RSI run or candidate promotion was started.
+Rollback: set `TRACE2TASK_CUA_DRIVER` to the retained
+`D:/Tools/cua-driver-probe/v0.34.1/cua-driver-rs-0.34.1-windows-x86_64/cua-driver.exe`
+and restart the consuming application.
+
 程序入口在模型旁显示执行后端选择。目前支持全桌面 + Win32 前台输入，或指定窗口 / 应用 +
 Cua 后台优先、明确拒绝时前台重试；不兼容的组合会提示并禁止启动，不会暗中改选。Codex、模型 API 和本地模型均可
 在已授权窗口范围内运行；已确认的语义经验也能作为模型指导，但经验不是窗口授权。
@@ -51,7 +88,7 @@ Qwen 2B 的 Cua 专用协议已有授权目标切换。本次为 GUI-Owl、MAI �
 0.28.2 没有独立 key-down/key-up 接口，因此不模拟任意长按或用前台 SendInput 补齐。
 
 The Cua executable is external, not redistributed in the desktop installer.
-Default: `D:/Tools/cua-driver-probe/v0.28.2/cua-driver-rs-0.28.2-windows-x86_64/cua-driver.exe`.
+Default: `D:/Tools/cua-driver-probe/v0.36.0/bin/cua-driver.exe`.
 Override with `TRACE2TASK_CUA_DRIVER`. Each task owns a private named-pipe daemon;
 it disables telemetry and terminates its own process tree on completion.
 

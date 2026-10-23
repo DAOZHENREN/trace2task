@@ -3,6 +3,7 @@ import type {ComponentProps, ReactNode} from 'react';
 
 export function Icon({name, size = 20}: {name: string; size?: number}) {
   const paths: Record<string, string> = {
+    trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7',
     tasks: 'M4 5h7M4 10h5M4 15h5M15 6l6 5-6 5V6Z', record: 'M6 3h12v18H6V3ZM10 8h4M10 12h4M10 16h2',
     library: 'M3 5h6l3 3h9v12H3V5ZM3 11h18', models: 'M8 8h8v8H8V8ZM8 2v3m8-3v3M8 19v3m8-3v3M2 8h3m-3 8h3M19 8h3m-3 8h3',
     history: 'M4 11a8 8 0 1 1 2 6M4 5v6h6M12 7v5l3 2', settings: 'M4 6h16M4 12h16M4 18h16M8 3v6M16 9v6M10 15v6',

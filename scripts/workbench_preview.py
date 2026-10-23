@@ -4,19 +4,25 @@ The normal desktop launcher uses the real controller. This intentionally refuses
 ALL writes and uses an empty temporary data directory; never point it at user data.
 """
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from trace2task.web_console import create_web_server
+from trace2task.api_settings import APISettingsStore
+from trace2task.web_console import WebConsoleController, create_web_server
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--port', type=int, default=8775)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='trace2task-workbench-') as folder:
-        server = create_web_server(Path(folder), port=args.port)
+        root = Path(folder)
+        # Never load personal deployment settings or saved API credentials in previews.
+        os.environ['TRACE2TASK_RSI_PROFILE'] = str(root / 'missing-rsi-profile.json')
+        controller = WebConsoleController(root, api_settings_store=APISettingsStore(root / 'model-api.json'))
+        server = create_web_server(root, port=args.port, controller=controller)
         server.RequestHandlerClass.controller._rsi_client = None
         server.RequestHandlerClass.controller._rsi_profile_error = '隔离 UI 验证不连接远程 RSI'
         def read_only(self):
@@ -27,3 +33,4 @@ if __name__ == '__main__':
             server.serve_forever()
         finally:
             server.server_close()
+            controller.run_store.db.close()

@@ -1502,7 +1502,7 @@ def test_windows_agent_dry_run_accepts_draft_and_sends_no_input(tmp_path: Path) 
     assert backend.events == []
     assert agent.closed
     assert result.input_mode == "foreground"
-    assert result.model == "gpt-6-sol"
+    assert result.model == "gpt-6.1-sol"
     assert result.reasoning_effort == "low"
     assert result.planning_ms >= 0
 

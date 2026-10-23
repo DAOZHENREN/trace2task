@@ -368,8 +368,8 @@ class CodexWindowsAgent:
         if not self.adaptive_reasoning or self._escalation_level <= 0:
             return self.model, self.reasoning_effort
         model_order = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
-        if self.model in {"gpt-6-luna", "gpt-6-sol"}:
-            model_order = ["gpt-6-luna", "gpt-6-sol"]
+        if self.model in {"gpt-6-luna", "gpt-6.1-sol"}:
+            model_order = ["gpt-6-luna", "gpt-6.1-sol"]
         effort_order = ["low", "medium", "high", "xhigh", "max"]
         active_model = self.model
         if active_model in model_order:

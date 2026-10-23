@@ -67,6 +67,8 @@ def test_archive_rejects_service_paths_outside_log_root(tmp_path):
 
 
 def test_later_client_turn_sends_no_system_profile_experience_or_before_image(tmp_path):
+    import hashlib
+
     image = tmp_path/'frame.png'
     image.write_bytes(b'png')
     audit = LocalRunAudit(tmp_path, {}, lambda *a, **kw: None, lambda _: None)
@@ -77,7 +79,8 @@ def test_later_client_turn_sends_no_system_profile_experience_or_before_image(tm
     for step in range(2):
         audit.predict(predict, SimpleNamespace(raise_if_requested=lambda: None), 'gui-owl-2b',
                       'task', image, [], step, previous_screenshot=image,
-                      experience_context={'kind': 'trace_sequence'},
+                      experience_context={'kind': 'trace_sequence', 'model_input': 'fixture method',
+                                          'sha256': hashlib.sha256(b'fixture method').hexdigest()},
                       prompt_profile={'system_prompt': 'fixed system', 'turn_template': 'fixed template'})
     assert calls[0]['prompt_profile']['system_prompt'] == 'fixed system'
     assert calls[0]['experience_context']

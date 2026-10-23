@@ -28,7 +28,7 @@ from trace2task.windows_guidance import (
     guidance_scope_payload,
 )
 
-DEFAULT_TASK_MODEL_REVISION_MODEL = "gpt-6-sol"
+DEFAULT_TASK_MODEL_REVISION_MODEL = "gpt-6.1-sol"
 DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT = "high"
 
 

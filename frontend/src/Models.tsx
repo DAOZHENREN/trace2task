@@ -2,11 +2,13 @@ import {useState} from 'react';
 import {Button, Input, Spinner} from '@fluentui/react-components';
 import {api} from './api';
 import {useConfirm} from './ConfirmDialog';
-import type {Catalog, Config} from './types';
+import type {Catalog, Config, ServiceSnapshot} from './types';
+import {LocalServices, loadedService, modelLabel} from './LocalServices';
 import {Choice, Field, Icon, PageHeading, Refresh} from './ui';
 
-export function Models({catalog, config: c, setConfig, busy, refresh, onError, onComponents}: {
+export function Models({catalog, config: c, setConfig, busy, refresh, onError, onComponents, services, serviceError}: {
   catalog: Catalog; config: Config; setConfig: (c: Config) => void; busy: boolean; refresh: () => Promise<void>;
+  services: ServiceSnapshot | null; serviceError: string;
   onError: (e: string) => void; onComponents: () => void}) {
   const confirm = useConfirm();
   const [pending, setPending] = useState('');
@@ -16,7 +18,7 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
   async function service(action: string) {
     setPending(action); setMessage('');
     try {const result = await api<{message: string}>('/api/local-model/service', {action, model: c.localModel, backend: c.inference});
-      await refresh(); setMessage(result.message);} catch (e) {onError(String(e));} finally {setPending('');}
+      setMessage(result.message);} catch (e) {onError(String(e));} finally {await refresh().catch(e => onError(String(e))); setPending('');}
   }
   async function saveApi() {
     setPending('api');
@@ -33,19 +35,20 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
   }
   const profile = catalog.models.find(p => p.id === c.localModel);
   const availability = profile?.availability[c.inference];
+  const running = serviceError ? [] : services?.services.filter(loadedService) || [];
+  const gui = running.find(s => s.id === 'gui');
   return <>
     <PageHeading eyebrow="MODELS & CONNECTIONS" title="选模型，也选对运行方式。" copy="模型负责理解，推理引擎负责计算，执行后端负责操作。三者可以独立选择。"
       action={<Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/>}/>
-    <p className="quiet">本地模型默认优先 llama-server，已有明确配置保留。只展示已实现的兼容引擎；MAI-UI 暂仍为 Transformers 实验适配。</p>
-    <div className="service-banner"><div className={`status-dot ${catalog.service.reachable ? '' : 'muted'}`}/><div>
-      <strong>{catalog.service.reachable ? '本地 GUI 服务在线' : '本地 GUI 服务未连接'}</strong>
-      <p>{catalog.service.reachable ? `${catalog.service.backend} · 当前加载 ${catalog.service.model || '尚无模型'}` : '云端模型不依赖本地 GPU 服务。启动本地模型前会校验文件和固定版本。'}</p>
-    </div><span className="mono">127.0.0.1:8768</span></div>
+    <LocalServices snapshot={services} error={serviceError} catalog={catalog}/>
     <div className="model-grid">{catalog.models.map(p => <button key={p.id} className={`model-card ${c.localModel === p.id ? 'selected' : ''}`}
       disabled={busy || !!pending} onClick={() => setConfig({...c, provider: 'local', localModel: p.id,
         inference: p.engines.includes(c.inference) ? c.inference : p.engines[0]})}>
       <div className="row-between"><div className="model-icon"><Icon name="models" size={24}/></div><span className="tag">{p.maturity === 'experimental' ? '实验适配' : '已接入'}</span></div>
       <h2>{p.label}</h2><p>{p.repository}</p><div className="engine-tags">{p.engines.map(b => <span key={b}>{b}</span>)}</div>
+      <div className="model-state-tags">{running.filter(s => s.model === p.id).map(s => <span className="running-model-tag" key={s.id}>
+        {s.status === 'reported' ? '服务报告已加载' : '运行中'} · {s.backend}</span>)}
+        {c.localModel === p.id && <span className="tag">已选择 · 待启动配置</span>}</div>
       <div className="model-card-foot">{Object.values(p.availability).some(a => a.files_present) ? '检测到模型文件 · 启动时校验' : '尚缺运行文件'}<Icon name={c.localModel === p.id ? 'check' : 'arrow'} size={17}/></div>
     </button>)}</div>
     <section className="surface engine-config"><div><span className="section-label">本地运行配置</span><h2>{profile?.label || c.localModel}</h2>
@@ -53,10 +56,13 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
       <div className="engine-form"><Field label="推理引擎"><Choice aria-label="推理引擎" disabled={busy || !!pending || !profile} value={c.inference}
         onChange={e => update('inference', e.target.value)}>{(profile?.engines || [c.inference]).map(b => <option key={b}>{b}</option>)}</Choice></Field>
         <div className="button-row"><Button appearance="primary" disabled={busy || !!pending || availability?.files_present === false} onClick={() => void service('start')}>启动所选服务</Button>
-          <Button disabled={busy || !!pending} onClick={() => void service('stop')}>关闭所选服务</Button></div>
+          <Button disabled={busy || !!pending} onClick={() => void service('stop')}>关闭 GUI 服务</Button></div>
       </div>
+      {gui && (gui.model !== c.localModel || gui.backend !== c.inference) && <p className="inline-warning">
+        当前后台为 {modelLabel(gui.model, catalog)} / {gui.backend}，与所选配置不同。选择卡片不会切换模型；启动所选服务会替换当前 GUI 服务。</p>}
+      <p className="quiet">关闭 GUI 服务会关闭它实际加载的模型，而不是只关闭所选卡片。</p>
       {availability && !availability.files_present && <div className="missing-files"><strong>先准备这些文件</strong>{availability.missing.map(p => <code key={p}>{p}</code>)}
-        <p>GGUF 使用注册表中的固定版本：2B 需本机转换，8B 使用官方量化文件；不会覆盖已有 GGUF。组件页可安装环境、下载模型和登记已有 D 模型。</p><Button size="small" onClick={onComponents}>管理组件与模型文件</Button></div>}
+        <p>GGUF 使用注册表中的固定版本：2B 需本机转换，8B 使用官方量化文件；不会覆盖已有 GGUF。组件页可安装环境和下载模型。</p><Button size="small" onClick={onComponents}>管理组件与模型文件</Button></div>}
       {c.inference === 'llama-server' && !catalog.summary_model_present && <p className="inline-warning">摘要模型尚未找到；长对话压缩不可用，达到预算时会明确报错，不会声称全部文本永久保留。</p>}
       <p className="quiet">{catalog.inference_backends.find(b => b.id === c.inference)?.context_description} 文件存在不等于真实任务能力已通过验收。</p>
     </section>

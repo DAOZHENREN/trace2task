@@ -29,7 +29,11 @@ class LocalRunAudit:
                 previous_screenshot=None, execution_feedback=None, experience_context=None,
                 prompt_profile=None, cursor_position=None):
         from trace2task.local_gui_client import cancel_gui
+        from trace2task.run_memory import freeze_experience
         from trace2task.trained_model_runner import interruptible_prediction
+        snapshot = freeze_experience(self.root, experience_context)
+        if snapshot:
+            self.result['experience_snapshot'] = snapshot
         request_id = uuid.uuid4().hex
         folder = self.root/'model-io'/f'{step:04d}'
         folder.mkdir(parents=True)
@@ -39,6 +43,8 @@ class LocalRunAudit:
             'purpose': (context or {}).get('purpose', 'plan'),
             'previous_screenshot': None,
             'experience_context': experience_context,
+            'experience_sha256': (experience_context or {}).get('sha256'),
+            'experience_snapshot': snapshot,
             'output_directory': str(folder), 'screenshot': str(screenshot),
             'request_path': str(folder/'request.json'), 'response_path': str(folder/'response.json')}
         native_history = self.previous_model_action()

@@ -1,0 +1,36 @@
+name: Offline core regression tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: src
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+      TRACE2TASK_RSI_PROFILE: /tmp/trace2task-ci-no-deployment.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # No model weights, ADB session, desktop driver or provider credentials.
+      - run: >-
+          python -m pip install --only-binary=:all:
+          'pytest>=8.3,<9' 'ruff>=0.12' 'pygame>=2.6,<3'
+          'numpy>=2,<3' 'pyyaml>=6,<7' 'pillow>=11,<13'
+          'langchain==1.4.3' 'langgraph-checkpoint-sqlite>=3,<4'
+      - run: python -m ruff check src tests scripts
+      - run: python -m pytest --tb=short

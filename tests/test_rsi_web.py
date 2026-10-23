@@ -17,8 +17,8 @@ DIGEST = "b" * 64
 
 class Remote:
     profile = RSIRemoteProfile(
-        ssh_host="dongjintao@100.70.228.85",
-        remote_config_path="/mnt/sda/dongjintao/trace2task-rsi/deployment.json",
+        ssh_host="fixture@rsi.example",
+        remote_config_path="/srv/trace2task-rsi/deployment.json",
         control_launcher_argv=("python", "-m", "trace2task.rsi_control"),
         max_model_calls=30,
         max_wall_seconds=1_200,
@@ -379,8 +379,8 @@ def test_rsi_health_distinguishes_connected_resources_not_ready(tmp_path: Path):
 def test_rsi_json_profile_converts_only_trusted_array_fields(tmp_path: Path, monkeypatch):
     profile = tmp_path / "rsi-profile.json"
     profile.write_text(json.dumps({
-        "ssh_host": "dongjintao@100.70.228.85",
-        "remote_config_path": "/mnt/sda/dongjintao/trace2task-rsi/deployment.json",
+        "ssh_host": "fixture@rsi.example",
+        "remote_config_path": "/srv/trace2task-rsi/deployment.json",
         "control_launcher_argv": ["python", "-m", "trace2task.rsi_control"],
         "allowed_models": ["gpt-6-astra"],
         "allowed_reasoning_efforts": ["low"],
@@ -401,8 +401,8 @@ def test_rsi_loads_persistent_local_app_data_profile(tmp_path: Path, monkeypatch
     profile_dir = local_app_data / "Trace2Task"
     profile_dir.mkdir(parents=True)
     (profile_dir / "rsi-profile.json").write_text(json.dumps({
-        "ssh_host": "dongjintao@100.70.228.85",
-        "remote_config_path": "/mnt/sda/dongjintao/trace2task-rsi/deployment.json",
+        "ssh_host": "fixture@rsi.example",
+        "remote_config_path": "/srv/trace2task-rsi/deployment.json",
         "control_launcher_argv": ["python", "-m", "trace2task.rsi_control"],
     }), encoding="utf-8")
     monkeypatch.delenv("TRACE2TASK_RSI_PROFILE", raising=False)
@@ -417,8 +417,8 @@ def test_rsi_loads_persistent_local_app_data_profile(tmp_path: Path, monkeypatch
 def test_rsi_json_profile_rejects_non_array_command_field(tmp_path: Path, monkeypatch):
     profile = tmp_path / "rsi-profile.json"
     profile.write_text(json.dumps({
-        "ssh_host": "dongjintao@100.70.228.85",
-        "remote_config_path": "/mnt/sda/dongjintao/trace2task-rsi/deployment.json",
+        "ssh_host": "fixture@rsi.example",
+        "remote_config_path": "/srv/trace2task-rsi/deployment.json",
         "control_launcher_argv": "python -m trace2task.rsi_control",
     }), encoding="utf-8")
     monkeypatch.setenv("TRACE2TASK_RSI_PROFILE", str(profile))

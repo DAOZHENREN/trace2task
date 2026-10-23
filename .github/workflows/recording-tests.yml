@@ -53,7 +53,7 @@ jobs:
       - run: >-
           python -m pytest tests/test_run_session.py tests/test_local_gui_client_context.py
           tests/test_trace_evidence.py tests/test_trace_library.py tests/test_opencua_export_d.py
-      - run: node --test tests/execution_entry.test.cjs tests/model_io_timeline.test.cjs
+      - run: node --test tests/*.test.cjs scripts/browser_worker.test.mjs
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
       - run: npm test

@@ -19,9 +19,9 @@ DIGEST = "b" * 64
 
 def profile(**changes):
     value = {
-        "ssh_host": "dongjintao@100.70.228.85",
-        "remote_config_path": "/mnt/sda/dongjintao/trace2task-rsi/deployment.json",
-        "control_launcher_argv": ("/mnt/sda/dongjintao/trace2task-rsi/venv/bin/python", "-m",
+        "ssh_host": "fixture@rsi.example",
+        "remote_config_path": "/srv/trace2task-rsi/deployment.json",
+        "control_launcher_argv": ("/srv/trace2task-rsi/venv/bin/python", "-m",
                                    "trace2task.rsi_control"),
         "request_timeout_seconds": 12,
     }
@@ -52,9 +52,9 @@ def test_health_uses_only_fixed_ssh_coordinates_and_one_json_stdin(monkeypatch):
         "ClearAllForwardings=yes",
     ]
     assert seen["command"][8:10] == ["-o", "ConnectTimeout=10"]
-    assert seen["command"][10] == "dongjintao@100.70.228.85"
+    assert seen["command"][10] == "fixture@rsi.example"
     assert seen["command"][11].endswith(
-        "--config /mnt/sda/dongjintao/trace2task-rsi/deployment.json"
+        "--config /srv/trace2task-rsi/deployment.json"
     )
     assert "shell" not in seen["kwargs"]
     assert seen["kwargs"]["timeout"] == 12

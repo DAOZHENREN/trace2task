@@ -60,8 +60,9 @@ def dispatch_backend_once(backend, action, prepared, target, stop):
 
 
 class ExecutionCore:
-    def __init__(self, backend: ExecutionBackend, stop, record, *, max_actions=40):
+    def __init__(self, backend: ExecutionBackend, stop, record, *, max_actions=40, interventions=None):
         self.backend, self.stop, self.record = backend, stop, record
+        self.interventions = interventions
         self.max_actions = max_actions
         self.attempts = self.rejections = 0
         self.consumed = set()
@@ -80,7 +81,7 @@ class ExecutionCore:
         except Exception:
             self.stopped = True
             raise
-        if result.status not in ('delivered', 'rejected', 'reobserve', 'completion_requested'):
+        if result.status not in ('delivered', 'rejected', 'reobserve', 'completion_requested', 'intervened'):
             self.stopped = True
             self.record('execution_stopped', status=result.status, reason=result.reason,
                         observation_id=observation_id)
@@ -92,6 +93,9 @@ class ExecutionCore:
         self.last_plan = None
         self.last_requests = []
         execution_context = dict(execution_context or {})
+        revision = execution_context.get('intervention_revision')
+        if self.interventions is not None and not self.interventions.current(revision):
+            return self._intervened(target, observation_id)
         # Reparse at the execution boundary even if the adapter already validated it.
         plan = ActionPlan.from_prediction(prediction)
         self.last_plan = plan.to_payload()
@@ -133,6 +137,8 @@ class ExecutionCore:
                 return ExecutionResult(status, target, payload, reason=str(error),
                                        steps=tuple(self.last_steps))
             self.stop.raise_if_requested()
+            if self.interventions is not None and not self.interventions.admit_action(revision):
+                return self._intervened(target, observation_id)
             self.attempts += 1
             request = self._request(action, prepared, target, index)
             self.record('dispatch', action=payload, observation_id=observation_id,
@@ -234,6 +240,16 @@ class ExecutionCore:
             elif action.skill in ('switch_window', 'launch_app'):
                 execution_context.pop('cursor_position', None)
             target = next_target
+            if receipt.get('reobserve'):
+                self.feedback = {'status': 'navigation_reobserve', 'executed': True,
+                                 'navigation': receipt.get('navigation'),
+                                 'reason': 'Bounded navigation ended; discard the remaining batch and re-observe. '
+                                 'Proximity is not proof of task completion.'}
+                self.record('batch_boundary', observation_id=observation_id,
+                            reason='navigation_feedback', remaining=len(plan.actions)-index)
+                return ExecutionResult('reobserve', target, payload, receipt,
+                                       reason=self.feedback['reason'], delivery_mode=delivery_mode,
+                                       steps=tuple(self.last_steps))
             if action.skill in ('switch_window', 'launch_app') and index < len(plan.actions):
                 self.feedback = {'status': 'reobserve', 'executed': False,
                                  'reason': 'Action changed the coordinate target; remaining actions need a new screenshot.'}
@@ -249,6 +265,13 @@ class ExecutionCore:
                                delivery_mode=delivery_mode,
                                background_refusal=background_refusal,
                                steps=tuple(self.last_steps))
+
+    def _intervened(self, target, observation_id):
+        self.feedback = {'status': 'human_intervention', 'executed': False,
+                         'reason': '用户干预使尚未执行的旧动作失效；必须从新截图重新规划。'}
+        self.record('batch_boundary', observation_id=observation_id, reason='human_intervention',
+                    delivered_count=len(self.last_steps))
+        return ExecutionResult('intervened', target, reason=self.feedback['reason'], steps=tuple(self.last_steps))
 
     def _delivery_mode(self, receipt, background_refusal):
         if background_refusal is not None:

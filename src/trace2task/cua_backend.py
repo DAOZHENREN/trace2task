@@ -8,7 +8,7 @@ from pathlib import Path
 from trace2task.cua_window import inspect_window
 from trace2task.execution_protocol import ActionUnavailable, DriverRefusal
 
-DEFAULT_DRIVER = 'D:/Tools/cua-driver-probe/v0.28.2/cua-driver-rs-0.28.2-windows-x86_64/cua-driver.exe'
+DEFAULT_DRIVER = 'D:/Tools/cua-driver-probe/v0.36.0/bin/cua-driver.exe'
 EXCLUDED_APPS = {'trace2task.exe', 'chatgpt.exe', 'codex.exe', 'cua-driver.exe'}
 
 

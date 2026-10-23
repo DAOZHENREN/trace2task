@@ -1,0 +1,3 @@
+# This source is byte-hashed alongside the bundled Android helper.
+/src/trace2task/android_touch/BoundedTouch.java text eol=lf
+/src/trace2task/android_touch/bounded-touch.jar -text

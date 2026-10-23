@@ -15,7 +15,7 @@ from trace2task.codex_agent import resolve_codex_binary
 from trace2task.codex_app_server import CodexAppServerSession
 from trace2task.windows_experience import SemanticExperience
 
-DEFAULT_REVISION_MODEL = "gpt-6-sol"
+DEFAULT_REVISION_MODEL = "gpt-6.1-sol"
 DEFAULT_REVISION_REASONING_EFFORT = "high"
 MAX_GUIDANCE_RULES = 12
 MAX_GUIDANCE_OPERATIONS = 12

@@ -7,6 +7,8 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -17,6 +19,48 @@ from trace2task.local_process import stop_started_process
 from trace2task.model_registry import MODEL_PROFILES, profile_for
 
 _lock = threading.Lock()
+
+
+def _probe_service(spec):
+    service_id, label, port = spec
+    result = {'id': service_id, 'label': label, 'endpoint': f'http://127.0.0.1:{port}',
+              'reachable': False, 'status': 'unavailable'}
+    try:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(result['endpoint'] + '/health', timeout=2) as response:
+            health = json.loads(response.read(65537))
+        if not isinstance(health, dict):
+            raise TypeError('服务状态格式无效')
+        if service_id == 'gui':
+            if health.get('service') != 'trace2task-local-gui' or health.get('protocol') != 1:
+                raise ValueError('服务身份不匹配')
+            if any(health.get(key) is not None and not isinstance(health[key], str) for key in ('model', 'backend', 'status')):
+                raise ValueError('服务状态格式无效')
+            result.update(model=health.get('model'), backend=health.get('backend'))
+            status = health.get('status')
+            result['status'] = (status if status in {'running', 'busy', 'loading', 'idle'} else
+                                'reported' if health.get('model') else 'idle')
+            if result['status'] == 'idle':
+                result['model'] = None
+            if isinstance(health.get('pid'), int) and not isinstance(health['pid'], bool) and health['pid'] > 0:
+                result['pid'] = health['pid']
+        else:
+            if health.get('protocol') != 2 or health.get('model') != 'D-5970':
+                raise ValueError('服务身份不匹配')
+            result.update(model='trained_d', backend='frozen-checkpoint')
+            result['status'] = ('running' if health.get('status') == 'ready' else
+                                'loading' if health.get('status') == 'loading' else 'unknown')
+        result['reachable'] = True
+    except (OSError, ValueError, TypeError, RuntimeError) as error:
+        result['error'] = str(error)
+    return result
+
+
+def service_status():
+    """Rediscover known services; no process ownership, cached selection or startup required."""
+    specs = [('gui', '本地 GUI 服务', 8768), ('trained_d', 'D-5970 预览服务', 8767)]
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        services = list(pool.map(_probe_service, specs))
+    return {'services': services, 'checked_at': datetime.now(UTC).isoformat()}
 
 
 def managed_processes():

@@ -46,7 +46,8 @@ def _execution_audit(execution, elapsed_ms, core):
         "delivery_mode_requested": execution.delivery_mode,
         "background_refusal": execution.background_refusal,
         "executed": (None if execution.status == 'reobserve' and core.feedback
-                     and core.feedback.get('executed') is None else execution.status == "delivered"),
+                     and core.feedback.get('executed') is None else bool(execution.steps)
+                     if execution.status in {'intervened', 'reobserve'} else execution.status == "delivered"),
         "effect": execution.receipt.get("effect") if execution.receipt else None,
         "elapsed_ms": elapsed_ms,
         "steps": list(execution.steps),
@@ -70,6 +71,10 @@ def _record_delivered_steps(steps, *, result, record, status_callback, batch_ind
         }
         if receipt.get("adapter_advisory") == "delivery_path_warning":
             history_item["delivery_advisory"] = "delivery_path_warning"
+        if receipt.get('navigation'):
+            navigation = receipt['navigation']
+            history_item['navigation'] = {key: navigation[key] for key in
+                                          ('outcome', 'input_sent', 'corrections', 'release_confirmed')}
         result["history"].append(history_item)
         record("delivered", action=raw, receipt=receipt,
                elapsed_ms=item["elapsed_ms"], batch_index=batch_index,
@@ -88,13 +93,19 @@ def _record_delivered_steps(steps, *, result, record, status_callback, batch_ind
 
 def _completion_review(*, observer, target, model, core, audit, predictor, instruction,
                        history, record, status_callback, experience_context=None,
-                       prompt_profile=None):
+                       prompt_profile=None, interventions=None, intervention_revision=None):
     """Ask the same model to inspect a fresh screenshot without sending input."""
     review_index = len(audit.result["model_io"])
     started = time.perf_counter()
     _, _, review_path = observer.observe(target, review_index)
     elapsed_ms = audit.elapsed("capture_ms", started)
     record("completion_review_capture", screenshot=str(review_path), elapsed_ms=elapsed_ms)
+    context, callbacks = {'purpose': 'verify_completion'}, {}
+    if interventions is not None:
+        handoff = interventions.model_context(intervention_revision)
+        context['human_intervention'] = handoff
+        callbacks = {'on_poll': lambda: interventions.checkpoint(observer.intervention_snapshot, core.stop),
+                     'on_request': lambda: interventions.submitted(handoff, review_index)}
     review = audit.predict(
         predictor,
         core.stop,
@@ -103,10 +114,13 @@ def _completion_review(*, observer, target, model, core, audit, predictor, instr
         review_path,
         history,
         review_index,
-        {"purpose": "verify_completion"},
+        context,
         experience_context=experience_context,
         prompt_profile=prompt_profile,
+        **callbacks,
     )
+    if interventions is not None:
+        interventions.responded(handoff, review_index)
     verification = review.get("verification") if review.get("status") == "reviewed" else None
     from trace2task.local_gui_protocol import decode_completion_review
 
@@ -153,6 +167,7 @@ def run_local_agent_loop(
     continuous=True,
     experience_context=None,
     prompt_profile=None,
+    interventions=None,
 ):
     """Run an evidence-preserving local GUI-agent loop.
 
@@ -171,7 +186,7 @@ def run_local_agent_loop(
             "D-5970 的冻结输入记录不支持经验上下文；未将经验混入任务文字"
         )
     if experience_context is not None and experience_context.get("kind") != "trace_sequence":
-        raise ValueError("执行仅支持 A 原始证据 / D 精简序列，不再使用状态图经验")
+        raise ValueError("执行仅支持 A 原始证据 / B 方法 / C 组合证据 / D 精简序列，不再使用状态图经验")
 
     target = initial_target
     previous = None
@@ -181,16 +196,23 @@ def run_local_agent_loop(
     stale_reobservations = 0
     root_name = Path(root).name
 
-    for step in range(max_actions):
+    iteration = 0
+    while iteration < max_actions:
+        step = iteration
         stop.raise_if_requested()
         if result.get("actions", 0) >= max_actions:
             break
+        revision = (interventions.checkpoint(observer.intervention_snapshot, stop)
+                    if interventions is not None else None)
 
         observation_index = len(result["model_io"])
         capture_started = time.perf_counter()
         target, state, path = observer.observe(target, observation_index)
         capture_ms = audit.elapsed("capture_ms", capture_started)
         record("capture", step_index=step, screenshot=str(path), elapsed_ms=capture_ms)
+        if interventions is not None and not interventions.current(revision):
+            previous = None
+            continue
 
         previous_path = previous[1] if previous and previous[0] == target else None
         history = result["history"]
@@ -209,6 +231,12 @@ def run_local_agent_loop(
         if context is not None:
             context = dict(context)
             context["execution_feedback"] = core.feedback
+        callbacks = {}
+        if interventions is not None:
+            handoff = interventions.model_context(revision)
+            context['human_intervention'] = handoff
+            callbacks = {'on_poll': lambda: interventions.checkpoint(observer.intervention_snapshot, stop),
+                         'on_request': lambda h=handoff, i=observation_index: interventions.submitted(h, i)}
         turn_experience = experience_context
         output = audit.predict(
             predictor,
@@ -223,7 +251,22 @@ def run_local_agent_loop(
             experience_context=turn_experience if model != "D-5970" else None,
             prompt_profile=prompt_profile if model != "D-5970" else None,
             cursor_position=cursor_position if model != "D-5970" else None,
+            **callbacks,
         )
+        if interventions is not None:
+            interventions.responded(handoff, observation_index)
+            if not interventions.current(revision):
+                audit.execution({'status': 'intervened', 'executed': False, 'steps': [],
+                                 'reason': '模型请求期间收到人工干预，旧回答未执行。'})
+                record('intervention_plan_discarded', model_io_index=observation_index,
+                       intervention_revision=revision, executed=False)
+                core.feedback = {'status': 'human_intervention', 'executed': False,
+                                 'reason': 'Previous proposals were discarded after a human intervention; replan.'}
+                previous = None
+                completion_rejections = adapter_rejections = format_rejections = stale_reobservations = 0
+                status_callback('人工干预已使旧回答失效；未执行该回答，从新截图重新规划。')
+                continue
+        iteration += 1
         if output.get("status") == "adapter_rejected":
             format_rejections = 0
             adapter_rejections += 1
@@ -296,9 +339,9 @@ def run_local_agent_loop(
             execution = core.execute(
                 output["prediction"],
                 target=target,
-                observation_id=f"{root_name}:{step}",
+                observation_id=f"{root_name}:{observation_index}",
                 state=state,
-                execution_context={"cursor_position": cursor_position},
+                execution_context={"cursor_position": cursor_position, 'intervention_revision': revision},
             )
         except Exception as error:
             partial_steps = getattr(core, "last_steps", ())
@@ -337,6 +380,13 @@ def run_local_agent_loop(
                         ("switch_window", "launch_app") else None)
             stale_reobservations = 0
 
+        if execution.status == 'intervened' or (interventions is not None and not interventions.current(revision)):
+            if not steps:
+                iteration -= 1
+            previous = None
+            status_callback('干预检查点已停止旧批次的剩余动作；保留已交付动作，重新观察。')
+            continue
+
         if execution.status == "completion_requested":
             if model == "D-5970":
                 result["stop_reason"] = "completion_unverifiable"
@@ -356,8 +406,23 @@ def run_local_agent_loop(
                 status_callback=status_callback,
                 experience_context=turn_experience,
                 prompt_profile=prompt_profile,
+                interventions=interventions,
+                intervention_revision=revision,
             )
             result.setdefault("completion_reviews", []).append(receipt)
+            stop.raise_if_requested()
+            superseded = interventions is not None and not interventions.current(revision)
+            if interventions is not None and not superseded and receipt['verdict'] == 'complete':
+                superseded = not interventions.seal_completion(revision)
+            if superseded:
+                receipt['discarded_by_intervention'] = True
+                audit.execution({'status': 'intervened', 'executed': False,
+                                 'reason': '完成核验期间收到新干预，旧核验结论作废。'})
+                if not steps:
+                    iteration -= 1
+                previous = None
+                status_callback('完成核验期间收到新干预；旧完成结论作废，继续按新要求规划。')
+                continue
             verification = receipt
             if verification["verdict"] == "complete":
                 result.update(
@@ -391,6 +456,16 @@ def run_local_agent_loop(
             continue
 
         if execution.status == "reobserve":
+            if core.feedback and core.feedback.get('status') == 'navigation_reobserve':
+                navigation = core.feedback.get('navigation') or {}
+                outcome = navigation.get('outcome', 'unknown')
+                label = {'arrival_candidate': '进入目标附近，尚待核验', 'duration_limit': '单段时限到达',
+                         'target_lost': '目标丢失', 'target_ambiguous': '目标匹配不唯一',
+                         'moving_away': '正在偏离目标', 'no_progress': '没有有效进展',
+                         'feedback_too_slow': '取图过慢，未启动', 'intervened': '收到人工干预'}.get(outcome, outcome)
+                prefix = '移动已停止' if navigation.get('input_sent') else '本段未发送移动输入'
+                status_callback(f'{prefix}（{label}）；重新截图定位，不继续旧批次，也不直接判定任务完成。')
+                continue
             if core.feedback and core.feedback.get('executed') is None:
                 record('observation_changed', step_index=step, reason=execution.reason,
                        executed=None)

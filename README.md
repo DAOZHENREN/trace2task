@@ -78,9 +78,9 @@ The repository provides [installer build scripts](docs/desktop-app.md), not bund
 **Record → Generate → Inspect → Select → Execute → Review**
 
 1. **Record.** OpenCUA captures a demonstration on the primary display. Finish with **F8**, cancel with **F9**; required components and recording limitations are [documented separately](docs/opencua-recording.md).
-2. **Generate locally.** After official action derivation, create **D** for actions alone or **A** for actions with visual evidence. Neither generator calls a model.
+2. **Generate.** Create **D** for actions alone or **A** for actions with visual evidence locally. Compile a reviewed **B** procedure with the selected Codex compiler, or combine its frozen evidence into **C** without another model call.
 3. **Inspect.** Open **查看模型原文** (“View model input”) to read the exact saved text and, for A, see every selected image. Raw files and audit metadata are separate.
-4. **Select explicitly.** Choose a version as reference for a new task, or run without experience. Generating a version never silently activates it.
+4. **Choose the reference mode.** Let the execution agent search reviewed B summaries and load one applicable method, pin a specific version, or run without experience. Unsaved drafts never enter automatic selection.
 5. **Execute and review.** Observe the current screen, plan within the chosen scope, execute, and observe again. Review the run evidence instead of treating a stop signal as proof of success.
 
 ### What reaches the model?
@@ -90,31 +90,34 @@ The repository provides [installer build scripts](docs/desktop-app.md), not bund
 | **N · No experience** | No demonstration; current task and observations only | Available |
 | **D · Action sequence** | Ordered action descriptions, durations, visible child actions, and click coordinates | Available |
 | **A · Actions + visual evidence** | The same D-style actions, with references to **at most 8** selected historical screenshots | Available |
-| **B · Procedure** | A semantically compiled, frozen task method | Planned |
-| **C · Evidence + Procedure** | The same A evidence plus the exact same B procedure | Planned |
+| **B · Procedure** | A compiled, frozen Markdown method, reviewed before use | Available |
+| **C · Evidence + Procedure** | B's frozen A evidence plus that exact B procedure | Available |
+| **R · Fixed-updater candidate** | A separate parent-linked method revision, requiring approval for trial | Experimental |
 
 A selects available images uniformly in temporal order, including the first and last; fewer than eight means all are selected. File paths, hashes, video clocks, and raw event logs stay in the **audit archive**, not the new A model text. Image alignment is approximate, not guaranteed pre-action state or proof of success.
 
 Original recordings and compiled versions are independent. Re-generating the same representation asks for confirmation and preserves prior versions. Old A versions are not rewritten automatically.
 
-**Scope matters:** legacy Windows/WAA task graphs, narrated compilation, and reviewed Guidance remain a separate workflow. They are not relabeled as B/C or silently inserted into the new A/D execution path. [Representation and versioning details →](docs/workbench.md)
+Completed or stopped runs can also be distilled into a draft B. When a run used experience, the compiler receives its actual parent method and evidence; a reviewed child preserves lineage without overwriting the parent. Human interventions remain explicitly attributed. Unchanged output is not an improvement claim.
+
+**Scope matters:** legacy Windows/WAA task graphs, narrated compilation, and reviewed Guidance remain separate archival workflows, not current executable A/B/C/D experience. Automatic selection currently supports the general Codex/API agent, not native local GUI models or MobileForge. [Representation and versioning details →](docs/workbench.md)
 
 ## Choose your runtime
 
 | Route | Implemented support | Important boundary |
 | --- | --- | --- |
-| **Codex CLI / subscription** | Visual execution; legacy compilation and revision | Separate CLI installation and authentication |
+| **Codex CLI / subscription** | Visual execution; B compilation, run distillation and revisions | Separate CLI installation and authentication |
 | **Vision model API** | User-configured Chat Completions endpoint | Must support images and the requested JSON format |
 | **Qwen3-VL 8B** | Official Q4_K_M + F16 vision projection via llama-server | Separately provisioned and verified weights |
 | **Qwen3-VL 2B / GUI-Owl 1.5 2B** | llama-server or Transformers | GGUF conversion/setup required for the llama route |
 | **MAI-UI 2B** | Transformers | Experimental Windows adaptation of a mobile protocol |
-| **D-5970 research model** | Frozen structured-action model protocol | Separate trusted model bundle; **no A/D experience input** |
+| **D-5970 research model** | Retained frozen protocol and historical records; hidden from current model selection | Separate trusted model bundle; **no experience input** |
 
 The **D representation** and the **D-5970 model** are different things.
 
 llama-server is the default local engine when no explicit setting exists. Existing choices are preserved; unsupported model/engine combinations fail rather than silently switching. Registered GUI models share a resident service and task conversation. [Local model setup →](docs/llama-gui-backend.md)
 
-**Execution:** Win32 controls the foreground desktop; the experimental Cua path supports explicitly selected windows/apps. Background input is not universally supported. Neither model choice nor experience grants access to additional targets. [Execution contracts](docs/unified-execution-core.md) · [Cua limitations](docs/cua-experimental-backend.md)
+**Execution:** The workbench uses Cua for desktop/selected windows, ADB for one authorized Android app, and an experimental isolated browser for Ancient Beast. The Win32 launch entry and its checkpoint resume are retired; historical data remains. Background input is not universally supported. Neither model choice nor experience grants access to additional targets. [Cua limitations](docs/cua-experimental-backend.md) · [Android backend](docs/android-backend.md) · [Isolated browser](docs/ancientbeast-background-validation.md)
 
 ## Evidence, privacy, and limits
 
@@ -124,7 +127,11 @@ llama-server is the default local engine when no explicit setting exists. Existi
 - **Keep claims narrow.** Unit tests are not model-quality benchmarks. Application-level audits do not expose a provider’s hidden prompts or reasoning.
 - **Keep data out of Git.** Do not commit recordings, generated experience, checkpoints, model weights, API keys, or unredacted run artifacts.
 
-### Android preview
+### Android from the desktop workbench
+
+The [ADB backend](docs/android-backend.md) discovers existing connections, binds one device/app, and supports bounded single-touch actions, short joystick holds and experimental minimap correction. The general visual agent also supports extra instructions and acknowledged human takeover. Stop/F9, device identity, app scope and action/time budgets remain enforced; this is not full 3D pathfinding or proof of game-task success. [MobileForge](docs/mobileforge.md) is a separate pinned policy integration with narrower capabilities.
+
+### Standalone Android preview
 
 The separate [Android project](android/README.md) records accessibility events and sampled screenshots, compiles experience through a user-configured cloud vision API, and operates **one selected app**. It supports versioned feedback and emergency stop.
 
@@ -140,12 +147,13 @@ Report the frozen artifacts and actual verification method used. A task reset is
 
 | Start here | Go deeper |
 | --- | --- |
-| [Workbench & A/D experience](docs/workbench.md) | [Action projection contract](docs/research-D-visual-projection.md) |
+| [Workbench & experience lifecycle](docs/workbench.md) | [Action projection contract](docs/research-D-visual-projection.md) |
 | [Desktop setup & packaging](docs/desktop-app.md) | [Source development](docs/desktop-development.md) |
 | [llama-server model setup](docs/llama-gui-backend.md) | [Native model profiles](docs/local-gui-models.md) · [D-5970](docs/trained-model-local.md) |
 | [OpenCUA recording](docs/opencua-recording.md) | [Narration & evidence](docs/narration-evidence.md) |
 | [Run history & model I/O](docs/model-io-audit.md) | [Task conversations](docs/task-conversations.md) · [Context management](docs/local-prefix-cache.md) |
-| [Android preview](android/README.md) | [WAA reports](docs/waa-report-format.md) · [Compiler snapshots](docs/compiler-snapshots.md) |
+| [Desktop-to-Android](docs/android-backend.md) · [MobileForge](docs/mobileforge.md) | [Standalone Android preview](android/README.md) |
+| [WAA reports](docs/waa-report-format.md) | [Compiler snapshots](docs/compiler-snapshots.md) |
 
 ## Development
 
@@ -157,8 +165,8 @@ npm ci --prefix frontend
 npm run build --prefix frontend
 
 uv run --extra dev pytest
-uv run --extra dev ruff check .
-node --test tests/*.test.cjs
+uv run --extra dev ruff check src tests scripts
+node --test tests/*.test.cjs scripts/*.test.mjs
 
 # Browser regression tests; uses an isolated, write-disabled preview
 cd frontend
@@ -166,7 +174,7 @@ npx playwright install
 npm test
 ~~~
 
-The offline suites do not call real models or drive the desktop. Platform-specific tests may skip when required capabilities are unavailable. Frontend bundles are committed for source startup; rebuild them whenever frontend sources change.
+The offline suites do not call real models or drive the desktop. JDK 17+ enables the Android helper's fake-framework protocol tests; they do not use ADB or certify real-device compatibility. Platform-specific tests may skip when required capabilities are unavailable. Frontend bundles are committed for source startup; rebuild them whenever frontend sources change. Keep `artifacts/` and the optional local `android-model-profile.json` out of Git.
 
 ## Acknowledgements & license
 

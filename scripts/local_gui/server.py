@@ -63,6 +63,14 @@ class Engine:
         self._cancellations = {}
         self._cancellations_lock = threading.Lock()
 
+    def runtime_status(self):
+        model = self.key if self.model is not None else None
+        if self.llama is not None:
+            process = self.llama.process
+            model = self.llama.process_key if process is not None and process.poll() is None else None
+        status = ('busy' if model else 'loading') if self.lock.locked() else ('running' if model else 'idle')
+        return {'model': model, 'status': status, 'pid': os.getpid()}
+
     @staticmethod
     def _request_id(value):
         if value is None:
@@ -780,7 +788,7 @@ def main():
         def do_GET(self):
             if self.path != '/health':
                 return self.reply(404,{'error':'Not found'})
-            self.reply(200,{'service':'trace2task-local-gui','protocol':1,'model':engine.key,
+            self.reply(200,{'service':'trace2task-local-gui','protocol':1, **engine.runtime_status(),
                             'backend': engine.backend,
                             'capabilities': {'cancel': True, 'detailed_metrics': True,
                                              'expected_backend': True, 'model_profiles': True,
@@ -798,7 +806,7 @@ def main():
             acquired = False
             try:
                 size=int(self.headers.get('Content-Length','0'))
-                if not 0<size<20_000_000:
+                if not 0<size<200_000_000:
                     raise ValueError('Invalid body size')
                 payload=json.loads(self.rfile.read(size))
                 if self.path == '/cancel':
