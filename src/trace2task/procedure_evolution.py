@@ -15,7 +15,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from trace2task.codex_agent import resolve_codex_binary
-from trace2task.codex_app_server import CODEX_MODELS, CODEX_REASONING_EFFORTS, CodexAppServerSession
+from trace2task.codex_app_server import CodexAppServerSession
+from trace2task.codex_catalog import CodexModelCatalog
 from trace2task.compiler_projection import INSTRUCTIONS as EVIDENCE_INSTRUCTIONS
 from trace2task.compiler_projection import compiler_evidence
 from trace2task.model_text import model_json
@@ -165,9 +166,9 @@ def evolution_confirmation(root, prepared, *, confirm_duplicate=False):
 def evolve_procedure(project_root, prepared, *, model, reasoning_effort, stop_event=None,
                      progress=None, on_round=None, publish_lock=None,
                      session_factory=None, binary_resolver=None):
-    if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
-        raise ValueError('不支持的改进模型或思考强度')
     stop_event = stop_event or threading.Event()
+    _check_cancel(stop_event)
+    CodexModelCatalog(project_root).validate(model, reasoning_effort)
     _check_cancel(stop_event)
     root = Path(project_root).resolve()
     identifier = str(uuid4())

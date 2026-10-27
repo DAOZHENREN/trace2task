@@ -91,6 +91,25 @@ def _record_delivered_steps(steps, *, result, record, status_callback, batch_ind
         )
 
 
+def _changed_after_model_wait(output, *, observer, target, path, audit, record):
+    cooldown = output.get('rate_limit_wait_seconds', 0)
+    extended = output.get('response_wait_extended', False)
+    if not cooldown and not extended:
+        return False
+    before = Path(path).read_bytes()
+    began = time.perf_counter()
+    current_target, _, current_path = observer.observe(target, len(audit.result['model_io']))
+    current = Path(current_path).read_bytes()
+    saved = audit.root / 'model-wait-checks' / f"{len(audit.result['model_io'])}{Path(current_path).suffix}"
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_bytes(current)
+    changed = current_target != target or before != current
+    record('model_wait_reobservation', screenshot=str(saved), changed=changed,
+           elapsed_ms=audit.elapsed('capture_ms', began),
+           rate_limit_wait_seconds=cooldown, response_wait_extended=extended)
+    return changed
+
+
 def _completion_review(*, observer, target, model, core, audit, predictor, instruction,
                        history, record, status_callback, experience_context=None,
                        prompt_profile=None, interventions=None, intervention_revision=None):
@@ -121,6 +140,8 @@ def _completion_review(*, observer, target, model, core, audit, predictor, instr
     )
     if interventions is not None:
         interventions.responded(handoff, review_index)
+    if _changed_after_model_wait(review, observer=observer, target=target, path=review_path, audit=audit, record=record):
+        review = {'status': 'stale', 'error': '模型等待期间画面已变化，需要重新观察核验。'}
     verification = review.get("verification") if review.get("status") == "reviewed" else None
     from trace2task.local_gui_protocol import decode_completion_review
 
@@ -266,6 +287,18 @@ def run_local_agent_loop(
                 completion_rejections = adapter_rejections = format_rejections = stale_reobservations = 0
                 status_callback('人工干预已使旧回答失效；未执行该回答，从新截图重新规划。')
                 continue
+        if _changed_after_model_wait(output, observer=observer, target=target, path=path, audit=audit, record=record):
+            audit.execution({'status': 'stale', 'executed': False, 'steps': [],
+                             'reason': '模型等待期间画面已变化，旧回答未执行。'})
+            core.feedback = {'status': 'stale', 'executed': False,
+                             'reason': 'The screen changed during the extended model wait. Replan from the fresh image.'}
+            previous = None
+            stale_reobservations += 1
+            if stale_reobservations >= 3:
+                result['stop_reason'] = 'observation_changed_limit'
+                break
+            status_callback('模型等待后已重新截图；画面变化，正在重新规划，旧动作未执行。')
+            continue
         iteration += 1
         if output.get("status") == "adapter_rejected":
             format_rejections = 0
@@ -456,6 +489,9 @@ def run_local_agent_loop(
             continue
 
         if execution.status == "reobserve":
+            if core.feedback and core.feedback.get('status') == 'camera_reobserve':
+                status_callback('转镜头滑动已发送；重新截图核对视角与方向，旧批次后续动作及完成声明作废。')
+                continue
             if core.feedback and core.feedback.get('status') == 'navigation_reobserve':
                 navigation = core.feedback.get('navigation') or {}
                 outcome = navigation.get('outcome', 'unknown')

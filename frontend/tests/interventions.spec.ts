@@ -1,7 +1,7 @@
 import {test, expect, type Page} from '@playwright/test';
 
 async function fixture(page: Page, archived = false) {
-  const state: any = {supported: true, phase: 'running', revision: 0, version: 1, assisted_by_user: false,
+  const state: any = {supported: true, visual_supported: true, phase: 'running', revision: 0, version: 1, assisted_by_user: false,
     commands: [], takeovers: [], message: '可以追加指令，或先暂停再接管手机。'};
   const run: any = {job_id: 'android-live', task_id: 'Android', kind: 'agent', instruction: '完成支援任务',
     model: 'fake-model', provider: 'codex', status: archived ? 'interrupted' : 'running', mode: 'execute',
@@ -33,6 +33,9 @@ async function fixture(page: Page, archived = false) {
         state.takeovers.push({id: 'takeover-1', status: 'requested', before: null, after: null, note: ''});
       } else if (body.kind === 'resume') {
         state.takeovers[0].note = body.text;
+        if (body.visual) state.commands[state.commands.length - 1].visual = {
+          origin: body.visual.upload_data_url ? 'user_upload' : 'takeover_snapshot', strokes: body.visual.strokes,
+          source: {path: 'runs/test/original.png'}, image: {path: 'runs/test/annotated.png'}};
         update('resuming', '正在核对授权应用并记录交还画面；请停止手动操作。');
       } else update(state.phase, '补充指令已收到；下一轮重新规划。');
     }
@@ -80,6 +83,109 @@ test('instructions and handoff notes stay separate; pause acknowledgement and re
   expect(new Set(f.requests.map(r => r.request_id)).size).toBe(3);
 });
 
+async function annotatedPause(page: Page) {
+  const f = await fixture(page);
+  await f.panel.getByLabel('补充指令', {exact: true}).fill('请看截图中的标记');
+  await f.panel.getByRole('button', {name: '截图并标注', exact: true}).click();
+  await expect(f.panel).toContainText('正在交接');
+  await expect(f.panel.getByRole('group', {name: '截图标注编辑器'})).toHaveCount(0);
+  f.state.takeovers[0].before = {path: 'runs/test/before.png', sha256: 'a'.repeat(64), width: 240, height: 135};
+  f.state.takeovers[0].status = 'active';
+  f.update('paused', '自动输入已暂停，可以标注截图。');
+  const editor = f.panel.getByRole('group', {name: '截图标注编辑器'});
+  await expect(editor.getByRole('button', {name: '画圈', exact: true})).toBeEnabled();
+  await expect(f.panel.getByLabel('接管说明（可选）', {exact: true})).toHaveValue('请看截图中的标记');
+  await expect(f.panel.getByLabel('补充指令', {exact: true})).toHaveCount(0);
+  return {...f, editor};
+}
+
+async function draw(page: Page, from: number[], to: number[]) {
+  const canvas = page.getByRole('img', {name: '在截图上绘制标注'});
+  await canvas.scrollIntoViewIfNeeded();
+  const rect = (await canvas.boundingBox())!;
+  await page.mouse.move(rect.x + rect.width * from[0], rect.y + rect.height * from[1]);
+  await page.mouse.down();
+  await page.mouse.move(rect.x + rect.width * to[0], rect.y + rect.height * to[1], {steps: 4});
+  await page.mouse.up();
+}
+
+test('circles crosses and pen marks retain coordinates after resize and travel with text', async ({page}, info) => {
+  const f = await annotatedPause(page);
+  await draw(page, [.1, .2], [.4, .6]);
+  await f.editor.getByRole('button', {name: '打叉', exact: true}).click();
+  await draw(page, [.7, .1], [.9, .3]);
+  await f.editor.getByRole('button', {name: '画笔', exact: true}).click();
+  await draw(page, [.1, .8], [.6, .7]);
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(3);
+  await f.editor.getByRole('button', {name: '撤销', exact: true}).click();
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(2);
+  await page.setViewportSize({width: 520, height: 780});
+  await draw(page, [.1, .8], [.6, .7]);
+  const overflow = await f.editor.evaluate(el => el.scrollWidth - el.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+  await f.panel.getByLabel('接管说明（可选）', {exact: true}).fill('点圈出的按钮，避开叉号，线表示方向');
+  await f.editor.screenshot({path: info.outputPath('annotation-narrow.png')});
+  await f.panel.getByRole('button', {name: '发送图文并继续'}).click();
+  await expect(f.panel.getByRole('button', {name: '发送图文并继续'})).toBeDisabled();
+  const request = f.requests[f.requests.length - 1];
+  expect(request.kind).toBe('resume');
+  expect(request.text).toContain('点圈出的按钮');
+  expect(request.visual.source_sha256).toBe('a'.repeat(64));
+  expect(request.visual.strokes.map((s: any) => s.tool)).toEqual(['circle', 'cross', 'pen']);
+  expect(request.visual.strokes[0].points[0][0]).toBeCloseTo(.1, 2);
+  expect(request.visual.strokes[0].points[1][1]).toBeCloseTo(.6, 2);
+  expect(request.visual.strokes[2].points.at(-1)[0]).toBeCloseTo(.6, 2);
+  await f.panel.getByText('查看截图指导 · 3 个标注').click();
+  await expect(f.panel.getByAltText('人工指令 2 · 用户标注图', {exact: true})).toBeVisible();
+});
+
+test('upload paste clear and remove preserve the text-only handoff', async ({page}) => {
+  const f = await annotatedPause(page);
+  await draw(page, [.1, .1], [.4, .5]);
+  await f.editor.getByRole('button', {name: '清空标注', exact: true}).click();
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(0);
+  const dataUrl = await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 120; canvas.height = 240;
+    const context = canvas.getContext('2d')!; context.fillStyle = '#557788'; context.fillRect(0, 0, 120, 240);
+    return canvas.toDataURL('image/png');
+  });
+  await f.editor.getByLabel('选择截图文件').setInputFiles({name: 'phone.png', mimeType: 'image/png', buffer: Buffer.from(dataUrl.split(',')[1], 'base64')});
+  await expect(f.editor).toContainText('上传的参考截图');
+  await f.editor.getByRole('button', {name: '使用接管截图'}).click();
+  await expect(f.editor).toContainText('接管时截图');
+  await f.editor.evaluate((el, url) => {
+    const bytes = Uint8Array.from(atob(url.split(',')[1]), c => c.charCodeAt(0));
+    const clipboard = new DataTransfer(); clipboard.items.add(new File([bytes], 'paste.png', {type: 'image/png'}));
+    el.dispatchEvent(new ClipboardEvent('paste', {bubbles: true, clipboardData: clipboard}));
+  }, dataUrl);
+  await expect(f.editor).toContainText('上传的参考截图');
+  await draw(page, [.1, .1], [.7, .4]);
+  await f.editor.getByRole('button', {name: '移除截图'}).click();
+  await expect(f.panel.getByRole('group', {name: '截图标注编辑器'})).toHaveCount(0);
+  await f.panel.getByLabel('接管说明（可选）', {exact: true}).fill('先只检查文字');
+  await f.panel.getByRole('button', {name: '交还模型', exact: true}).click();
+  expect(f.requests.at(-1).visual).toBeUndefined();
+  expect(f.requests.at(-1).text).toBe('先只检查文字');
+});
+
+test('a rejected return keeps the visual draft and an explicit retry gets a new request ID', async ({page}) => {
+  const f = await annotatedPause(page);
+  await draw(page, [.1, .2], [.4, .6]);
+  await f.panel.getByLabel('接管说明（可选）', {exact: true}).fill('圈内按钮');
+  f.failNext();
+  await f.panel.getByRole('button', {name: '发送图文并继续'}).click();
+  await expect(f.panel.getByRole('alert')).toContainText('复用请求标识');
+  f.state.commands.at(-1).status = 'scope_rejected';
+  f.update('paused', '尚未交还：请回到授权应用再重试');
+  await expect(f.panel).toContainText('尚未交还：请回到授权应用再重试');
+  await expect(f.panel.getByRole('button', {name: '发送图文并继续'})).toBeEnabled();
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(1);
+  await expect(f.panel.getByLabel('接管说明（可选）', {exact: true})).toHaveValue('圈内按钮');
+  await f.panel.getByRole('button', {name: '发送图文并继续'}).click();
+  expect(f.requests[1].visual).toEqual(f.requests[2].visual);
+  expect(f.requests[1].request_id).not.toBe(f.requests[2].request_id);
+});
+
 test('lost HTTP response retries the same request ID without duplicating an instruction', async ({page}) => {
   const f = await fixture(page);
   f.failNext();
@@ -102,6 +208,16 @@ test('archived tasks offer no resume and do not fabricate a missing return image
   await expect(f.panel.getByRole('button')).toHaveCount(0);
   await f.panel.getByText('人工接管 1 · 未完成交还 · 查看前后画面', {exact: true}).click();
   await expect(f.panel).toContainText('交还后：没有可用截图');
+  expect(f.requests).toHaveLength(0);
+});
+
+test('an already-running older backend keeps text controls without advertising image support', async ({page}) => {
+  const f = await fixture(page);
+  delete f.state.visual_supported;
+  f.update('running', '旧后端尚未重启');
+  await expect(f.panel).toContainText('旧后端尚未重启');
+  await expect(f.panel.getByRole('button', {name: '截图并标注', exact: true})).toHaveCount(0);
+  await expect(f.panel.getByRole('button', {name: '我要接管', exact: true})).toBeEnabled();
   expect(f.requests).toHaveLength(0);
 });
 

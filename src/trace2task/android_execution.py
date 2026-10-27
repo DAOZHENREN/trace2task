@@ -3,8 +3,8 @@
 ADB input uses current display coordinates (not physical portrait coordinates).
 The selected transport and boot must remain unchanged. Input delivery is never
 reported as visual success. Multi-touch is intentionally not advertised.
-Dedicated navigation gestures use a single-contact helper with a device-side
-1500 ms lease; the ordinary ADB tap/long-press/swipe semantics stay unchanged.
+Dedicated movement gestures use a single-contact helper with a device-side
+deadline and heartbeat watchdog; ordinary ADB tap/long-press/swipe semantics stay unchanged.
 """
 from __future__ import annotations
 
@@ -12,14 +12,17 @@ import hashlib
 import io
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from PIL import Image
 
 from trace2task.execution_protocol import ActionUnavailable, ObservationStale, UnifiedAction
 
-SKILLS = ('click', 'hold_mouse', 'drag', 'press_key', 'wait', 'joystick_move', 'navigate_to')
+SKILLS = ('click', 'hold_mouse', 'drag', 'press_key', 'wait', 'joystick_move', 'camera_drag')
 STATE_KEYS = ('boot_id', 'focus', 'rotation', 'width', 'height')
+SCREENSHOT_TIMEOUT_SECONDS = 60
+SCREENSHOT_MAX_ATTEMPTS = 3
 
 
 class AndroidAppNotFocused(RuntimeError):
@@ -55,12 +58,65 @@ class AndroidDriver:
             if self.transport is None:
                 raise RuntimeError('Android transport not bound')
             command += ['-t', str(self.transport)]
+        command += list(args)
+        screenshot = device and args == ('exec-out', 'screencap', '-p')
         try:
-            return subprocess.run(command + list(args), capture_output=True, check=True,
+            if screenshot:
+                return self._read_screenshot(command)
+            return subprocess.run(command, capture_output=True, check=True,
                                   timeout=20, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout
+        except subprocess.TimeoutExpired:
+            # Only a pixel read may recover; an uncertain input is never retried.
+            if not screenshot:
+                self.broken = True
+            raise
         except (OSError, subprocess.SubprocessError):
             self.broken = True
             raise
+
+    def _read_screenshot(self, command):
+        deadline = time.monotonic() + SCREENSHOT_TIMEOUT_SECONDS
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)) as process:
+            try:
+                while True:
+                    self.stop.raise_if_requested()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, SCREENSHOT_TIMEOUT_SECONDS)
+                    try:
+                        output, error = process.communicate(timeout=min(.25, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+                    self.stop.raise_if_requested()
+                    if process.returncode:
+                        raise subprocess.CalledProcessError(process.returncode, command, output, error)
+                    return output
+            finally:
+                if process.poll() is None:
+                    # Reap only this read-only client; never reset ADB or reconnect.
+                    process.kill()
+                    process.communicate()
+
+    def _check_screenshot_transport(self):
+        # A CLI `devices` query could start or replace a lost/incompatible daemon.
+        # Query the already-running server directly before allowing another read.
+        from trace2task.android_discovery import _host
+
+        self.stop.raise_if_requested()
+        try:
+            if int(_host(self.port, 'host:version'), 16) != 41:
+                raise RuntimeError('ADB 服务版本不兼容')
+            rows = _host(self.port, 'host:devices-l').splitlines()
+        except (OSError, RuntimeError, ValueError) as error:
+            self.broken = True
+            raise RuntimeError('截图重试已停止：无法核验原 ADB 服务；未重启或重新连接') from error
+        matches = [re.search(r'\btransport_id:(\d+)\b', row) for row in rows
+                   if row.split()[:2] == [self.serial, 'device']]
+        if len(matches) != 1 or matches[0] is None or int(matches[0][1]) != self.transport:
+            self.broken = True
+            raise RuntimeError('截图重试已停止：所选手机离线或 ADB 通道身份已变化；未重新连接')
 
     def bind(self):
         if self.transport is not None or self.broken:
@@ -139,8 +195,28 @@ class AndroidDriver:
         return self._last_observation
 
     def capture(self, path):
-        before = self.state()
-        data = self._run('exec-out', 'screencap', '-p')
+        for attempt in range(1, SCREENSHOT_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                self._check_screenshot_transport()
+            before = self.state()  # Checks the bound boot identity and authorized foreground app.
+            if attempt > 1:
+                self.record('android_capture_retry', attempt=attempt,
+                            max_attempts=SCREENSHOT_MAX_ATTEMPTS,
+                            timeout_seconds=SCREENSHOT_TIMEOUT_SECONDS)
+            try:
+                data = self._run('exec-out', 'screencap', '-p')
+                break
+            except subprocess.TimeoutExpired as error:
+                self.stop.raise_if_requested()
+                self.record('android_capture_timeout', attempt=attempt,
+                            max_attempts=SCREENSHOT_MAX_ATTEMPTS,
+                            timeout_seconds=SCREENSHOT_TIMEOUT_SECONDS)
+                if attempt == SCREENSHOT_MAX_ATTEMPTS:
+                    self.broken = True
+                    raise TimeoutError(
+                        f'手机截图连续 {attempt} 次超过 {SCREENSHOT_TIMEOUT_SECONDS} 秒，'
+                        '已停止本次任务；请检查云手机连接') from error
+                self.stop.sleep(1)
         with Image.open(io.BytesIO(data)) as image:
             image.load()
             if image.format != 'PNG' or image.size != (before['width'], before['height']):
@@ -153,6 +229,8 @@ class AndroidDriver:
             raise ValueError('Android snapshot must stay in this run directory')
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+        if attempt > 1:
+            self.record('android_capture_recovered', attempt=attempt, screenshot=str(path))
         return {**before, 'sha256': hashlib.sha256(data).hexdigest()}, path
 
     def create_touch_session(self, state, stop, *, is_current):
@@ -200,16 +278,18 @@ class AndroidExecutionBackend:
     default_delivery_mode = 'remote_android'
     allow_foreground_retry = False
 
-    def __init__(self, driver, *, interventions=None):
+    def __init__(self, driver, *, interventions=None, experimental_navigation=False):
         self.driver = driver
         self.interventions = interventions
+        # Internal research/tests only; the workbench never enables this controller.
+        self.skills = SKILLS + (('navigate_to',) if experimental_navigation else ())
         self.navigation_failures = 0
         self.navigation_revision = None
 
     def authorize(self, action, target):
         if target != self.driver.target:
             raise ValueError('Only the bound Android device and package are authorized')
-        if action is not None and action.skill not in SKILLS:
+        if action is not None and action.skill not in self.skills:
             raise ActionUnavailable('Unsupported Android action; no desktop fallback')
 
     def check_current(self, target, state):
@@ -221,10 +301,15 @@ class AndroidExecutionBackend:
     def prepare(self, action, state, execution_context=None):
         action = UnifiedAction.from_payload(action.to_payload())
         args = action.args
-        if action.skill not in SKILLS or args.get('button', 'left') != 'left':
+        if action.skill not in self.skills or args.get('button', 'left') != 'left':
             raise ActionUnavailable('Android supports single-touch only, no keyboard/text/desktop tools')
-        if args.get('duration_ms', 0) > 1500:
-            raise ActionUnavailable('Android actions/waits are bounded to 1500 ms for stop responsiveness')
+        if action.skill != 'joystick_move' and args.get('duration_ms', 0) > 1500:
+            raise ActionUnavailable('Android actions/waits other than joystick_move are bounded to 1500 ms')
+        if action.skill == 'camera_drag':
+            from trace2task.android_camera import prepare_camera
+            if getattr(self.driver, '_touch_session', None) is not None:
+                raise ActionUnavailable('转镜头前必须释放移动触点；不支持多指同时操作')
+            return prepare_camera(action, state, getattr(self.driver, '_last_observation', None))
         if action.skill in {'joystick_move', 'navigate_to'}:
             from trace2task.android_navigation import prepare_navigation
             revision = (execution_context or {}).get('intervention_revision')
@@ -257,7 +342,8 @@ class AndroidExecutionBackend:
         return {'state': {k: state[k] for k in STATE_KEYS}, 'command': command}
 
     def request_view(self, action, prepared, target, *, delivery_mode=None):
-        operation = ('bounded_navigation' if action.skill in {'joystick_move', 'navigate_to'}
+        operation = ('camera_drag' if action.skill == 'camera_drag'
+                     else 'bounded_navigation' if action.skill in {'joystick_move', 'navigate_to'}
                      else 'input' if prepared else 'wait')
         return {'backend': 'android', 'operation': operation,
                 'args': prepared or action.args, 'delivery_mode': self.default_delivery_mode}
@@ -291,6 +377,12 @@ class AndroidExecutionBackend:
                 self.navigation_failures = 0
             return receipt, target
         self.driver._run('shell', 'input', *checked['command'])
+        if action.skill == 'camera_drag':
+            return {'effect': 'unverifiable', 'route': 'adb_camera_swipe',
+                    'delivery': {'mode': self.default_delivery_mode}, 'reobserve': True,
+                    'camera': checked['camera'],
+                    'note': 'One swipe returned; inspect a fresh screenshot for direction and extent. '
+                            'Do not reuse the old camera heading or assume task completion.'}, target
         return {'effect': 'unverifiable', 'route': 'adb_single_touch',
                 'delivery': {'mode': self.default_delivery_mode},
                 'note': 'Input command returned; re-observe to establish visual effect'}, target
@@ -299,12 +391,20 @@ class AndroidExecutionBackend:
         raise ActionUnavailable('Android never falls back to Windows input')
 
     def capabilities(self, state):
-        return {'available_skills': list(SKILLS), 'coordinate_space': 'android_screenshot',
+        capabilities = {'available_skills': list(self.skills), 'coordinate_space': 'android_screenshot',
                 'delivery_mode': self.default_delivery_mode, 'allowed_keys': ['escape'],
-                'max_duration_ms': 1500, 'multi_touch': False, 'no_hidden_game_state': True,
-                'navigation': {'frame': 'visible_minimap', 'max_duration_ms': 1500,
+                'duration_limits_ms': {'hold_mouse': 1500, 'drag': 1500, 'wait': 1500,
+                                       'joystick_move': None, 'camera_drag': 1500},
+                'multi_touch': False, 'no_hidden_game_state': True,
+                'camera': {'gesture': 'single continuous swipe, then release',
+                           'fresh_observation_before_and_after': True,
+                           'angle_calibration': 'unknown; inspect visible response after each swipe'}}
+        if 'navigate_to' in self.skills:
+            capabilities['duration_limits_ms']['navigate_to'] = 1500
+            capabilities['navigation'] = {'frame': 'visible_minimap', 'max_duration_ms': 1500,
                                'radius_unit': 'fraction_of_shorter_screenshot_side',
                                'heading': 'camera heading clockwise from minimap up',
                                'arrival': 'marker within stop_radius of fixed player anchor; candidate only',
                                'release_on': ['stop', 'time_budget', 'intervention', 'target_lost',
-                                              'no_progress', 'scope_change', 'device_lease']}}
+                                              'no_progress', 'scope_change', 'heartbeat_timeout']}
+        return capabilities

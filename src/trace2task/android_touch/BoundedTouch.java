@@ -18,6 +18,8 @@ import java.util.zip.DeflaterOutputStream;
  * building this small helper does not require a full Android SDK installation.
  */
 public final class BoundedTouch {
+    private static final int HEARTBEAT_TIMEOUT_MS = 1500;
+
     interface WindowScope {
         String read() throws Exception;
         String boot() throws Exception;
@@ -48,7 +50,8 @@ public final class BoundedTouch {
         private final Input input;
         private final int width, height;
         private boolean started, pressed, finished;
-        private long down, deadline;
+        private final long idleDeadline;
+        private long down, deadline, heartbeatDeadline;
         private float x, y;
         private int moves;
 
@@ -56,6 +59,7 @@ public final class BoundedTouch {
             this.input = input;
             this.width = width;
             this.height = height;
+            idleDeadline = input.uptime() + 5000;
         }
 
         private void point(float px, float py) {
@@ -65,18 +69,19 @@ public final class BoundedTouch {
             }
         }
 
-        void begin(int duration, float cx, float cy, float ex, float ey) throws Exception {
+        void begin(long duration, float cx, float cy, float ex, float ey) throws Exception {
             point(cx, cy);
             point(ex, ey);
-            if (duration < 1 || duration > 1500) {
-                throw new IllegalArgumentException("duration must be 1..1500 ms");
+            if (duration < 1) {
+                throw new IllegalArgumentException("duration must be positive milliseconds");
             }
             input.checkScope();
             synchronized (this) {
                 if (started || finished) throw new IllegalStateException("gesture already consumed");
                 started = true;
                 down = input.uptime();
-                deadline = down + duration;
+                deadline = duration > Long.MAX_VALUE - down ? Long.MAX_VALUE : down + duration;
+                heartbeatDeadline = down + HEARTBEAT_TIMEOUT_MS;
                 x = cx;
                 y = cy;
                 // Mark before injection: a throwing Binder call may have delivered DOWN.
@@ -96,7 +101,7 @@ public final class BoundedTouch {
             point(px, py);
             input.checkScope();
             synchronized (this) {
-                if (finished || !pressed || input.uptime() >= deadline) return false;
+                if (finished || !pressed || expiryReason() != null) return false;
                 if (++moves > 32) throw new IllegalArgumentException("too many corrections");
                 x = px;
                 y = py;
@@ -105,8 +110,26 @@ public final class BoundedTouch {
             }
         }
 
-        synchronized boolean expired() {
-            return started && input.uptime() >= deadline;
+        String keepAlive() throws Exception {
+            input.checkScope();
+            synchronized (this) {
+                if (!started) throw new IllegalStateException("no active gesture");
+                // The watchdog may have released while checkScope was running.
+                // Let that owner report its reason; never revive the contact.
+                if (finished) return null;
+                String expired = expiryReason();
+                if (expired != null) return expired; // Never revive an expired contact.
+                heartbeatDeadline = input.uptime() + HEARTBEAT_TIMEOUT_MS;
+                return null; // The original duration/deadline and downTime never change.
+            }
+        }
+
+        synchronized String expiryReason() {
+            if (finished) return null;
+            long now = input.uptime();
+            if (!started) return now >= idleDeadline ? "idle_timeout" : null;
+            if (now >= deadline) return "deadline";
+            return now >= heartbeatDeadline ? "heartbeat_timeout" : null;
         }
 
         synchronized void release() throws Exception {
@@ -289,7 +312,7 @@ public final class BoundedTouch {
     }
 
     private static synchronized void reply(String message) {
-        System.out.println("T2T1 " + message);
+        System.out.println("T2T2 " + message);
         System.out.flush();
     }
 
@@ -323,14 +346,15 @@ public final class BoundedTouch {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 try { active.release(); } catch (Exception ignored) { }
             }));
-            // Device-side lease is independent of the host, ADB connection and stdin reader.
+            // Requested duration and lost-host timeout are separate. Neither
+            // a blocked scope check nor a missing host UP may block this watchdog.
             Thread watchdog = new Thread(() -> {
-                long idleLimit = input.uptime() + 5000;
                 try {
                     while (true) {
-                        if (active.expired() || input.uptime() >= idleLimit) {
+                        String expired = active.expiryReason();
+                        if (expired != null) {
                             active.release();
-                            reply("RELEASED deadline");
+                            reply("RELEASED " + expired);
                             System.exit(0);
                         }
                         Thread.sleep(10);
@@ -372,9 +396,17 @@ public final class BoundedTouch {
                     frame.start();
                 } else if (parts.length == 6 && parts[0].equals("START")) {
                     if (capturing.get()) throw new IllegalArgumentException("frame pending");
-                    active.begin(Integer.parseInt(parts[1]), Float.parseFloat(parts[2]),
+                    active.begin(Long.parseLong(parts[1]), Float.parseFloat(parts[2]),
                             Float.parseFloat(parts[3]), Float.parseFloat(parts[4]), Float.parseFloat(parts[5]));
                     reply("STARTED");
+                } else if (parts.length == 1 && parts[0].equals("KEEPALIVE")) {
+                    String expired = active.keepAlive();
+                    if (expired != null) {
+                        active.release();
+                        reply("RELEASED " + expired);
+                        return;
+                    }
+                    reply("ALIVE");
                 } else if (parts.length == 3 && parts[0].equals("MOVE")) {
                     if (capturing.get()) throw new IllegalArgumentException("frame pending");
                     if (!active.move(Float.parseFloat(parts[1]), Float.parseFloat(parts[2]))) break;

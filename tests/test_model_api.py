@@ -104,6 +104,7 @@ def test_multimodal_request_schema_history_and_reset(tmp_path: Path) -> None:
     assert "reasoning_effort" not in first
     assert first["response_format"]["json_schema"]["strict"] is True
     assert first["response_format"]["json_schema"]["schema"] == SCHEMA
+    assert json.dumps(SCHEMA, separators=(",", ":")) not in first["messages"][0]["content"]
     assert KEY not in json.dumps(first)
     images = first["messages"][-1]["content"][1:]
     assert [
@@ -177,6 +178,38 @@ def test_json_object_mode_omits_strict_schema() -> None:
     _turn(session)
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert json.dumps(SCHEMA, separators=(",", ":")) in calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize('response_format', ['json_schema', 'json_object'])
+def test_schema_changes_for_review_without_accumulating_in_history(response_format):
+    from trace2task.chat_model_adapter import _REVIEW_SCHEMA
+
+    calls = []
+    replies = iter(['{"actions": ["wait"]}',
+                    '{"verdict":"unknown","evidence":"dialog visible","missing":"completion"}'])
+    session = ModelAPISession(
+        ModelAPIConfig(api_key=KEY, response_format=response_format), model='vision-model',
+        requester=lambda config, payload: calls.append(payload) or _completion(next(replies)),
+    )
+    session.system_guidance = 'Use only visible evidence.'
+    for schema in (SCHEMA, _REVIEW_SCHEMA):
+        session.run_turn(prompt='Inspect the screen.', image_path=None, output_schema=schema)
+        request = calls[-1]
+        contract = request['messages'][0]['content']
+        serialized = json.dumps(schema, separators=(',', ':'))
+        assert 'Return only a JSON object' in contract
+        assert session.system_guidance in contract
+        if response_format == 'json_schema':
+            assert request['response_format']['json_schema'] == {
+                'name': 'trace2task_plan', 'strict': True, 'schema': schema,
+            }
+            assert serialized not in contract
+        else:
+            assert request['response_format'] == {'type': 'json_object'}
+            assert contract.count(serialized) == 1
+    assert [item['role'] for item in calls[1]['messages']] == ['system', 'user', 'assistant', 'user']
+    assert json.dumps(SCHEMA, separators=(',', ':')) not in calls[1]['messages'][0]['content']
+    assert all(message['role'] != 'system' for message in session._history)
 
 
 @pytest.mark.parametrize(

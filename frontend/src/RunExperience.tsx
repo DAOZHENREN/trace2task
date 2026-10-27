@@ -1,10 +1,11 @@
 import {useEffect, useState} from 'react';
-import {Button, Checkbox, Dialog, DialogActions, DialogBody, DialogContent, DialogSurface, DialogTitle, Spinner} from '@fluentui/react-components';
+import {Button, Checkbox, Dialog, DialogActions, DialogBody, DialogContent, DialogSurface, DialogTitle, Radio, RadioGroup, Spinner, Textarea} from '@fluentui/react-components';
 import {api} from './api';
 import {useConfirm} from './ConfirmDialog';
 import {active} from './types';
-import type {AppState, CompilationConfirmation, ExperienceLineage, ModelChoice, Run} from './types';
-import {Icon} from './ui';
+import type {AppState, CompilationConfirmation, ExperienceLineage, ExperienceVersioning, ModelChoice, Run, Trace} from './types';
+import {Choice, Field, Icon} from './ui';
+import {versionLabel} from './experience';
 import {CompilerChoice, useAction} from './workflow';
 
 type Summary = {run_id: string; instruction: string; status: string; outcome: string; stop_reason: string;
@@ -17,6 +18,9 @@ type Preview = Summary & {source_sha256: string; input: string; images: Picture[
   image_selection?: {rule: string};
   drafts: {draft_id: string; trace_name: string; created_at: string; saved_trace_id: string | null}[]};
 type Draft = {draft_id: string; draft_sha256: string; content: string; trace_name: string; description: string;
+  save_options?: {default_mode: ExperienceVersioning['mode']; default_parent_id: string; revision_targets: (Trace & {version_revision: number})[]};
+  saved_versioning?: ExperienceVersioning | null;
+  authoring?: {kind: string; guidance: string; revision: number} | null;
   lineage?: ExperienceLineage | null; parent_content?: string; revision_diff?: string; revision_changed?: boolean | null;
   saved_trace_id: string | null; summary: Summary; compiler_images: Picture[]};
 const scopeLabel = (scope: string) => ({android: 'Android · 指定应用', desktop: '桌面', selected_windows: '指定窗口', browser: '独立浏览器'}[scope] || scope);
@@ -40,12 +44,20 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
   const [preview, setPreview] = useState<Preview | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [reviewed, setReviewed] = useState(false);
+  const [saveMode, setSaveMode] = useState<ExperienceVersioning['mode']>('independent');
+  const [revisionParent, setRevisionParent] = useState('');
   const [error, setError] = useState('');
+  const [guidance, setGuidance] = useState('');
+  const [feedback, setFeedback] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [editedContent, setEditedContent] = useState('');
+  const [selectedDraft, setSelectedDraft] = useState<string | null>(null);
   const [model, setModel] = useState<ModelChoice>(state.agent_options.compiler_defaults || state.agent_options.defaults);
   const {pending, perform} = useAction(setError);
   const confirm = useConfirm();
   const generated = run.result?.experience_draft_id;
-  useEffect(() => {setOpen(false); setPreview(null); setDraft(null); setReviewed(false); setError('');}, [run.job_id]);
+  useEffect(() => {setOpen(false); setPreview(null); setDraft(null); setReviewed(false); setError('');
+    setGuidance(''); setFeedback(''); setEditing(false); setSelectedDraft(null);}, [run.job_id]);
   const eligible = run.kind === 'agent' && !active(run);
   if (!eligible && !generated && run.kind !== 'experience_compilation') return null;
   const source = draft?.summary || preview;
@@ -54,15 +66,22 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
   const lineage = draft?.lineage || preview?.lineage;
   const previouslyUsed = run.run_facts?.experience_id || run.memory_selection?.selected?.id || run.result?.memory_selection?.selected?.id;
   const pictures = draft?.compiler_images || preview?.images || [];
+  const revisionTargets = draft?.save_options?.revision_targets || [];
+  const revisionTarget = revisionTargets.find(t => t.id === revisionParent);
+  function receiveDraft(result: Draft) {
+    setDraft(result); setSelectedDraft(result.draft_id); setReviewed(false); setEditing(false); setFeedback('');
+    setSaveMode(result.saved_versioning?.mode || result.save_options?.default_mode || 'independent');
+    setRevisionParent(result.saved_versioning?.parent_id || result.save_options?.default_parent_id || '');
+  }
   async function readDraft(id: string) {
     setError('');
     const result = await api<Draft>('/api/run-experience/draft', {draft_id: id});
-    setDraft(result); setReviewed(false);
+    receiveDraft(result);
   }
   async function inspect() {
     await perform('preview', async () => {
       setError(''); setPreview(null); setDraft(null); setReviewed(false); setOpen(true);
-      if (generated) await readDraft(generated);
+      if (selectedDraft || generated) await readDraft(selectedDraft || generated!);
       else setPreview(await api<Preview>('/api/run-experience/preview', {run_id: run.job_id}));
     });
   }
@@ -70,7 +89,7 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
     if (!preview) return;
     await perform('generate', async () => {
       setError('');
-      const payload = {run_id: run.job_id, source_sha256: preview.source_sha256, ...model};
+      const payload = {run_id: run.job_id, source_sha256: preview.source_sha256, guidance, ...model};
       let result = await api<Run | CompilationConfirmation>('/api/run-experience/generate', payload);
       if ('confirmation_required' in result) {
         if (!await confirm({title: '再次提炼这次运行？', body: result.message, confirmLabel: '再次提炼',
@@ -81,13 +100,38 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
       setOpen(false); onRun(result);
     });
   }
+  const unsavedEdit = editing && editedContent !== draft?.content;
+  async function dismiss() {
+    if (!canDismiss) return;
+    if (unsavedEdit && !await confirm({title: '放弃未保存的编辑？', body: '当前正文的修改还没有保存为新草稿。', confirmLabel: '放弃编辑'})) return;
+    setEditing(false); setOpen(false);
+  }
+  async function applyEdit() {
+    if (!draft) return;
+    await perform('edit', async () => {
+      const result = await api<Draft>('/api/run-experience/edit', {
+        draft_id: draft.draft_id, draft_sha256: draft.draft_sha256, content: editedContent});
+      receiveDraft(result);
+    });
+  }
+  async function revise() {
+    if (!draft || !feedback.trim() || unsavedEdit) return;
+    await perform('revise', async () => {
+      const result = await api<Run>('/api/run-experience/generate', {
+        draft_id: draft.draft_id, draft_sha256: draft.draft_sha256, guidance: feedback, ...model});
+      setOpen(false); onRun(result);
+    });
+  }
   async function save() {
-    if (!draft || !reviewed) return;
+    if (!draft || !reviewed || (saveMode === 'revision' && !revisionTarget)) return;
     await perform('save', async () => {
       setError('');
-      const result = await api<{id: string}>('/api/run-experience/save', {
-        draft_id: draft.draft_id, draft_sha256: draft.draft_sha256, confirmed: true});
-      setDraft({...draft, saved_trace_id: result.id});
+      const result = await api<{id: string; versioning?: ExperienceVersioning}>('/api/run-experience/save', {
+        draft_id: draft.draft_id, draft_sha256: draft.draft_sha256, confirmed: true, save_mode: saveMode,
+        ...(saveMode === 'revision' && revisionTarget ? {revision_parent_id: revisionTarget.id,
+          expected_revision: revisionTarget.version_revision} : {})});
+      setDraft({...draft, saved_trace_id: result.id, saved_versioning: result.versioning || {
+        mode: saveMode, parent_id: saveMode === 'revision' ? revisionParent : null}});
     });
   }
   const compiling = run.kind === 'experience_compilation' && active(run);
@@ -98,15 +142,15 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
       <div className="experience-invitation-copy"><div className="eyebrow">让这一次，成为下一次的参考</div>
         <h3>{compiling ? '正在提炼这次运行…' : generated ? '经验手稿已就绪' : '把走过的步骤，留下来。'}</h3>
         <p>{compiling ? '仅分析历史轨迹，不操作设备；完成后先生成草稿。' : generated ? '先核对方法、完成判断与证据，再决定是否收入经验库。'
-          : previouslyUsed ? '把本次实际使用的原经验与执行反馈一起交给编译 Agent，形成有父版本关系的新方法；原版保留。'
+          : previouslyUsed ? '根据原经验与本次执行反馈提炼方法，保存时可接续原经验版本，也可建立新的独立经验。'
           : '从这次任务中提炼关键步骤、判断依据和注意事项。原始轨迹完整保留。'}</p></div>
       {compiling ? <Spinner size="small"/> : <Button appearance="primary" disabled={!!pending || (!eligible && !generated)}
         icon={<Icon name="arrow" size={16}/>} iconPosition="after" onClick={() => void inspect()}>
         {pending === 'preview' ? '正在读取…' : generated ? '审阅经验草稿' : '提炼为经验'}</Button>}
     </section>
-    {open && <Dialog open onOpenChange={(_, data) => {if (canDismiss) setOpen(data.open);}}>
+    {open && <Dialog open onOpenChange={(_, data) => {if (!data.open) void dismiss();}}>
       <DialogSurface className="experience-studio"><DialogBody>
-        <DialogTitle className="studio-title" action={<Button appearance="subtle" disabled={!canDismiss} onClick={() => setOpen(false)}>关闭</Button>}>
+        <DialogTitle className="studio-title" action={<Button appearance="subtle" disabled={!canDismiss} onClick={() => void dismiss()}>关闭</Button>}>
           <span className="eyebrow">TRACE COMPILE / EXPERIENCE STUDIO</span>经验手稿
         </DialogTitle>
         <DialogContent className="studio-content">
@@ -147,37 +191,86 @@ export function RunExperience({run, state, busy, onRun, onLibrary}: {
               <p className="quiet mono">RUN {source.run_id.slice(0, 12)}</p>
             </aside>
             <div className="studio-paper">{draft ? <>
-              <div className="paper-label"><span>{draft.saved_trace_id ? '已收入经验库' : parent ? '待核对的反馈修订草稿' : '待核对的经验草稿'}</span><span>{parent ? 'B · 反馈修订条件' : '方法 B · 纯文本'}</span></div>
-              <MethodText content={draft.content}/>
+              <div className="paper-label"><span>{draft.saved_trace_id ? '已收入经验库' : parent ? '待核对的反馈修订草稿' : '待核对的经验草稿'}</span><span>{draft.authoring ? draft.authoring.kind === 'edit' ? '人工编辑版' : '人工指导版' : parent ? 'B · 反馈修订条件' : '方法 B · 纯文本'}</span></div>
+              {editing ? <div className="studio-editor">
+                <label className="field"><span>经验正文（Markdown）</span><Textarea aria-label="经验正文（Markdown）" value={editedContent} resize="vertical"
+                  disabled={!!pending} onChange={(_, d) => {setEditedContent(d.value); setReviewed(false);}}/></label>
+                <p className="quiet">保留章节结构和真实的来源轮次引用。修改保存在新草稿中，原稿保留。</p>
+                <div className="studio-edit-actions"><Button disabled={!!pending || !unsavedEdit || !editedContent.trim()} onClick={() => void applyEdit()}>
+                  {pending === 'edit' ? '正在保存修改…' : '保存修改为新草稿'}</Button>
+                  <Button disabled={!!pending} onClick={() => {setEditing(false); setReviewed(false);}}>取消编辑</Button></div>
+              </div> : <><MethodText content={draft.content}/><Button disabled={!!pending || busy}
+                onClick={() => {setEditedContent(draft.content); setEditing(true); setReviewed(false);}}>直接编辑正文</Button></>}
+              <div className="studio-revision">
+                <label className="field"><span>希望怎样修改</span><Textarea value={feedback} resize="vertical" disabled={!!pending || busy}
+                  placeholder="例如：只保留酒店露台导航；补充容易走错的分岔，不要把试错动作写成必要步骤。"
+                  onChange={(_, d) => {setFeedback(d.value); setReviewed(false);}}/></label>
+                <p className="quiet">提交后会把当前草稿、修改意见和 {pictures.length} 张已冻结历史截图及轨迹证据交给所选 Codex 模型，生成新草稿；旧稿保留。</p>
+                <div className="studio-edit-actions"><Button disabled={busy || !!pending || !feedback.trim() || unsavedEdit}
+                  onClick={() => void revise()}>{pending === 'revise' ? '正在提交…' : '按意见修订'}</Button>
+                  {!!feedback && <Button disabled={!!pending} onClick={() => setFeedback('')}>清空意见</Button>}</div>
+                {unsavedEdit && <p className="quiet">请先保存正文修改，再提交修订意见或确认入库。</p>}
+                <details className="studio-settings"><summary>修订模型 · {model.model}</summary>
+                  <CompilerChoice state={state} value={model} onChange={setModel} disabled={!!pending || busy}/></details>
+              </div>
+              <Button appearance="subtle" disabled={!!pending} onClick={() => void perform('versions', async () => {
+                setPreview(await api<Preview>('/api/run-experience/preview', {run_id: draft.summary.run_id}));
+              })}>查看这次运行的其他草稿</Button>
+              {!!preview?.drafts.length && <div className="studio-existing">{preview.drafts.map(d => <Button key={d.draft_id}
+                appearance="subtle" disabled={!!pending || unsavedEdit} onClick={() => void perform('read', () => readDraft(d.draft_id))}>
+                {d.trace_name} · {d.saved_trace_id ? '已保存' : '草稿'} · {new Date(d.created_at).toLocaleString()}</Button>)}</div>}
               {draft.revision_changed === false && <p className="inline-warning">方法内容未变。本次未产生有证据支持的修改，不代表方法已经改善。</p>}
               {draft.revision_diff != null && <details className="studio-raw"><summary>与父方法的文本差异</summary><pre>{draft.revision_diff || '无文本差异'}</pre></details>}
               <details className="studio-raw"><summary>查看完整 Markdown 原文</summary><pre>{draft.content}</pre></details>
-              <div className="studio-review">{draft.saved_trace_id ? <p role="status"><Icon name="check" size={18}/>{parent ? '已保存带父版本关系的反馈修订版，原方法保留；后续自动检索优先提供同一谱系最新已确认版本。没有启动新任务。' : '已保存独立经验版本。没有启动新任务，也没有自动选为任务经验。'}</p>
-                : <Checkbox checked={reviewed} disabled={!!pending} onChange={(_, d) => setReviewed(d.checked === true)}
-                    label={parent ? '我已核对原经验、本次反馈与修订内容，同意保存新版本供后续检索；这不代表效果提升。' : '我已核对方法与来源，理解保存不代表独立验证成功。'}/>}</div>
+              {!draft.saved_trace_id && <div className="studio-save-options">
+                <h3>保存方式</h3>
+                <RadioGroup aria-label="保存方式" value={saveMode} disabled={busy || !!pending || unsavedEdit}
+                  onChange={(_, data) => {setSaveMode(data.value as ExperienceVersioning['mode']); setReviewed(false);}}>
+                  <Radio value="revision" label="成为已有经验的新版本" disabled={!revisionTargets.length}/>
+                  <Radio value="independent" label="成为新的独立经验"/>
+                </RadioGroup>
+                {saveMode === 'revision' ? <>
+                  <Field label="接续哪份经验"><Choice value={revisionParent} disabled={busy || !!pending || unsavedEdit}
+                    onChange={event => {setRevisionParent(event.target.value); setReviewed(false);}}>
+                    <option value="">请选择要更新的经验</option>
+                    {revisionTargets.map(target => <option key={target.id} value={target.id}>{versionLabel(target)}</option>)}
+                  </Choice></Field>
+                  <p className="quiet">保存后成为所选经验的当前版本，原当前版本进入历史；后续自动选择只使用新版本。</p>
+                </> : <p className="quiet">建立自己的版本历史，已有经验的当前版本不变。来源证据仍保留，可作为独立候选参与后续自动检索。</p>}
+                {!revisionTargets.length && <p className="quiet">暂无范围匹配的已有方法，可先保存为独立经验。</p>}
+              </div>}
+              <div className="studio-review">{draft.saved_trace_id ? <p role="status"><Icon name="check" size={18}/>{draft.saved_versioning?.mode === 'independent'
+                ? '已保存为新的独立经验，已有经验的当前版本保持不变；没有启动新任务。'
+                : draft.saved_versioning?.mode === 'revision' ? '已保存为新版本，原当前版本保留在版本历史中；没有启动新任务。'
+                : '已保存到经验库，可查看当前版本和版本历史；没有启动新任务。'}</p>
+                : <Checkbox checked={reviewed} disabled={!!pending || unsavedEdit || !!feedback.trim()} onChange={(_, d) => setReviewed(d.checked === true)}
+                    label={`我已核对方法、来源和保存方式，同意${saveMode === 'revision' ? '保存为所选经验的新版本' : '保存为新的独立经验'}；保存不代表独立验证成功。`}/>}</div>
             </> : <>
-              <div className="paper-label"><span>{parent ? '原经验 + 本次反馈 → 新版本' : '从一次执行，到一份方法'}</span><Icon name="record" size={18}/></div>
+              <div className="paper-label"><span>{parent ? '原经验 + 本次反馈 → 方法草稿' : '从一次执行，到一份方法'}</span><Icon name="record" size={18}/></div>
               <h2>{parent ? <>用这次反馈，<br/>修订原方法。</> : <>留下判断，<br/>不只是点击。</>}</h2>
               <p className="studio-lead">{parent ? '保留仍有依据的原步骤，只根据本次证据修改、补充或标注不确定性。未执行到的旧步骤不等于无效；新旧版本不会覆盖。' : '把零散的动作整理成可读、可核对的步骤。相同方法可作为新任务的参考，具体操作仍以当前观察为准。'}</p>
               <div className="studio-outline">{[
-                ['01', '适用条件', '在什么场景下参考这份经验'], ['02', '关键步骤', '保留顺序与判断，合并机械等待'],
-                ['03', '完成判断', '说明需要看到什么，不把点击当成功'], ['04', '注意与局限', '保留失败教训与尚未证实的部分'],
+                ['01', '进入条件', '识别当前状态，找到适用的任务阶段'], ['02', '阶段操作', '保留关键顺序，合并重复移动和等待'],
+                ['03', '反馈判断', '说明观察什么、何时继续或转入分支'], ['04', '独立方法', '写全流程与条件，直接用于新的任务'],
               ].map(([number, title, text]) => <div key={number}><span>{number}</span><div><h4>{title}</h4><p>{text}</p></div></div>)}</div>
               {!!preview?.drafts.length && <div className="studio-existing"><h4>这次运行已有手稿</h4>{preview.drafts.map(d => <Button key={d.draft_id}
                 appearance="subtle" disabled={!!pending} onClick={() => void perform('read', () => readDraft(d.draft_id))}>{d.trace_name} · {d.saved_trace_id ? '已保存' : '草稿'}</Button>)}</div>}
+              <label className="field studio-guidance"><span>提炼要求（可选）</span><Textarea value={guidance} resize="vertical"
+                disabled={!!pending || busy} onChange={(_, d) => setGuidance(d.value)}
+                placeholder="指定要保留的部分、重点、详略或应避免的结论。生成后还可以编辑或提出修改意见。"/></label>
               <details className="studio-settings"><summary>提炼设置 · {model.model}</summary>
                 <CompilerChoice state={state} value={model} onChange={setModel} disabled={!!pending || busy}/></details>
-              <div className="studio-disclosure"><Icon name="shield" size={17}/><p>点击生成后，将{parent ? '实际使用的原经验全文、' : ''}本次任务、动作与回执、模型回答{source.assisted_by_user ? '、人工指令与接管说明' : ''}及 {source.image_count} 张历史截图发送到 Codex 订阅服务。请先确认经验和截图中没有不希望发送的敏感内容。只调用一次模型，不操作设备，不自动入库。</p></div>
+              <div className="studio-disclosure"><Icon name="shield" size={17}/><p>点击生成后，将提炼要求、{parent ? '实际使用的原经验方法、' : ''}本次任务、动作与回执、模型回答{source.assisted_by_user ? '、人工指令与接管说明' : ''}及 {source.image_count} 张历史截图发送到 Codex 订阅服务。请先确认经验和截图中没有不希望发送的敏感内容。只调用一次模型，不操作设备，不自动入库。</p></div>
               <details className="studio-raw"><summary>查看实际发送的任务证据</summary><pre>{preview?.input}</pre></details>
-              <p className="quiet">审计 SHA、文件路径与来源校验留在本地，不作为编译证据发送。相同动作按引用去重，保留全部轮次、判断、执行差异和人工说明；原始记录不改写。</p>
+              <p className="quiet">审计 SHA、文件路径与来源校验留在本地，不作为编译证据发送。逐轮简表保留判断、交付状态和人工说明；普通坐标、机械时长与重复回执留在本地，相同图片只发送一次。方法正文按阶段组织，不含轮次引用或修订报告。</p>
               <p className="quiet">不设固定文本大小或轮数上限。输入仍受所选模型的实际上下文容量约束；服务端拒绝时会保留记录并显示错误。</p>
             </>}</div>
           </div>}
         </DialogContent>
         <DialogActions className="studio-actions"><span className="quiet">{draft ? '保存的是方法，原始运行记录不会改动。' : '先生成草稿，再由你核对保存。'}</span>
-          <Button disabled={!canDismiss} onClick={() => setOpen(false)}>{draft ? '稍后再看' : '暂不提炼'}</Button>
+          <Button disabled={!canDismiss} onClick={() => void dismiss()}>{draft ? '稍后再看' : '暂不提炼'}</Button>
           {draft?.saved_trace_id ? <Button appearance="primary" onClick={() => {setOpen(false); onLibrary?.(draft.saved_trace_id!);}}>到经验库查看</Button>
-            : draft ? <Button appearance="primary" disabled={busy || !!pending || !reviewed} onClick={() => void save()}>{pending === 'save' ? '正在保存…' : '保存到经验库'}</Button>
+            : draft ? <Button appearance="primary" disabled={busy || !!pending || !reviewed || unsavedEdit || !!feedback.trim() || (saveMode === 'revision' && !revisionTarget)} onClick={() => void save()}>{pending === 'save' ? '正在保存…' : '保存到经验库'}</Button>
               : <Button appearance="primary" disabled={busy || !!pending || !preview} onClick={() => void generate()}>{pending === 'generate' ? '正在提交…' : '生成经验草稿'}</Button>}
         </DialogActions>
       </DialogBody></DialogSurface>

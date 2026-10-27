@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -14,15 +16,6 @@ from typing import Any, Protocol, TextIO
 
 from trace2task import __version__
 
-CODEX_SELECTABLE_MODELS = ("gpt-6.1-sol", "gpt-6-luna")
-# Accept explicitly pinned historical jobs without offering old models in new jobs.
-CODEX_MODELS = CODEX_SELECTABLE_MODELS + (
-    "gpt-6-sol",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-)
-
 _CODEX_CONNECTIVITY_ERROR_MARKERS = (
     "network reconnect",
     "tls handshake",
@@ -32,12 +25,24 @@ _CODEX_CONNECTIVITY_ERROR_MARKERS = (
 )
 
 
-class CodexTurnTimeoutError(RuntimeError):
-    """A model turn missed a specific response-progress deadline."""
+_CODEX_RATE_LIMIT_PATTERN = re.compile(
+    r"\b(?:HTTP\s+429|status:\s*429|429\s+Too Many Requests|rate limit exceeded)\b",
+    re.IGNORECASE,
+)
+_SYSTEM_ERROR_GRACE_SECONDS = 1.0
 
-    def __init__(self, category: str, message: str) -> None:
+
+class CodexTurnError(RuntimeError):
+    """A classified model failure with bounded, run-local diagnostic evidence."""
+
+    def __init__(self, category: str, message: str, *, diagnostics: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.category = category
+        self.diagnostics = diagnostics or {}
+
+
+class CodexTurnTimeoutError(CodexTurnError):
+    """A model turn missed a specific response-progress deadline."""
 
 
 class _CodexReceiveTimeout(RuntimeError):
@@ -45,19 +50,81 @@ class _CodexReceiveTimeout(RuntimeError):
 
 
 def classify_codex_failure(error: BaseException) -> str | None:
-    """Classify transport and progress timeouts without treating all delays as network faults."""
+    """Prefer explicit model errors over generic transport wording in wrappers."""
 
     current: BaseException | None = error
     seen: set[int] = set()
+    inferred = None
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, CodexTurnTimeoutError):
+        if isinstance(current, CodexTurnError):
             return current.category
         text = str(current).casefold()
-        if any(marker in text for marker in _CODEX_CONNECTIVITY_ERROR_MARKERS):
-            return "codex_connectivity"
+        if _CODEX_RATE_LIMIT_PATTERN.search(text):
+            inferred = "codex_rate_limit"
+        elif inferred is None and any(marker in text for marker in _CODEX_CONNECTIVITY_ERROR_MARKERS):
+            inferred = "codex_connectivity"
         current = current.__cause__ or current.__context__
-    return None
+    return inferred
+
+
+def _codex_error_details(error: Any) -> tuple[str, dict[str, Any]]:
+    error = error if isinstance(error, dict) else {}
+    info = error.get("codexErrorInfo")
+    code = info if isinstance(info, str) else None
+    http_status = None
+    if isinstance(info, dict) and len(info) == 1:
+        code, detail = next(iter(info.items()))
+        if isinstance(detail, dict):
+            http_status = detail.get("httpStatusCode")
+    category = {
+        "contextWindowExceeded": "codex_context_limit",
+        "sessionBudgetExceeded": "codex_usage_limit",
+        "usageLimitExceeded": "codex_usage_limit",
+        "rateLimitExceeded": "codex_rate_limit",
+        "serverOverloaded": "codex_server_error",
+        "internalServerError": "codex_server_error",
+        "httpConnectionFailed": "codex_connectivity",
+        "responseStreamConnectionFailed": "codex_connectivity",
+        "responseStreamDisconnected": "codex_connectivity",
+        "responseTooManyFailedAttempts": "codex_connectivity",
+    }.get(code, "codex_error")
+    if http_status == 403:
+        category = "codex_access_denied"
+    elif http_status == 429 or _CODEX_RATE_LIMIT_PATTERN.search(str(error.get("message", ""))):
+        category = "codex_rate_limit"
+    elif isinstance(http_status, int) and http_status >= 500:
+        category = "codex_server_error"
+    return category, {"error_code": code, "http_status_code": http_status}
+
+
+def _stderr_retry_notice(line: str) -> dict[str, Any] | None:
+    # This CLI version reports long 429 backoffs only through structured stderr,
+    # before emitting any protocol error. Copy metadata, never the raw log text.
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entry, dict) or entry.get("target") != "codex_core::responses_retry":
+        return None
+    fields = entry.get("fields")
+    if not isinstance(fields, dict):
+        return None
+    turn_id = fields.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        return None
+    if not _CODEX_RATE_LIMIT_PATTERN.search(str(fields.get("sampling_error", ""))):
+        return None
+    match = re.search(r"\bin ([0-9]+(?:\.[0-9]+)?)s\b", str(fields.get("message", "")))
+    delay = float(match.group(1)) if match else None
+    if delay is not None and not math.isfinite(delay):
+        delay = None
+    params = {"turnId": turn_id, "httpStatusCode": 429, "retryAfterSeconds": delay}
+    for source, key in (("retries", "retryAttempt"), ("max_retries", "maxRetries")):
+        value = fields.get(source)
+        if type(value) is int and value >= 0:
+            params[key] = value
+    return {"method": "trace2task/codexRetry", "params": params}
 
 
 def is_codex_connectivity_error(error: BaseException) -> bool:
@@ -66,7 +133,8 @@ def is_codex_connectivity_error(error: BaseException) -> bool:
     return classify_codex_failure(error) == "codex_connectivity"
 
 
-CODEX_REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Protocol values only. Picker availability comes from model/list per model.
+CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "low"
 
@@ -98,6 +166,13 @@ class StdioJsonTransport:
 
     def __init__(self, codex_executable: str, *, command: list[str] | None = None) -> None:
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        # GUI launches may not inherit the Codex shell's JSON logging settings.
+        # Retry warnings are part of our stderr protocol, including silent 429s.
+        child_env = os.environ.copy()
+        child_env["LOG_FORMAT"] = "json"
+        child_env["RUST_LOG"] = (
+            f"{child_env.get('RUST_LOG') or 'warn'},codex_core::responses_retry=warn"
+        )
         try:
             self._process = subprocess.Popen(
                 command if command is not None else [codex_executable, "app-server"],
@@ -109,6 +184,7 @@ class StdioJsonTransport:
                 errors="replace",
                 bufsize=1,
                 creationflags=creation_flags,
+                env=child_env,
             )
         except FileNotFoundError as error:
             raise RuntimeError(
@@ -163,6 +239,10 @@ class StdioJsonTransport:
             for line in stream:
                 if line.strip():
                     self._stderr_lines.append(line.rstrip())
+                    notice = _stderr_retry_notice(line)
+                    if notice is not None:
+                        # Wake a receive blocked on stdout while Codex sleeps.
+                        self._messages.put(notice)
         except (OSError, ValueError):
             return
 
@@ -194,6 +274,18 @@ class StdioJsonTransport:
         status = f" (exit code {exit_code})" if exit_code is not None else ""
         details = f": {stderr}" if stderr else ""
         return f"Codex App Server stopped unexpectedly{status}{details}"
+
+    def diagnostics(self) -> dict[str, Any]:
+        # Keep timeout evidence without copying credentials, URLs or message
+        # contents that a dependency might have written to stderr.
+        stderr = "\n".join(tuple(self._stderr_lines)).casefold()
+        return {
+            "process_pid": self._process.pid,
+            "process_exit_code": self._process.poll(),
+            "stderr_connectivity_markers": [
+                marker for marker in _CODEX_CONNECTIVITY_ERROR_MARKERS if marker in stderr
+            ],
+        }
 
     def close(self) -> None:
         if self._closed:
@@ -231,6 +323,10 @@ class CodexAppServerSession:
         transport_factory: TransportFactory = StdioJsonTransport,
         base_instructions: str | None = None,
         thread_config: dict[str, Any] | None = None,
+        wait_on_rate_limit: bool = False,
+        rate_limit_callback: Callable[[float | None], None] | None = None,
+        wait_while_active: bool = False,
+        active_wait_callback: Callable[[float], None] | None = None,
     ) -> None:
         if reasoning_effort not in CODEX_REASONING_EFFORTS:
             raise ValueError(
@@ -251,6 +347,16 @@ class CodexAppServerSession:
         self.timeout_seconds = timeout_seconds
         self.progress_timeout_seconds = progress_timeout_seconds
         self.hard_timeout_seconds = hard_timeout_seconds
+        self.wait_on_rate_limit = wait_on_rate_limit
+        self.rate_limit_callback = rate_limit_callback
+        # Callers opting in must retain their stop control / overall run budget.
+        # A live thread is evidence of an outstanding turn, not model progress.
+        self.wait_while_active = wait_while_active
+        self.active_wait_callback = active_wait_callback
+        self.last_turn_wait_extended = False
+        self._rate_limit_started: float | None = None
+        self._rate_limit_until = 0.0
+        self.last_rate_limit_wait_seconds = 0.0
         self._transport = transport_factory(codex_executable)
         self._request_id = 0
         self._thread_id: str | None = None
@@ -269,6 +375,11 @@ class CodexAppServerSession:
     def start(self) -> str:
         if self._thread_id is not None:
             return self._thread_id
+        self.initialize()
+        return self._start_thread()
+
+    def initialize(self) -> None:
+        """Connect without starting a conversation or requesting inference."""
         if not self._initialized:
             self._request(
                 "initialize",
@@ -282,6 +393,27 @@ class CodexAppServerSession:
             )
             self._send({"method": "initialized", "params": {}})
             self._initialized = True
+
+    def list_models(self) -> list[dict[str, Any]]:
+        self.initialize()
+        models, seen = [], set()
+        cursor = None
+        while True:
+            params = {"limit": 100, "includeHidden": False}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = self._request("model/list", params)
+            if not isinstance(result.get("data"), list):
+                raise TypeError("Codex model/list returned no model catalog")
+            models.extend(result["data"])
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return models
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError("Codex model/list returned an invalid pagination cursor")
+            seen.add(cursor)
+
+    def _start_thread(self) -> str:
         params: dict[str, Any] = {
             "cwd": str(self.cwd),
             "approvalPolicy": "never",
@@ -311,7 +443,29 @@ class CodexAppServerSession:
         self._thread_id = None
         self.context_near_limit = False
 
-    def run_turn(
+    def _rate_limit_elapsed(self) -> float:
+        pending = (max(0.0, min(time.monotonic(), self._rate_limit_until) - self._rate_limit_started)
+                   if self._rate_limit_started is not None else 0.0)
+        return self.last_rate_limit_wait_seconds + pending
+
+    def _finish_rate_limit_wait(self) -> None:
+        if self._rate_limit_started is None:
+            return
+        self.last_rate_limit_wait_seconds = self._rate_limit_elapsed()
+        self._rate_limit_started = None
+        self._rate_limit_until = 0.0
+        if self.rate_limit_callback is not None:
+            self.rate_limit_callback(None)
+
+    def run_turn(self, **kwargs: Any) -> str:
+        self.last_rate_limit_wait_seconds = 0.0
+        self.last_turn_wait_extended = False
+        try:
+            return self._run_turn(**kwargs)
+        finally:
+            self._finish_rate_limit_wait()
+
+    def _run_turn(
         self,
         *,
         prompt: str,
@@ -375,49 +529,249 @@ class CodexAppServerSession:
         turn_id = turn["id"]
         completion_started = time.perf_counter()
         response_progress_seen = False
+        last_response_progress_at: float | None = None
+        last_event: dict[str, Any] | None = None
+        pending_rate_limit: dict[str, Any] | None = None
+        last_retry_error: tuple[str, dict[str, Any]] | None = None
+        system_error_deadline: float | None = None
+        wait_failure: tuple[str, str] | None = None
+        wait_failure_deadline: float | None = None
+
+        def turn_error(category: str, message: str, **details: Any) -> CodexTurnError:
+            diagnostics = {
+                "thread_id": thread_id, "turn_id": turn_id,
+                "turn_elapsed_seconds": round(time.monotonic() - turn_started_at, 3),
+                "model_progress_seen": response_progress_seen,
+                "last_event": last_event,
+                **details,
+            }
+            audit = getattr(self, "audit", None)
+            if audit is not None:
+                audit.record("codex_turn_error", category=category, **diagnostics)
+            return CodexTurnError(category, message, diagnostics=diagnostics)
+
+        def system_error() -> CodexTurnError:
+            category, details = last_retry_error or ("codex_thread_error", {})
+            message = "Codex thread entered systemError"
+            http_status = details.get("http_status_code")
+            if http_status is not None:
+                message += f"; last retry failed with HTTP {http_status}"
+                if http_status == 403:
+                    message += " Forbidden"
+            return turn_error(category, message, thread_status="systemError",
+                              error_source="last_retry" if last_retry_error else "thread_status",
+                              **details)
+
+        def timeout_error(category: str, message: str) -> CodexTurnTimeoutError:
+            now = time.monotonic()
+            diagnostics = {
+                "thread_id": thread_id, "turn_id": turn_id,
+                "turn_elapsed_seconds": round(now - turn_started_at, 3),
+                "model_progress_seen": response_progress_seen,
+                "model_progress_idle_seconds": (
+                    round(now - last_response_progress_at, 3)
+                    if last_response_progress_at is not None else None
+                ),
+                "last_event": last_event,
+                "timeout_seconds": self.timeout_seconds,
+                "progress_timeout_seconds": self.progress_timeout_seconds,
+                "hard_timeout_seconds": self.hard_timeout_seconds,
+            }
+            transport_diagnostics = getattr(self._transport, "diagnostics", None)
+            if callable(transport_diagnostics):
+                diagnostics["transport"] = transport_diagnostics()
+            audit = getattr(self, "audit", None)
+            if audit is not None:
+                audit.record("codex_timeout", category=category, **diagnostics)
+            return CodexTurnTimeoutError(category, message, diagnostics=diagnostics)
 
         while True:
+            if self._rate_limit_started is not None and time.monotonic() >= self._rate_limit_until:
+                self._finish_rate_limit_wait()
+            # Only a known upstream cooldown pauses the clocks. Health checks
+            # below extend the receive wait, never the caller's execution budget.
+            pause = self._rate_limit_elapsed() + max(0.0, self._rate_limit_until - time.monotonic())
             active_deadline = (
                 min(deadline, hard_deadline) if hard_deadline is not None else deadline
-            )
+            ) + pause
+            if wait_failure_deadline is not None:
+                active_deadline = min(active_deadline, wait_failure_deadline)
+            if system_error_deadline is not None:
+                active_deadline = min(active_deadline, system_error_deadline)
             try:
                 message = self._receive(active_deadline)
             except _CodexReceiveTimeout as error:
-                if hard_deadline is not None and active_deadline >= hard_deadline:
-                    raise CodexTurnTimeoutError(
+                if system_error_deadline is not None:
+                    raise system_error() from error
+                if wait_failure is not None:
+                    raise turn_error(*wait_failure) from error
+                if hard_deadline is not None and deadline >= hard_deadline:
+                    raise timeout_error(
                         "hard_timeout",
                         "Codex model response exceeded the hard limit of "
                         f"{self.hard_timeout_seconds:g} seconds",
                     ) from error
-                if response_progress_seen:
-                    idle_seconds = self.progress_timeout_seconds or self.timeout_seconds
-                    raise CodexTurnTimeoutError(
-                        "response_in_progress_timeout",
-                        "Codex model response stopped before completion; no progress arrived for "
-                        f"{idle_seconds:g} seconds",
+                if self.wait_while_active:
+                    # Read metadata only: ephemeral threads reject includeTurns.
+                    # This is not a retry and must never issue another turn/start.
+                    self.last_turn_wait_extended = True
+                    status, check_error = None, None
+                    check_deadline = time.monotonic() + 5
+                    if hard_deadline is not None:
+                        check_deadline = min(check_deadline, hard_deadline + pause)
+                    try:
+                        thread = self._request(
+                            "thread/read", {"threadId": thread_id, "includeTurns": False},
+                            deadline=check_deadline,
+                        ).get("thread")
+                        if isinstance(thread, dict) and thread.get("id") == thread_id:
+                            status = thread.get("status")
+                        if not isinstance(status, dict):
+                            status = {}
+                    except (RuntimeError, TypeError) as check_exception:
+                        # Keep only the error type, never raw remote log contents.
+                        check_error = type(check_exception).__name__
+                        status = {}
+                    status_type = status.get("type")
+                    elapsed = time.monotonic() - turn_started_at
+                    audit = getattr(self, "audit", None)
+                    if audit is not None:
+                        audit.record("codex_wait_status", thread_id=thread_id, turn_id=turn_id,
+                                     turn_elapsed_seconds=round(elapsed, 3),
+                                     status=status_type, check_error=check_error)
+                    if status_type == "active":
+                        deadline = time.monotonic() - self._rate_limit_elapsed() + 60
+                        if self.active_wait_callback is not None:
+                            self.active_wait_callback(elapsed)
+                    else:
+                        # A completion/error may have arrived during thread/read.
+                        # _request defers notifications; drain them before failing.
+                        # idle can precede turn/completed, so allow a short grace.
+                        grace = (5 if status_type == "idle" else
+                                 _SYSTEM_ERROR_GRACE_SECONDS if status_type == "systemError" else 0)
+                        wait_failure_deadline = time.monotonic() + grace
+                        if status_type == "systemError":
+                            system_error_deadline = wait_failure_deadline
+                        deadline = wait_failure_deadline - self._rate_limit_elapsed()
+                        wait_failure = (
+                            ("codex_thread_error", f"Codex thread is {status_type} without a completed turn")
+                            if status_type in {"idle", "systemError", "notLoaded"} else
+                            ("codex_status_unavailable", ("Codex did not return a valid thread status "
+                             "within the bounded health check; no duplicate request was sent"))
+                        )
+                    continue
+                if pending_rate_limit is not None:
+                    raise turn_error(
+                        "codex_rate_limit",
+                        "Codex rate limited the request (HTTP 429); its retry did not finish "
+                        "within this turn's response deadline. Wait before retrying.",
+                        **pending_rate_limit,
                     ) from error
-                raise CodexTurnTimeoutError(
+                if response_progress_seen:
+                    if self.progress_timeout_seconds is not None:
+                        detail = (
+                            "Codex model response stopped before completion; no progress arrived for "
+                            f"{self.progress_timeout_seconds:g} seconds"
+                        )
+                    else:
+                        detail = f"Codex model response did not complete within {self.timeout_seconds:g} seconds"
+                    raise timeout_error("response_in_progress_timeout", detail) from error
+                raise timeout_error(
                     "first_token_timeout",
                     "Codex did not begin its model response within "
                     f"{self.timeout_seconds:g} seconds",
                 ) from error
+            except RuntimeError as error:
+                if system_error_deadline is not None:
+                    raise system_error() from error
+                raise
             if self._handle_server_request(message):
                 continue
             method = message.get("method")
+            params = message.get("params")
+            params = params if isinstance(params, dict) else {}
+            item = params.get("item")
+            item_type = item.get("type") if isinstance(item, dict) else None
+            last_event = {"method": method, "item_type": item_type,
+                          "at_seconds": round(time.monotonic() - turn_started_at, 3)}
+            if method == "trace2task/codexRetry" and params.get("turnId") == turn_id:
+                delay = params.get("retryAfterSeconds")
+                pending_rate_limit = {
+                    "http_status_code": params.get("httpStatusCode"),
+                    "retry_after_seconds": delay,
+                    "retry_attempt": params.get("retryAttempt"),
+                    "max_retries": params.get("maxRetries"),
+                }
+                last_retry_error = ("codex_rate_limit", dict(pending_rate_limit))
+                audit = getattr(self, "audit", None)
+                if audit is not None:
+                    audit.record("codex_retry", thread_id=thread_id, turn_id=turn_id,
+                                 **pending_rate_limit)
+                if system_error_deadline is not None:
+                    continue
+                if self.wait_on_rate_limit and isinstance(delay, (int, float)) and math.isfinite(delay) and delay >= 0:
+                    self._finish_rate_limit_wait()
+                    self._rate_limit_started = time.monotonic()
+                    self._rate_limit_until = self._rate_limit_started + delay
+                    if self.rate_limit_callback is not None:
+                        self.rate_limit_callback(delay)
+                    continue
+                remaining = max(0.0, active_deadline - time.monotonic())
+                if delay is not None and delay >= remaining:
+                    raise turn_error(
+                        "codex_rate_limit",
+                        f"Codex rate limited the request (HTTP 429); retry is scheduled in "
+                        f"{math.ceil(delay)} seconds, beyond this turn's remaining "
+                        f"{remaining:.0f} seconds. Wait before retrying.",
+                        remaining_seconds=round(remaining, 3), **pending_rate_limit,
+                    )
+                # The CLI owns this retry. Do not resend the turn or extend its budget.
+                continue
+            if (method == "error" and params.get("threadId") == thread_id
+                    and params.get("turnId") == turn_id):
+                error = params.get("error")
+                category, details = _codex_error_details(error)
+                if params.get("willRetry") is False:
+                    detail = error.get("message") if isinstance(error, dict) else None
+                    if category == "codex_access_denied":
+                        detail = "Codex request was rejected by the service (HTTP 403 Forbidden)"
+                    raise turn_error(category, f"Codex decision failed: {detail or category}",
+                                     **details)
+                last_retry_error = (category, details)
+                if category == "codex_rate_limit":
+                    pending_rate_limit = pending_rate_limit or {**details, "retry_after_seconds": None}
+                continue
+            status = params.get("status")
+            if (method == "thread/status/changed" and params.get("threadId") == thread_id
+                    and isinstance(status, dict) and status.get("type") == "systemError"):
+                # The status can precede the terminal error/completion. Drain
+                # that detail briefly, without resubmitting or accepting actions.
+                if system_error_deadline is None:
+                    system_error_deadline = time.monotonic() + _SYSTEM_ERROR_GRACE_SECONDS
+                continue
             if method == "thread/tokenUsage/updated":
-                params = message.get("params", {})
                 usage = params.get("tokenUsage", {})
                 limit = usage.get("modelContextWindow")
                 used = usage.get("last", {}).get("totalTokens")
                 if params.get("threadId") == thread_id and limit and isinstance(used, int):
                     self.context_near_limit = used >= limit * .8
                     self.last_token_usage = usage.get('last', {})
-            if isinstance(method, str) and method.startswith("item/"):
+            # Input receipts are local acknowledgements, not model output.
+            # Late items from a previous turn must not keep this turn alive.
+            if (system_error_deadline is None
+                    and isinstance(method, str) and method.startswith("item/")
+                    and params.get("threadId") == thread_id and params.get("turnId") == turn_id
+                    and (method not in {"item/started", "item/completed"}
+                         or item_type not in {None, "userMessage", "functionCallOutput"})):
                 response_progress_seen = True
+                self._finish_rate_limit_wait()
+                pending_rate_limit = None
+                last_retry_error = None
+                last_response_progress_at = time.monotonic()
                 if self.progress_timeout_seconds is not None:
                     deadline = max(
                         deadline,
-                        time.monotonic() + self.progress_timeout_seconds,
+                        time.monotonic() - self._rate_limit_elapsed() + self.progress_timeout_seconds,
                     )
             if method != "turn/completed":
                 continue
@@ -429,13 +783,21 @@ class CodexAppServerSession:
                 continue
             if completed_turn.get("status") != "completed":
                 error = completed_turn.get("error")
+                category, details = _codex_error_details(error)
+                if completed_turn.get("status") == "interrupted":
+                    category = "codex_interrupted"
                 if isinstance(error, dict):
                     message_text = error.get("message")
                 else:
                     message_text = None
-                raise RuntimeError(
-                    f"Codex decision failed: {message_text or completed_turn.get('status')}"
+                if category == "codex_access_denied":
+                    message_text = "Codex request was rejected by the service (HTTP 403 Forbidden)"
+                raise turn_error(
+                    category, f"Codex decision failed: {message_text or completed_turn.get('status')}",
+                    **details,
                 )
+            if system_error_deadline is not None:
+                raise system_error()
             items = completed_turn.get("items")
             if not isinstance(items, list):
                 raise TypeError("Codex completed the turn without any response items")
@@ -511,7 +873,7 @@ class CodexAppServerSession:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _CodexReceiveTimeout(
-                "Codex did not complete its model response or network reconnect within "
+                "Codex App Server did not respond within "
                 f"{self.timeout_seconds:g} seconds"
             )
         try:
@@ -522,7 +884,7 @@ class CodexAppServerSession:
             return message
         except TimeoutError as error:
             raise _CodexReceiveTimeout(
-                "Codex did not complete its model response or network reconnect within "
+                "Codex App Server did not respond within "
                 f"{self.timeout_seconds:g} seconds"
             ) from error
 

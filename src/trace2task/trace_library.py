@@ -86,9 +86,9 @@ def list_traces(project_root):
             result.append({"id": path.parent.name, "trace_name": header["trace_name"],
                            "description": header["description"], "representation": header["representation"],
                            "created_at": created_at, "created_at_source": time_source,
-                           **{k: header[k] for k in ('source_kind', 'source_run_id', 'source_draft_id',
+                           **{k: header[k] for k in ('source_kind', 'source_run_id', 'source_draft_id', 'source_recording', 'source_b_id',
                                                     'source_scope', 'source_package', 'lineage', 'condition',
-                                                    'revision_changed', 'assisted_by_user', 'execution_condition') if k in header}, **review})
+                                                    'revision_changed', 'assisted_by_user', 'execution_condition', 'versioning') if k in header}, **review})
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return sorted(result, key=lambda item: (item["created_at"], item["id"]), reverse=True)

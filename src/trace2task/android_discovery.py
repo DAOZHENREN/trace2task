@@ -112,7 +112,7 @@ def discover(value=None):
 
 
 def attach_redfinger(value):
-    """Explicit device selection attaches only a still vendor-owned loopback port."""
+    """Attach a discovered loopback channel only while its port is vendor-owned."""
     config = validate_config({**value, 'package': 'com.android.placeholder'})
     match = re.fullmatch(r'127\.0\.0\.1:(\d+)', config['serial'])
     if not match or int(match[1]) not in _redfinger_ports():

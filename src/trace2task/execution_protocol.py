@@ -26,6 +26,9 @@ class UnifiedAction:
         if skill in ('joystick_move', 'navigate_to'):
             from trace2task.android_navigation import validate_navigation_action
             args = validate_navigation_action(skill, args)
+        elif skill == 'camera_drag':
+            from trace2task.android_camera import validate_camera_action
+            args = validate_camera_action(args)
         elif skill == 'type_text' and ('x' in args or 'y' in args):
             if set(args) != {'text', 'x', 'y'}:
                 raise ValueError('Coordinate text input requires text, x and y only')

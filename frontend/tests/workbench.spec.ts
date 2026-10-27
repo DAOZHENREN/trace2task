@@ -314,7 +314,9 @@ test.describe('compiled versions', () => {
       recording_backend: 'opencua', success: true, input_events: 2, compilation_supported: false, derivation: {status: 'completed'}};
     const requests: any[] = []; let generated = 0;
     await page.route('**/api/state?compact=1', async route => {const state = await (await route.fetch()).json();
-      await route.fulfill({json: {...state, recordings: [record], trace_representations: traces}});});
+      await route.fulfill({json: {...state, recordings: [record], trace_representations: traces.map(trace => ({...trace,
+        family_id: 'old-version', current_version_id: traces[0].id, is_current: trace.id === traces[0].id,
+        version_count: traces.length, version_revision: generated + 1}))}});});
     await page.route('**/api/traces/generate-d', async route => {
       const body = route.request().postDataJSON(); requests.push(body);
       expect(body.trace_path).toBe(record.trace_path);
@@ -325,6 +327,8 @@ test.describe('compiled versions', () => {
       await route.fulfill({json: {id: 'confirmed-new-version'}});
     });
     await page.goto('/'); await page.getByRole('button', {name: '经验库', exact: true}).click();
+    await expect(page.getByRole('heading', {name: record.task_id, exact: true})).toHaveCount(1);
+    await page.getByRole('button', {name: '查看版本历史', exact: true}).click();
     await expect(page.getByRole('heading', {name: record.task_id, exact: true})).toHaveCount(2);
     await expect(page.locator('.version-time').filter({hasText: '生成时间：2026/10/02 17:00:00.123'})).toBeVisible();
     await expect(page.locator('.version-time').filter({hasText: '生成时间（旧版文件时间）：2026/09/30 17:00:00.000'})).toBeVisible();
@@ -332,7 +336,7 @@ test.describe('compiled versions', () => {
     await page.getByRole('button', {name: '任务工作台', exact: true}).click();
     const options = await page.getByLabel('参考经验', {exact: true}).locator('option').allTextContents();
     expect(options.some(label => label.includes('2026/10/02 17:00:00.123'))).toBe(true);
-    expect(options.some(label => label.includes('2026/09/30 17:00:00.000'))).toBe(true);
+    expect(options.some(label => label.includes('2026/09/30 17:00:00.000'))).toBe(false);
     expect(new Set(options).size).toBe(options.length);
     await page.getByRole('button', {name: '经验库', exact: true}).click();
     await page.getByRole('tab', {name: /原始录制/}).click();
@@ -354,8 +358,11 @@ test.describe('compiled versions', () => {
     await page.setViewportSize({width: 1366, height: 768});
     await page.getByRole('button', {name: '生成精简序列 D', exact: true}).click();
     await acceptConfirmation(page, '生成新版本');
+    await expect(page.getByRole('heading', {name: record.task_id, exact: true})).toHaveCount(1);
+    await expect(page.getByText('新版本已生成并设为当前版本；旧版本保留在版本历史中，未启动任务。', {exact: true})).toBeVisible();
+    await expect(page.locator('.version-time')).toContainText('2026/10/03 17:00:00.456');
+    await page.getByRole('button', {name: '查看版本历史', exact: true}).click();
     await expect(page.getByRole('heading', {name: record.task_id, exact: true})).toHaveCount(3);
-    await expect(page.getByText('新版本已生成；已有版本保留，未自动切换当前任务经验。', {exact: true})).toBeVisible();
     expect(requests.map(body => body.confirm_duplicate)).toEqual([undefined, undefined, true]);
     expect(generated).toBe(1);
     await page.getByRole('button', {name: '任务工作台', exact: true}).click();
@@ -653,6 +660,16 @@ test('incremental rounds keep disclosures open and fetch raw content only on dem
   await expect(page.getByText('只读模型回答', {exact: true})).toBeVisible();
   await expect.poll(() => polls).toBeGreaterThan(1);
   await expect(page.locator('.round-content > details')).toHaveAttribute('open', '');
+  const receipt = page.locator('.execution-receipt');
+  await expect(receipt).not.toHaveAttribute('open');
+  await expect(receipt.locator('pre')).toBeHidden();
+  await receipt.locator('summary').click();
+  await expect(receipt.locator('pre')).toBeVisible();
+  const nextPoll = polls;
+  await expect.poll(() => polls).toBeGreaterThan(nextPoll);
+  await expect(receipt).toHaveAttribute('open', '');
+  await receipt.locator('summary').click();
+  await expect(receipt.locator('pre')).toBeHidden();
   expect(reads).toBe(1);
 });
 
@@ -691,7 +708,9 @@ test('round input is readable before output with full text, folded history/syste
   await expect(page.getByText('未发送操作输入', {exact: true})).toBeVisible();
   await expect(page.getByText('这轮真实模型输出', {exact: true})).toBeVisible();
   const order = await page.locator('.raw-round h4').allTextContents();
-  expect(order).toEqual(['模型输入', '模型输出', '执行回执']);
+  expect(order).toEqual(['模型输入', '模型输出']);
+  await expect(page.locator('.execution-receipt > summary')).toHaveText('执行回执');
+  await expect(page.locator('.execution-receipt')).not.toHaveAttribute('open');
   await input.getByText('本轮携带的历史消息 · 2 条', {exact: true}).click();
   await expect(input.getByText('早先发送的任务全文', {exact: true})).toBeVisible();
   await input.getByText('系统 / 开发者提示词 · 1 条', {exact: true}).click();
@@ -730,7 +749,7 @@ test('round input discloses Codex context limits, missing images and unavailable
   expect(external).toEqual([]);
 });
 
-test('round observations expand in place without a shared sidebar or eager image/raw requests', async ({page}, info) => {
+test('round observations default open and retain user collapse choices across updates', async ({page}, info) => {
   const id = 'observation-inline'; let polls = 0, rawReads = 0;
   const images: string[] = [];
   const run = {job_id: id, instruction: '逐轮画面就地查看', provider: 'api', status: 'running', kind: 'agent', created_at: new Date().toISOString(),
@@ -753,23 +772,29 @@ test('round observations expand in place without a shared sidebar or eager image
   await page.getByRole('button', {name: /逐轮画面就地查看/}).click();
   await expect(page.locator('.round-card')).toHaveCount(8);
   await expect(page.locator('.run-aside')).toHaveCount(0);
-  expect(images).toEqual([]); expect(rawReads).toBe(0);
+  await expect(page.locator('.round-observation')).toHaveCount(8);
+  await expect(page.getByRole('button', {name: '收起该轮画面'})).toHaveCount(8);
+  expect(rawReads).toBe(0);
   const last = page.locator('.round-card').nth(7);
-  await last.getByRole('button', {name: '查看该轮画面'}).click();
+  await last.scrollIntoViewIfNeeded();
   await expect(last.getByRole('img', {name: '第 8 轮归档观察截图'})).toBeVisible();
   expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(500);
-  await expect.poll(() => images.length).toBe(1);
-  expect(images).toEqual(['runs/fixture/round-7.png']);
+  await expect.poll(() => images.includes('runs/fixture/round-7.png')).toBe(true);
   const beforePoll = polls;
   await expect.poll(() => polls).toBeGreaterThan(beforePoll);
   await expect(last.getByRole('button', {name: '收起该轮画面'})).toHaveAttribute('aria-expanded', 'true');
-  expect(images).toHaveLength(1); expect(rawReads).toBe(0);
+  expect(rawReads).toBe(0);
   const previous = page.locator('.round-card').nth(6);
-  await previous.getByRole('button', {name: '查看该轮画面'}).click();
   await expect(previous.getByRole('img')).toHaveAttribute('alt', '第 7 轮归档观察截图');
   await expect(last.getByRole('img')).toHaveAttribute('alt', '第 8 轮归档观察截图');
   await previous.getByRole('button', {name: '收起该轮画面'}).click();
   await expect(previous.locator('img')).toHaveCount(0);
+  await last.getByRole('button', {name: '收起该轮画面'}).click();
+  const closedPoll = polls;
+  await expect.poll(() => polls).toBeGreaterThan(closedPoll);
+  await expect(last.getByRole('button', {name: '查看该轮画面'})).toHaveAttribute('aria-expanded', 'false');
+  await expect(last.locator('img')).toHaveCount(0);
+  await last.getByRole('button', {name: '查看该轮画面'}).click();
   await page.setViewportSize({width: 960, height: 900});
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.setViewportSize({width: 1366, height: 1100});

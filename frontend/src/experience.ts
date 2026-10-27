@@ -11,9 +11,10 @@ export function versionTime(version: Pick<Trace, 'created_at' | 'created_at_sour
 }
 
 export function versionLabel(trace: Trace) {
-  return `${trace.trace_name} · ${trace.representation}${trace.lineage ? ` · 反馈修订 ${trace.lineage.generation}` : ''} · ${versionTime(trace)} · ${trace.id.slice(0, 8)}`;
+  return `${trace.trace_name} · ${trace.representation}${trace.condition === 'trace-compile+human-revision' ? ' · 人工修订' : ''}${trace.lineage ? ` · 反馈修订 ${trace.lineage.generation}` : ''} · ${versionTime(trace)} · ${trace.id.slice(0, 8)}`;
 }
 
-export const usableTrace = (trace: Trace) => ['A', 'B', 'C', 'D'].includes(trace.representation)
-  || (trace.representation === 'R' && trace.review_status === 'approved_for_trial');
+export const currentTrace = (trace: Trace) => trace.is_current !== false;
+export const usableTrace = (trace: Trace) => currentTrace(trace) && (['A', 'B', 'C', 'D'].includes(trace.representation)
+  || (trace.representation === 'R' && trace.review_status === 'approved_for_trial'));
 export const traceAssetUrl = (id: string, file: string) => `/api/traces/asset?id=${encodeURIComponent(id)}&file=${encodeURIComponent(file)}`;

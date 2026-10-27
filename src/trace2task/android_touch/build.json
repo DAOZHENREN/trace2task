@@ -1,8 +1,9 @@
 {
-  "protocol": "T2T1",
-  "source_sha256": "001eb3a966ae3fab81b6cfcd24359b46eda8ab3349f3169dca7feccd516afa41",
-  "jar_sha256": "35f89ddd88105c9773b3a830aac6e572e798b8c1470bffa5c019767175d12145",
+  "protocol": "T2T2",
+  "source_sha256": "062e71f3aef17c35ee473008e9a97deec10cf48cfeea6c994f1d33100391223a",
+  "jar_sha256": "96f1c61e73b8c9c0656336edcc1cadbd521380c47d8123a0cb7171e5a0ce0034",
   "compiler_sha256": "38a9ffaaebbd17d1514e3ecbff5a85b989bb13c551b9e224c7409514eea84ff5",
   "min_api": 29,
-  "max_duration_ms": 1500
+  "max_duration_ms": null,
+  "heartbeat_timeout_ms": 1500
 }

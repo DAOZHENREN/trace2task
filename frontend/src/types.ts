@@ -19,9 +19,14 @@ export type MemorySelection = {mode: string; status: string; reason?: string; er
   selected?: {id: string; name: string; sha256: string; representation?: string}; experience_path?: string;
   operations: {tool: string; query: string; memory_id: string; reason: string; returned_ids?: string[]}[]};
 export type HandoffPicture = {path: string; sha256: string; package: string; width: number; height: number};
+export type AnnotationStroke = {tool: 'circle' | 'cross' | 'pen'; points: [number, number][]};
+export type VisualInput = ({takeover_id: string; source_sha256: string} | {upload_data_url: string}) & {strokes: AnnotationStroke[]};
+export type VisualReference = {origin: 'takeover_snapshot' | 'user_upload'; source: HandoffPicture; image: HandoffPicture;
+  strokes: AnnotationStroke[]};
 export type InterventionCommand = {id: string; index: number; kind: 'instruction' | 'pause' | 'resume';
-  text: string; status: string; requested_at: string; revision: number; submitted_round?: number; responded_round?: number; takeover_id?: string};
-export type InterventionState = {supported: boolean; phase: 'starting' | 'running' | 'pausing' | 'paused' | 'resuming' | 'closed';
+  text: string; status: string; requested_at: string; revision: number; submitted_round?: number; responded_round?: number; takeover_id?: string;
+  visual?: VisualReference};
+export type InterventionState = {supported: boolean; visual_supported?: boolean; phase: 'starting' | 'running' | 'pausing' | 'paused' | 'resuming' | 'closed';
   version: number; revision: number; assisted_by_user: boolean; message: string; commands: InterventionCommand[];
   takeovers: {id: string; status: string; note: string; before: HandoffPicture | null; after: HandoffPicture | null;
     before_error?: string; return_error?: string; started_at?: string; ended_at?: string}[]};
@@ -41,10 +46,13 @@ export type Round = {step_index: number; status: string; purpose: string; durati
 export type RunEvent = {seq: number; name: string; time: string; trace_id: string;
   attributes: Round & {message?: string; status?: string}};
 export type Trace = {id: string; trace_name: string; description: string; representation: string;
+  family_id?: string; current_version_id?: string; is_current?: boolean; version_count?: number; version_revision?: number;
+  versioning?: ExperienceVersioning;
   source_kind?: string; source_run_id?: string; source_scope?: string; source_package?: string;
   lineage?: ExperienceLineage; condition?: string; revision_changed?: boolean | null;
   assisted_by_user?: boolean; execution_condition?: string;
   created_at?: string; created_at_source?: 'metadata' | 'file_mtime'; review_status?: TrialReview['decision']};
+export type ExperienceVersioning = {mode: 'revision' | 'independent'; parent_id: string | null};
 export type ExperienceLineage = {parent_id: string; parent_representation: string; parent_sha256: string;
   root_id: string; generation: number; source_run_id: string; condition: string; task_quality: string};
 export type TrialReview = {decision: 'pending_review' | 'approved_for_trial' | 'rejected'; candidate_sha256: string; time?: string};
@@ -81,10 +89,15 @@ export type AppState = {version: string; active_job: Run | null; trace_represent
   trash?: TrashItem[];
   recordings: Recording[]; candidates: Candidate[]; taskpacks: TaskPack[];
   agent_options: {models: string[]; reasoning_efforts: string[]; defaults: {model: string; reasoning_effort: string};
+    model_details?: {model: string; display_name: string; description: string; reasoning_efforts: string[];
+      default_reasoning_effort: string; is_default: boolean; input_modalities: string[]}[];
+    catalog_status?: 'ready' | 'stale' | 'unavailable'; catalog_error?: string;
     compiler_defaults?: ModelChoice; revision_defaults?: ModelChoice; task_model_revision_defaults?: ModelChoice;
     waa_defaults?: {root: string; example_path: string};
     api_defaults: {saved_settings?: {model?: string; base_url?: string; has_saved_key?: boolean;
       response_format?: string; timeout_seconds?: number; context_window_tokens?: number}}}};
+export const DEFAULT_ANDROID_BUDGET = {max_actions: 160, max_seconds: 2400};
+
 export type Config = {provider: 'codex' | 'api' | 'local'; model: string; localModel: string;
   inference: string; executor: 'cua' | 'browser' | 'android'; scope: 'desktop' | 'selected_windows' | 'browser' | 'android';
   android?: {adb: string; serial: string; package: string; server_port: number; launch_app?: boolean};

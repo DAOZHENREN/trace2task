@@ -45,14 +45,14 @@ function RoundObservation({path, step}: {path: string; step: number}) {
   return <figure className="round-observation">
     <figcaption><strong>第 {step + 1} 轮 · 观察画面</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
     {failed ? <p className="quiet" role="status">画面加载失败，原运行记录仍保留；可尝试打开原图。</p>
-      : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={`第 ${step + 1} 轮归档观察截图`}
+      : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={`第 ${step + 1} 轮归档观察截图`} loading="lazy"
         onError={() => setFailed(true)}/></a>}
   </figure>;
 }
 
 const RoundCard = memo(function RoundCard({round, provider}: {round: Round; provider?: string}) {
   const [open, setOpen] = useState(false);
-  const [imageOpen, setImageOpen] = useState(false);
+  const [imageOpen, setImageOpen] = useState(true);
   const [raw, setRaw] = useState<RawRound | null>(null);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -83,7 +83,8 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
         {error ? <p role="alert">{error}</p> : !raw ? <Spinner size="tiny" label="读取该轮记录"/> : <div className="raw-round">
           <ModelInput raw={raw} provider={provider}/>
           <h4>模型输出</h4><pre>{raw.raw_output || JSON.stringify(raw.prediction || raw.verification || raw.error || '等待模型返回', null, 2)}</pre>
-          <h4>执行回执</h4><pre>{JSON.stringify(raw.execution || '尚无执行回执；模型输出不代表已执行', null, 2)}</pre>
+          <details className="execution-receipt"><summary>执行回执</summary>
+            <pre>{JSON.stringify(raw.execution || '尚无执行回执；模型输出不代表已执行', null, 2)}</pre></details>
           <details><summary>原始请求 / 完整记录（可能含敏感内容）</summary><pre>{JSON.stringify(raw, null, 2)}</pre></details>
         </div>}
       </details>
@@ -105,6 +106,7 @@ export function RunInspector({id, onLibrary, state, busy = false, onRun, onError
         onRun={onRun} onLibrary={onLibrary}/>}
       {error && <p className="error-inline" role="alert">{error} · 正在重试，不会重复启动任务。</p>}
       {run?.error && <p className="error-inline" role="alert">{run.error}</p>}
+      {active(run) && /限流|冷却/.test(logs.at(-1)?.message || '') && <p className="notice" role="status">{logs.at(-1)?.message}</p>}
       {run?.result?.stop_reason && <p className="notice">停止原因：{run.result.stop_reason === 'action_limit' ? '动作预算耗尽，任务未完成' : run.result.stop_reason === 'time_limit' ? '时间预算耗尽，任务未完成' : run.result.stop_reason}</p>}
       {run?.result?.compiled_trace_id && <div className="notice"><p>{run.result.representation === 'R' ? '改进候选 R 已生成，尚未获准试用或证明效果提升。' : 'Agent 方法 B 已生成独立版本，未自动选为任务经验。'}</p>
         {onLibrary && <Button onClick={() => onLibrary(run.result!.compiled_trace_id!)}>{run.result.representation === 'R' ? '到经验库审查改进候选' : '到经验库查看 Procedure B'}</Button>}</div>}

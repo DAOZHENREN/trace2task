@@ -4,14 +4,16 @@ import {api, requestFor} from './api';
 import {Dictation, dictationActive} from './audio';
 import {AUTO_MEMORY, usableTrace, versionLabel} from './experience';
 import type {AppState, Catalog, Config, Run, Target} from './types';
+import {DEFAULT_ANDROID_BUDGET} from './types';
+import {chooseCodexModel, codexChoiceError, codexEfforts, CodexModelOptions} from './codexModels';
 import {Choice, Field, Icon} from './ui';
 import {CloudPhoneConnection, cloudPhoneDestination, cloudPhoneSelected} from './CloudPhoneConnection';
 import {AndroidDevices} from './AndroidDevices';
 
 type Props = {config: Config; setConfig: (next: Config) => void; state: AppState; catalog: Catalog;
-  busy: boolean; promptDirty: boolean; onRun: (run: Run) => void; onModels: () => void; onError: (message: string) => void};
+  busy: boolean; promptDirty: boolean; onRun: (run: Run) => void; onModels: () => void; onRefreshCodex: () => Promise<void>; onError: (message: string) => void};
 
-export function TaskComposer({config: c, setConfig, state, catalog, busy, promptDirty, onRun, onModels, onError}: Props) {
+export function TaskComposer({config: c, setConfig, state, catalog, busy, promptDirty, onRun, onModels, onRefreshCodex, onError}: Props) {
   const [instruction, setInstruction] = useState('');
   const [confirm, setConfirm] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -20,8 +22,9 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
   const [loadingTargets, setLoadingTargets] = useState(false);
   const [deviceStatus, setDeviceStatus] = useState('');
   const [probing, setProbing] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
   const android = c.android || {adb: 'D:/Tools/trace2task-android/sdk/platform-tools/adb.exe', serial: '', package: '', server_port: 5037};
-  const budget = c.androidBudget || {max_actions: 80, max_seconds: 1200};
+  const budget = c.androidBudget || DEFAULT_ANDROID_BUDGET;
   const updateAndroid = (key: keyof typeof android, value: string | number | boolean) => {
     setDeviceStatus(''); setConfig({...c, android: {...android, [key]: value}});
   };
@@ -41,6 +44,7 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
   }
   const update = (key: keyof Config, value: unknown) => {
     const next = {...c, [key]: value};
+    if (key === 'model') next.effort = chooseCodexModel(state.agent_options, String(value), c.effort).reasoning_effort;
     if (key === 'scope') next.executor = value === 'android' ? 'android' : value === 'browser' ? 'browser' : 'cua';
     if (key === 'localModel') {
       const p = catalog.models.find(p => p.id === value);
@@ -68,6 +72,7 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
     } catch (e) { onError(String(e)); } finally { setLoadingTargets(false); }
   }
   function validate() {
+    if (c.provider === 'codex') {const error = codexChoiceError(state.agent_options, c.model, c.effort); if (error) return error;}
     if (dictationActive()) return '请先结束语音输入并等待转写完成。';
     if (promptDirty) return '当前模型的提示词有未保存修改，请在「设置与工具 → 模型提示词」保存或恢复默认后再开始任务。';
     if (!instruction.trim()) return '请先写下任务目标。';
@@ -104,29 +109,36 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
   }
   return <>
     <section className="composer surface">
-      <CloudPhoneConnection config={c} setConfig={setConfig} busy={busy || submitting} onError={onError}/>
+      <CloudPhoneConnection config={c} setConfig={setConfig} busy={busy || submitting || discovering || probing} onError={onError}/>
       <div className="composer-top"><span className="section-label"><span className="step-marker">01</span>任务目标</span><div className="button-row"><Dictation disabled={busy} onError={onError} onAppend={text => setInstruction(value => `${value} ${text}`.trim().slice(0, 2000))}/></div></div>
       <Textarea className="task-textarea" aria-label="任务指令" placeholder={cloudPhone ? '描述手机任务，例如：继续当前暂停的秒表，不要重置。' : '描述你想完成的事，例如：把今天的待办整理到记事本，按优先级排序。'}
         value={instruction} onChange={(_, d) => setInstruction(d.value)} maxLength={2000} resize="vertical" disabled={busy}/>
       <div className="execution-setup">
-      <div className="setup-heading"><span className="section-label"><span className="step-marker">02</span>执行配置</span><Button appearance="subtle" size="small" onClick={onModels}>模型连接 <Icon name="arrow" size={14}/></Button></div>
-      <div className="composer-fields">
+      <div className="setup-heading"><span className="section-label"><span className="step-marker">02</span>执行配置</span><div className="button-row">
+        {c.provider === 'codex' && <Button appearance="subtle" size="small" disabled={busy} title="模型和思考强度来自当前 Codex 客户端" onClick={() => void onRefreshCodex()}>刷新订阅模型</Button>}
+        <Button appearance="subtle" size="small" onClick={onModels}>模型连接 <Icon name="arrow" size={14}/></Button></div></div>
+      <div className={`composer-fields${c.provider === 'codex' ? ' codex-fields' : ''}`}>
         <Field label="模型来源"><Choice value={c.provider} disabled={busy} onChange={e => update('provider', e.target.value)}>
           <option value="codex">Codex 订阅</option><option value="local">本地模型</option><option value="api">视觉模型 API</option>
         </Choice></Field>
         <Field label="执行模型">{c.provider === 'api' ? <Input value={c.apiModel} disabled={busy} placeholder="模型 ID"
           onChange={(_, d) => update('apiModel', d.value)}/> : <Choice disabled={busy} value={c.provider === 'codex' ? c.model : c.localModel}
           onChange={e => update(c.provider === 'codex' ? 'model' : 'localModel', e.target.value)}>
-          {c.provider === 'codex' ? state.agent_options.models.map(m => <option key={m}>{m}</option>) : <>
+          {c.provider === 'codex' ? <CodexModelOptions options={state.agent_options} value={c.model}/> : <>
             {catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}{p.maturity === 'experimental' ? ' · 实验' : ''}</option>)}
           </>}
         </Choice>}</Field>
+        {c.provider === 'codex' && <Field label="思考强度"><Choice value={c.effort} disabled={busy} onChange={e => update('effort', e.target.value)}>
+          {!codexEfforts(state.agent_options, c.model).includes(c.effort) && <option value={c.effort} disabled>请重新选择</option>}
+          {codexEfforts(state.agent_options, c.model).map(e => <option key={e}>{e}</option>)}
+        </Choice></Field>}
         <Field label="参考经验"><Choice value={c.experience} disabled={busy} onChange={e => update('experience', e.target.value)}>
           <option value={AUTO_MEMORY} disabled={c.provider === 'local' || !!c.mobileforge}>自动选择 · Agent 检索并加载方法 B</option>
           <option value="">不使用经验</option>{state.trace_representations.filter(usableTrace).map(t =>
             <option key={t.id} value={`trace-library/${t.id}/model-input.txt`}>{versionLabel(t)}</option>)}
         </Choice></Field>
       </div>
+      {c.provider === 'codex' && state.agent_options.catalog_error && <p role="status" className="quiet">{state.agent_options.catalog_error}</p>}
       {c.experience === AUTO_MEMORY ? <p className="quiet">Agent 先检索方法摘要，再决定加载一份 B 或不使用经验；操作前重新截图。检索和加载过程记入运行记录。</p>
         : (c.provider === 'local' || c.mobileforge) && <p className="quiet">当前策略不支持自动经验，自动模式已关闭；本地 GUI 模型仍可按现有协议手动选择经验。</p>}
       <div className="scope-row">
@@ -144,7 +156,8 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
       </div>
       {(c.scope === 'android' || c.executor === 'android') && <div className="target-picker">
         <div className="setup-heading"><strong>手机连接</strong><span className="tag">{c.mobileforge ? 'MobileForge' : '通用视觉代理'} · ADB</span></div>
-        <AndroidDevices value={android} onChange={value => {setDeviceStatus(''); setConfig({...c, android: value});}} busy={busy || probing} onError={onError}/>
+        <AndroidDevices value={android} onChange={value => {setDeviceStatus(''); setConfig({...c, android: value});}}
+          busy={busy || probing} onError={onError} autoConnect={c.scope === 'android'} onPendingChange={setDiscovering}/>
         <div className="composer-fields">
           <Field label="动作预算"><Input type="number" min={1} max={500} value={String(budget.max_actions)} disabled={busy}
             onChange={(_, d) => update('androidBudget', {...budget, max_actions: Number(d.value)})}/></Field>
@@ -154,10 +167,10 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
         <p className="quiet">任一预算耗尽即停止，任务不视为完成；等待也计入动作数。时间包含加载、截图和模型推理，已提交的调用可能需要等待返回。</p>
         <details className="advanced-connection"><summary>手动连接与高级设置</summary>
         <div className="composer-fields">
-          <AndroidChoice label="设备 serial" value={android.serial} disabled={busy || probing}
+          <AndroidChoice label="设备 serial" value={android.serial} disabled={busy || probing || discovering}
             options={[]}
             onChange={value => updateAndroid('serial', value)}/>
-          <AndroidChoice label="授权应用包名" value={android.package} disabled={busy || probing}
+          <AndroidChoice label="授权应用包名" value={android.package} disabled={busy || probing || discovering}
             options={[[ 'com.android.deskclock', '时钟（预设）'], ['com.android.calculator2', '计算器（预设）'],
               ['com.android.calendar', '日历（预设）'], ['com.miHoYo.hkrpg', '崩坏：星穹铁道（预设）']]}
             onChange={value => updateAndroid('package', value)}/>
@@ -167,17 +180,17 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
         </div>
         <details className="advanced-connection"><summary>高级连接设置 <span>ADB 路径 · 端口{c.mobileforge ? ' · 源码目录' : ''}</span></summary>
           <div className="composer-fields">
-            <AndroidChoice label="ADB 路径" value={android.adb} disabled={busy || probing}
+            <AndroidChoice label="ADB 路径" value={android.adb} disabled={busy || probing || discovering}
               options={[['D:/Tools/trace2task-android/sdk/platform-tools/adb.exe', '本机安装路径（预设）']]}
               onChange={value => updateAndroid('adb', value)}/>
-            <Field label="ADB 服务端口"><Input type="number" value={String(android.server_port)} disabled={busy || probing} onChange={(_, d) => updateAndroid('server_port', Number(d.value))}/></Field>
+            <Field label="ADB 服务端口"><Input type="number" value={String(android.server_port)} disabled={busy || probing || discovering} onChange={(_, d) => updateAndroid('server_port', Number(d.value))}/></Field>
             {!!c.mobileforge && <Field label="MobileForge 源码目录"><Input value={c.mobileforge} disabled={busy} onChange={(_, d) => update('mobileforge', d.value)}/></Field>}
           </div>
         </details>
-        <Checkbox checked={!!android.launch_app} disabled={busy || probing} label="确认任务后自动打开授权应用（不重置）" onChange={(_, d) => updateAndroid('launch_app', d.checked === true)}/>
-        <div className="button-row"><Button disabled={busy || probing} onClick={() => void prepareDevice('connect')}>连接云手机</Button>
-          <Button disabled={busy || probing} onClick={() => void prepareDevice('check')}>启动前检查</Button>
-          <Button disabled={busy || probing} onClick={probeDevice}>{probing ? '正在检查…' : '只读检查设备'}</Button></div>
+        <Checkbox checked={!!android.launch_app} disabled={busy || probing || discovering} label="确认任务后自动打开授权应用（不重置）" onChange={(_, d) => updateAndroid('launch_app', d.checked === true)}/>
+        <div className="button-row"><Button disabled={busy || probing || discovering} onClick={() => void prepareDevice('connect')}>连接云手机</Button>
+          <Button disabled={busy || probing || discovering} onClick={() => void prepareDevice('check')}>启动前检查</Button>
+          <Button disabled={busy || probing || discovering} onClick={probeDevice}>{probing ? '正在检查…' : '只读检查设备'}</Button></div>
         {deviceStatus && <p role="status">{deviceStatus}</p>}
         <p className="quiet">仅在设备未出现在列表时手动配置。连接按钮只连接填写的地址，不重启红手指或全局 ADB 服务。</p>
         </details>
@@ -205,7 +218,7 @@ export function TaskComposer({config: c, setConfig, state, catalog, busy, prompt
       </div>}
       </div>
       <div className="composer-footer"><span className="quiet"><Icon name="shield" size={16}/>{remote ? `画面与经验将发送到 ${destination}` : '画面由本机服务处理'}</span>
-        <Button appearance="primary" size="large" icon={<Icon name="arrow" size={18}/>} iconPosition="after" disabled={busy || submitting || !instruction.trim()}
+        <Button appearance="primary" size="large" icon={<Icon name="arrow" size={18}/>} iconPosition="after" disabled={busy || submitting || discovering || probing || !instruction.trim()}
           onClick={() => {const problem = validate(); if (problem) onError(problem); else setConfirm(true);}}>开始任务</Button></div>
     </section>
     <details className="context-strip"><summary>当前推理连接 · {engine?.label || '推理引擎'}</summary><p>{engine?.context_description}</p></details>

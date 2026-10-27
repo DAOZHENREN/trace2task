@@ -3,7 +3,7 @@ import {Button, Input, Textarea} from '@fluentui/react-components';
 import {api} from './api';
 import {useConfirm} from './ConfirmDialog';
 import {Dictation, dictationActive} from './audio';
-import {traceAssetUrl, usableTrace, versionTime} from './experience';
+import {currentTrace, traceAssetUrl, usableTrace, versionTime} from './experience';
 import type {AppState, Candidate, CompilationConfirmation, EvidencePicture, ModelChoice, Recording, Run, TaskPack, Trace, TraceEvidenceBody, TraceModelInput, TrashItem, TrialReview} from './types';
 import {Empty, Field, Icon, PageHeading, Refresh} from './ui';
 import {CompilerChoice, EvidenceImage, JsonDetails, Sections, useAction} from './workflow';
@@ -15,6 +15,7 @@ type Props = {state: AppState; busy: boolean; refresh: () => Promise<void>; onRu
 export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, requestedTraceId, onRequestedTraceHandled, mode}: Props) {
   const confirm = useConfirm();
   const [tab, setTab] = useState(mode || 'sequences'); const [filter, setFilter] = useState('');
+  const [historyFamily, setHistoryFamily] = useState('');
   const [selection, setSelection] = useState<{kind: string; id: string} | null>(null);
   const [preview, setPreview] = useState<{trace: Trace; input: TraceModelInput; body: TraceEvidenceBody} | null>(null);
   const [compiler, setCompiler] = useState<ModelChoice>(state.agent_options.compiler_defaults || state.agent_options.defaults);
@@ -22,7 +23,12 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
   const trash = [...(state.trash || [])].sort((a, b) => (b.deleted_at || '').localeCompare(a.deleted_at || ''));
   const {pending, perform} = useAction(onError);
   const matches = (text: string) => text.toLowerCase().includes(filter.toLowerCase());
-  const batchItems: BatchItem[] = tab === 'sequences' ? state.trace_representations.filter(t => matches(`${t.trace_name} ${t.description}`)).map(t =>
+  const currentTraces = state.trace_representations.filter(currentTrace);
+  const historicalTraces = state.trace_representations.filter(t => !currentTrace(t));
+  const visibleTraces = (tab === 'history' ? historyFamily
+    ? state.trace_representations.filter(t => t.family_id === historyFamily) : historicalTraces : currentTraces)
+    .filter(t => matches(`${t.trace_name} ${t.description}`));
+  const batchItems: BatchItem[] = tab === 'sequences' ? visibleTraces.map(t =>
     ({id: t.id, name: t.trace_name, endpoint: '/api/traces/delete', payload: {id: t.id}}))
     : tab === 'recordings' ? state.recordings.filter(r => matches(r.task_id || r.trace_path)).map(r =>
       ({id: r.trace_path, name: r.task_id || r.trace_path, endpoint: '/api/recordings/delete', payload: {trace_path: r.trace_path}}))
@@ -42,8 +48,33 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
   useEffect(() => {
     const trace = state.trace_representations.find(t => t.id === requestedTraceId);
     if (!trace) return;
-    setTab('sequences'); setFilter(''); void inspect(trace); onRequestedTraceHandled?.();
+    setTab(currentTrace(trace) ? 'sequences' : 'history'); setHistoryFamily(trace.family_id || '');
+    setFilter(''); void inspect(trace); onRequestedTraceHandled?.();
   }, [requestedTraceId, state.trace_representations]);
+  useEffect(() => {
+    setPreview(previous => {
+      if (!previous) return null;
+      const trace = state.trace_representations.find(t => t.id === previous.trace.id);
+      return trace ? {...previous, trace} : null;
+    });
+  }, [state.trace_representations]);
+  function showHistory(trace: Trace) {
+    setHistoryFamily(trace.family_id || ''); setTab('history'); setFilter(''); setSelection(null); setPreview(null);
+  }
+  async function rollback() {
+    if (!preview || currentTrace(preview.trace) || disabled) return;
+    const {trace, input} = preview;
+    const current = state.trace_representations.find(t => t.id === trace.current_version_id);
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input.content));
+    const model_input_sha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    if (!await confirm({title: '回滚为当前版本？',
+      body: `经验：${trace.trace_name}\n回滚目标：${trace.id}\n${versionTime(trace)}\n当前版本：${current?.id || trace.current_version_id || '无'}${current ? `\n${versionTime(current)}` : ''}`,
+      confirmLabel: '确认回滚', note: '后续自动选择将只使用回滚后的当前版本。所有版本及运行记录保留，不会启动任务。'})) return;
+    await perform('rollback', async () => {
+      await api('/api/traces/rollback', {id: trace.id, expected_revision: trace.version_revision, model_input_sha256});
+      await refresh(); setMessage('已回滚为当前版本。后续自动选择使用此版本，其他版本保留在版本历史中。');
+    });
+  }
   async function remove(endpoint: string, payload: unknown, description: string) {
     if (!await confirm({title: '移到回收站？', body: description, confirmLabel: '移到回收站', note: '此操作可恢复，不会永久删除。'})) return;
     setMessage('');
@@ -124,32 +155,39 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
           body: <><p>{existing.message}</p><div className="version-list-heading"><span>这份录制的已有版本</span><span>{existing.existing_versions.length} 个版本</span></div>
             <ul className="confirmation-versions">{existing.existing_versions.map(v => <li key={v.id || v.path}><strong>{v.trace_name}</strong>
               <div className="quiet">{versionTime(v)}</div><span className="mono">{v.id?.slice(0, 8) || v.path}</span></li>)}</ul></>,
-          confirmLabel: semantic ? '继续编译' : '生成新版本', note: '取消不会生成新版本或启动编译。新生成的经验不会自动启用。'})) {
+          confirmLabel: semantic ? '继续编译' : '生成新版本', note: semantic ? '取消不会生成新版本或启动编译。' : '生成后作为当前版本，旧版本保留在版本历史中；不会启动任务。'})) {
           setMessage('已取消重复编译，未生成新版本。'); return;
         }
         result = await api<Reply>(endpoint, {...payload, confirm_duplicate: true});
       }
       if ('confirmation_required' in result) throw new Error('后台仍要求确认，未开始重复编译，请刷新后重试。');
       if ('job_id' in result) onRun(result);
-      else {setTab('sequences'); setMessage('新版本已生成；已有版本保留，未自动切换当前任务经验。');}
+      else {setTab('sequences'); setMessage('新版本已生成并设为当前版本；旧版本保留在版本历史中，未启动任务。');}
       await refresh();
     });
   }
   return <>
-    <PageHeading eyebrow={mode === 'trash' ? 'RECYCLE BIN' : 'EXPERIENCE LIBRARY'} title={mode === 'trash' ? '全局回收站' : mode === 'recordings' ? '已保存的录制示范' : '经验积累下来，下一次更从容。'} copy={mode === 'trash' ? '统一管理录制示范、经验版本、反馈和运行记录；不会自动清空。' : '原始示范、编译结果与人工反馈各自保留来源。确认不改变内容；反馈修订生成独立版本。'}
+    <PageHeading eyebrow={mode === 'trash' ? 'RECYCLE BIN' : 'EXPERIENCE LIBRARY'} title={mode === 'trash' ? '全局回收站' : mode === 'recordings' ? '已保存的录制示范' : '经验积累下来，下一次更从容。'} copy={mode === 'trash' ? '统一管理录制示范、经验版本、反馈和运行记录；不会自动清空。' : '默认展示当前版本，自动选择也只使用当前版本。旧版本保留在版本历史中，可查看原文并回滚，不自动删除。'}
       action={<div className="button-row"><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/>{mode !== 'trash' && <Button onClick={onRecord}>录制新示范</Button>}</div>}/>
-    {!mode && <Sections label="经验分类" value={tab} onChange={value => {setTab(value); setSelection(null); setFilter('');}} items={[
-      {id: 'sequences', label: `经验版本 · ${state.trace_representations.length}`}, {id: 'recordings', label: `原始录制 · ${state.recordings.length}`},
+    {!mode && <Sections label="经验分类" value={tab} onChange={value => {setTab(value); setHistoryFamily(''); setSelection(null); setFilter('');}} items={[
+      {id: 'sequences', label: `经验版本 · ${currentTraces.length}`}, {id: 'history', label: `版本历史 · ${historicalTraces.length}`}, {id: 'recordings', label: `原始录制 · ${state.recordings.length}`},
       {id: 'tasks', label: `旧版状态图 · ${state.taskpacks.length}`}, {id: 'candidates', label: `反馈审查 · ${state.candidates.length}`} ]}/>}
     {message && <p className="notice" role="status">{message}</p>}
     <div className="library-toolbar"><Input aria-label="搜索经验" value={filter} placeholder="搜索名称、指令或说明" contentBefore={<Icon name="library" size={18}/>} onChange={(_, d) => setFilter(d.value)}/>
-      <span className="quiet">{pending ? '正在处理…' : '所有内容直接读取本地数据，不自动启用新版本'}</span></div>
+      <span className="quiet">{pending ? '正在处理…' : '新版本正式保存后成为当前版本；草稿不影响当前版本'}</span></div>
+    {tab === 'history' && <div className="notice"><span>{historyFamily ? '这份经验的完整版本历史（含当前版本）' : '历史版本仅供查看；回滚后可用于后续任务。'}</span>
+      {historyFamily && <Button appearance="subtle" onClick={() => {setHistoryFamily(''); setSelection(null); setPreview(null);}}>查看全部历史版本</Button>}</div>}
     {['recordings', 'candidates'].includes(tab) && <details className="surface compiler-options"><summary>编译与反馈模型</summary><CompilerChoice state={state} value={compiler} onChange={setCompiler} disabled={disabled}/><p className="quiet">Agent 编译 B 将动作与已选截图交给 Codex，返回 Markdown 方法。旧版状态图编译 / 反馈修订仍独立保留；A 与 D 都是本地确定性提取。</p></details>}
-    {tab !== 'trash' && batch.toolbar}
+    {!['trash', 'history'].includes(tab) && batch.toolbar}
     {tab === 'trash' && <p className="notice">恢复不会覆盖同名资产或自动执行任务；永久删除须再次确认。运行记录与录制、经验分别管理，不会连带删除。运行记录归档包含事件与逐轮原文，不包含关联目录中的文件。</p>}
     {selection && <section className="surface detail-workspace"><div className="row-between"><div><span className="section-label">经验详情</span><h2>{candidate?.task_id || task?.task_id || preview?.trace.trace_name}</h2></div>
       <Button onClick={() => setSelection(null)}>返回列表</Button></div>
       {selection.kind === 'sequence' && preview && <><p className="quiet">{versionTime(preview.trace)}</p>
+        <div className="button-row"><span className="tag">{currentTrace(preview.trace) ? '当前版本' : '历史版本'}</span>
+          {preview.trace.versioning?.mode === 'independent' && <span className="tag">独立经验 · 版本历史单独管理</span>}
+          {!!preview.trace.family_id && <Button onClick={() => showHistory(preview.trace)}>查看版本历史</Button>}
+          {!currentTrace(preview.trace) && ['A', 'B', 'C', 'D'].includes(preview.trace.representation) &&
+            <Button appearance="primary" disabled={disabled} onClick={() => void rollback().catch(e => onError(String(e)))}>回滚为当前版本</Button>}</div>
         {preview.trace.representation === 'R' && <div className="notice"><strong>R · 运行后改进候选 · 效果尚未评测</strong>
           <p>固定改进器第 {preview.input.evolution?.generation} 代；父版本 {preview.input.evolution?.parent_id}，源运行 {preview.input.evolution?.source_run_id}。</p>
           <p>这是独立实验条件，不是原始 Trace Compile B/C，也不代表改进器自身已改进。执行时仅发送下方候选方法。</p>
@@ -208,13 +246,16 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
         onChange={async (endpoint, extra, job, confirmation) => change(endpoint, {path: candidate.local_path, ...extra}, confirmation, job)}/>}
     </section>}
     <div className="experience-grid">
-      {tab === 'sequences' && state.trace_representations.filter(t => matches(`${t.trace_name} ${t.description}`)).map(trace => <article className="surface experience-card" key={trace.id}>
-        {batch.checkbox(trace.id, trace.trace_name)}
+      {['sequences', 'history'].includes(tab) && visibleTraces.map(trace => <article className="surface experience-card" key={trace.id}>
+        {tab === 'sequences' && batch.checkbox(trace.id, trace.trace_name)}
         <div className="row-between"><Icon name="library" size={25}/><span className="tag">{trace.representation === 'D' ? '可执行参考 · 序列 D' : trace.representation === 'A' ? '可执行参考 · 原始证据 A' : trace.representation === 'B' ? '可执行参考 · Agent 方法 B' : trace.representation === 'C' ? '可执行参考 · 组合证据 C' : trace.representation === 'R' ? `实验候选 R · ${trace.review_status === 'approved_for_trial' ? '已允许试用' : trace.review_status === 'rejected' ? '已拒绝' : '待审查'}` : `${trace.representation} · 只读来源`}</span></div>
         <h2>{trace.trace_name}</h2><p className="quiet version-time">{versionTime(trace)}</p><p>{trace.description}</p><div className="experience-meta mono">{trace.id}</div>
+        <p className="quiet">{currentTrace(trace) ? '当前版本' : '历史版本'}{trace.version_count ? ` · 共 ${trace.version_count} 个版本` : ''}</p>
+        {trace.versioning?.mode === 'independent' && <p className="quiet">独立经验 · 保留来源关系</p>}
         {trace.lineage && <p className="quiet">反馈修订 {trace.lineage.generation} · 父版本 {trace.lineage.parent_id.slice(0, 8)}{trace.revision_changed === false ? ' · 方法未变' : ''}</p>}
         {trace.assisted_by_user && <p className="quiet">人工辅助来源 · 非纯自主执行结果</p>}
         <div className="button-row"><Button disabled={!!pending} onClick={() => void inspect(trace)}>查看模型原文</Button><Button appearance="primary" disabled={!usableTrace(trace)} onClick={() => onUse(trace)}>用于新任务</Button>
+          {tab === 'sequences' && (trace.version_count || 0) > 1 && <Button onClick={() => showHistory(trace)}>查看版本历史</Button>}
           {trace.representation === 'B' && trace.source_kind !== 'agent_run' && <Button disabled={disabled} onClick={() => void combine(trace)}>生成组合证据 C</Button>}
           </div></article>)}
       {tab === 'recordings' && state.recordings.filter(r => matches(r.task_id || r.trace_path)).map(record => <article className="surface experience-card" key={record.trace_path}>
@@ -262,7 +303,7 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
           <Button disabled={!!pending || item.can_open === false} onClick={() => void openLocal(item.path)}>打开归档</Button>
           <Button appearance="subtle" disabled={disabled || !item.can_delete} onClick={() => void trashAction(item, true)}>永久删除</Button></div></article>)}
     </div>
-    {({sequences: state.trace_representations.length, recordings: state.recordings.length, tasks: state.taskpacks.length, candidates: state.candidates.length, trash: trash.length}[tab] || 0) === 0 &&
+    {({sequences: currentTraces.length, history: visibleTraces.length, recordings: state.recordings.length, tasks: state.taskpacks.length, candidates: state.candidates.length, trash: trash.length}[tab] || 0) === 0 &&
       <section className="surface"><Empty icon="library" title={tab === 'trash' ? '回收站是空的' : '这里还没有记录'} text={tab === 'trash' ? '移入回收站的资产会在这里显示，可以恢复或明确确认后永久删除。' : '新录制、编译结果或反馈会出现在对应分类。已有数据不会被自动转换或覆盖。'} action={tab === 'trash' ? undefined : <Button onClick={onRecord}>录制示范</Button>}/></section>}
   </>;
 }

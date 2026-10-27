@@ -1,4 +1,4 @@
-"""Workbench boundary for explicitly selected Android devices (no auto-connect)."""
+"""Android task boundary; device discovery/connection is separate from execution."""
 import re
 import subprocess
 from pathlib import Path

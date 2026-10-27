@@ -86,8 +86,8 @@ def test_worker_routes_android_and_keeps_stop_control(
     result = controller.wait(job['job_id'])
     assert result['status'] == 'stopped'
     assert calls[0]['android_config'] == config
-    assert calls[0]['max_actions'] == 80
-    assert calls[0]['max_seconds'] == 1200
+    assert calls[0]['max_actions'] == 160
+    assert calls[0]['max_seconds'] == 2400
     assert calls[0].get('upstream', '') == mobileforge
     assert calls[0]['emergency_stop'].stop_event is controller._jobs[job['job_id']].stop_event
     if mobileforge:

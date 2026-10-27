@@ -19,7 +19,7 @@ from trace2task.android_touch import NavigationSuperseded
 from trace2task.execution_protocol import ActionUnavailable
 
 NAVIGATION_SKILLS = ('joystick_move', 'navigate_to')
-MAX_DURATION_MS = 1500
+MAX_NAVIGATION_DURATION_MS = 1500
 
 
 def _object(value, keys, name):
@@ -41,8 +41,10 @@ def validate_navigation_action(skill, value):
                     'camera_heading_deg', 'duration_ms'))
     _object(value, fields, skill)
     duration = value['duration_ms']
-    if type(duration) is not int or not 1 <= duration <= MAX_DURATION_MS:
-        raise ValueError('Navigation duration_ms must be an integer 1..1500')
+    if type(duration) is not int or duration < 1:
+        raise ValueError('Movement duration_ms must be a positive integer')
+    if skill == 'navigate_to' and duration > MAX_NAVIGATION_DURATION_MS:
+        raise ValueError('navigate_to duration_ms must be an integer 1..1500')
     if skill == 'joystick_move':
         args = {key: _number(value[key], 0, 1, key) for key in fields if key != 'duration_ms'}
     else:
@@ -75,7 +77,7 @@ def navigation_schemas():
         return {'type': 'object', 'additionalProperties': False, 'properties': properties,
                 'required': list(properties)}
 
-    duration = {'type': 'integer', 'minimum': 1, 'maximum': MAX_DURATION_MS}
+    duration = {'type': 'integer', 'minimum': 1}
     variants = {
         'joystick_move': {**{key: number() for key in ('start_x', 'start_y', 'end_x', 'end_y')},
                           'duration_ms': duration},
@@ -84,7 +86,8 @@ def navigation_schemas():
             'map_region': obj({key: number() for key in ('left', 'top', 'right', 'bottom')}),
             'marker': obj({'x': number(), 'y': number(), 'radius': number(.004, .04)}),
             'anchor': obj({'x': number(), 'y': number()}), 'stop_radius': number(.005, .1),
-            'camera_heading_deg': number(0, 360), 'duration_ms': duration,
+            'camera_heading_deg': number(0, 360),
+            'duration_ms': {**duration, 'maximum': MAX_NAVIGATION_DURATION_MS},
         },
     }
     return [obj({'skill': {'type': 'string', 'enum': [skill]}, 'args': obj(properties)})
@@ -284,7 +287,7 @@ def execute_navigation(driver, action, prepared, stop, *, is_current=lambda: Tru
         moving_since = time.monotonic()
         while not touch.released.is_set():
             check()
-            if time.monotonic() - moving_since >= args['duration_ms'] / 1000:
+            if (time.monotonic() - moving_since) * 1000 >= args['duration_ms']:
                 break
             if action.skill == 'joystick_move':
                 stop.sleep(.02)
@@ -314,6 +317,7 @@ def execute_navigation(driver, action, prepared, stop, *, is_current=lambda: Tru
             if not touch.move(endpoint):
                 break
             corrections += 1
+        touch.check()  # Surface a lost heartbeat/transport even if it already released the contact.
     except NavigationSuperseded:
         outcome = 'intervened'
     finally:

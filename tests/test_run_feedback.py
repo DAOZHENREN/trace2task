@@ -16,9 +16,7 @@ from trace2task.run_experience import (
 from trace2task.run_memory import freeze_experience
 from trace2task.trace_library import execution_context, list_traces, read_body, read_model_input
 
-REVISED = METHOD.replace('等待可交互状态。[第 1 轮]', '等待可交互状态，核对当前按钮是否可用。[第 1 轮]') + (
-    '\n## 反馈修订说明\n- 保留按可见状态判断的步骤。[父方法]\n'
-    '- 补充操作前按钮检查。[第 1 轮]\n- 未覆盖其他分支，不认为已经改善。\n')
+REVISED = METHOD.replace('等待可交互状态。', '等待可交互状态，核对当前按钮是否可用。')
 
 
 def publish(root, result):

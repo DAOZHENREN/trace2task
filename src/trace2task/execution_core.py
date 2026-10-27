@@ -115,6 +115,14 @@ class ExecutionCore:
             if self.attempts >= self.max_actions:
                 return ExecutionResult('action_limit', target, payload,
                                        steps=tuple(self.last_steps))
+            if action.skill == 'camera_drag' and self.last_steps:
+                self.feedback = {'status': 'reobserve', 'executed': False,
+                                 'reason': 'Camera control needs a fresh screenshot after preceding actions; '
+                                           'replan camera_drag alone from the new image.'}
+                self.record('batch_boundary', observation_id=observation_id,
+                            reason='camera_needs_fresh_observation', remaining=len(plan.actions)-index+1)
+                return ExecutionResult('reobserve', target, payload, reason=self.feedback['reason'],
+                                       steps=tuple(self.last_steps))
             try:
                 self.backend.check_current(target, state)
             except ObservationStale as error:
@@ -241,12 +249,21 @@ class ExecutionCore:
                 execution_context.pop('cursor_position', None)
             target = next_target
             if receipt.get('reobserve'):
-                self.feedback = {'status': 'navigation_reobserve', 'executed': True,
-                                 'navigation': receipt.get('navigation'),
-                                 'reason': 'Bounded navigation ended; discard the remaining batch and re-observe. '
-                                 'Proximity is not proof of task completion.'}
+                if action.skill == 'camera_drag':
+                    self.feedback = {'status': 'camera_reobserve', 'executed': True,
+                                     'camera': receipt.get('camera'),
+                                     'reason': 'Camera swipe ended; discard the remaining batch and re-observe. '
+                                               'Verify the actual view change and re-estimate camera heading '
+                                               'before movement. Input delivery is not task completion.'}
+                    boundary = 'camera_feedback'
+                else:
+                    self.feedback = {'status': 'navigation_reobserve', 'executed': True,
+                                     'navigation': receipt.get('navigation'),
+                                     'reason': 'Bounded navigation ended; discard the remaining batch and re-observe. '
+                                     'Proximity is not proof of task completion.'}
+                    boundary = 'navigation_feedback'
                 self.record('batch_boundary', observation_id=observation_id,
-                            reason='navigation_feedback', remaining=len(plan.actions)-index)
+                            reason=boundary, remaining=len(plan.actions)-index)
                 return ExecutionResult('reobserve', target, payload, receipt,
                                        reason=self.feedback['reason'], delivery_mode=delivery_mode,
                                        steps=tuple(self.last_steps))

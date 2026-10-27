@@ -19,7 +19,7 @@ def test_invalid_budget(value):
 
 
 def test_budget_defaults_and_copy():
-    assert android_budget() == {'max_actions': 80, 'max_seconds': 1200}
+    assert android_budget() == {'max_actions': 160, 'max_seconds': 2400}
     value = {'max_actions': 33, 'max_seconds': 180}
     result = android_budget(value)
     value['max_actions'] = 1
@@ -98,3 +98,100 @@ def test_loop_can_continue_past_ten_and_stops_at_selected_budget(tmp_path):
     assert result['actions'] == 12
     assert result['stop_reason'] == 'action_limit'
     assert not result['task_complete']
+
+
+def test_cooldown_pauses_budget_but_keeps_stop_and_normal_expiry(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr('trace2task.execution_budget.time.monotonic', lambda: clock[0])
+    class Cancellable(Stop):
+        stopped = False
+        def raise_if_requested(self):
+            if self.stopped:
+                raise EmergencyStopRequested('stopped')
+    stop = Cancellable()
+    budget = BudgetStop(stop, 30)
+    clock[0] = 5
+    budget.rate_limit_wait(590)
+    clock[0] = 400
+    budget.raise_if_requested()
+    stop.stopped = True
+    with pytest.raises(EmergencyStopRequested):
+        budget.raise_if_requested()
+    stop.stopped = False
+    clock[0] = 600
+    budget.rate_limit_wait(None)
+    assert budget.paused_seconds == 590
+    budget.raise_if_requested()
+    clock[0] = 620
+    with pytest.raises(TimeBudgetExceeded):
+        budget.raise_if_requested()
+
+
+def test_early_cooldown_end_returns_unused_budget_pause(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr('trace2task.execution_budget.time.monotonic', lambda: clock[0])
+    budget = BudgetStop(Stop(), 30)
+    budget.rate_limit_wait(590)
+    clock[0] = 10
+    budget.rate_limit_wait(None)
+    assert budget.paused_seconds == 10
+    clock[0] = 40
+    with pytest.raises(TimeBudgetExceeded):
+        budget.raise_if_requested()
+
+
+def test_agent_resumes_after_cooldown_and_replans_changed_screen_before_input(tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr('trace2task.execution_budget.time.monotonic', lambda: clock[0])
+    class CoolingSession(Session):
+        def run_turn(self, **request):
+            self.last_rate_limit_wait_seconds = 0
+            if not self.requests:
+                self.rate_limit_callback(590)
+                clock[0] += 590
+                self.rate_limit_callback(None)
+                self.last_rate_limit_wait_seconds = 590
+            return super().run_turn(**request)
+    click = _reply([{'skill': 'click', 'args': {'x': .5, 'y': .5, 'button': 'left'}}])
+    session = CoolingSession([click, click])
+    driver = Driver(tmp_path)
+    result = run_chat_agent(instruction='test', model='fake', reasoning_effort='low',
+        output_root=tmp_path, emergency_stop=Stop(), status_callback=lambda msg: None,
+        executor_backend='cua', cua_target=Driver.target, cua_driver=driver,
+        session=session, max_actions=1, max_seconds=30)
+    assert len(session.requests) == 2
+    assert result['actions'] == 1 and len(driver.calls) == 1
+    assert result['model_io'][0]['execution']['status'] == 'stale'
+    assert result['model_io'][0]['execution']['executed'] is False
+    assert result['budget']['rate_limit_wait_seconds'] == 590
+    assert result['stop_reason'] == 'action_limit'
+
+
+@pytest.mark.parametrize('max_seconds,expected_actions', [(600, 1), (330, 0)])
+def test_silent_model_wait_preserves_budget_and_rechecks_screen(tmp_path, monkeypatch, max_seconds, expected_actions):
+    clock = [0.0]
+    monkeypatch.setattr('trace2task.execution_budget.time.monotonic', lambda: clock[0])
+
+    class DelayedSession(Session):
+        def run_turn(self, **request):
+            self.last_turn_wait_extended = not self.requests
+            if self.last_turn_wait_extended:
+                self.active_wait_callback(300)
+                clock[0] += 350
+            return super().run_turn(**request)
+
+    click = _reply([{'skill': 'click', 'args': {'x': .5, 'y': .5, 'button': 'left'}}])
+    session, driver = DelayedSession([click, click]), Driver(tmp_path)
+    result = run_chat_agent(instruction='synthetic', model='fake', reasoning_effort='low',
+        output_root=tmp_path, emergency_stop=Stop(), status_callback=lambda _: None,
+        executor_backend='cua', cua_target=Driver.target, cua_driver=driver,
+        session=session, max_actions=1, max_seconds=max_seconds)
+    assert result['actions'] == len(driver.calls) == expected_actions
+    assert not result['budget'].get('rate_limit_wait_seconds')
+    if expected_actions:
+        assert len(session.requests) == 2
+        assert result['model_io'][0]['execution']['status'] == 'stale'
+        assert result['model_io'][0]['execution']['executed'] is False
+    else:
+        assert result['stop_reason'] == 'time_limit'
+        assert len(session.requests) == 1

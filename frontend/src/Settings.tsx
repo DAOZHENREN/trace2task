@@ -5,6 +5,7 @@ import {useConfirm} from './ConfirmDialog';
 import type {AppState, Catalog, Config, Run} from './types';
 import {Choice, Empty, Field, PageHeading, Refresh} from './ui';
 import {Sections, useAction} from './workflow';
+import {codexEfforts} from './codexModels';
 
 export function Settings({state, catalog, config, setConfig, busy, section, setSection, visible, onRun, onError, sound, setSound, playSound, onPromptDirty}: {
   state: AppState; catalog: Catalog; config: Config; setConfig: (next: Config) => void; busy: boolean;
@@ -15,7 +16,7 @@ export function Settings({state, catalog, config, setConfig, busy, section, setS
     <Sections label="设置分类" value={section} onChange={setSection} items={[{id: 'preferences', label: '执行偏好'}, {id: 'prompts', label: '模型提示词'},
       {id: 'components', label: '组件与模型文件'}, {id: 'recovery', label: '任务恢复'}]}/>
     <div hidden={section !== 'preferences'} className="settings-grid"><section className="surface setting-card"><h2>执行偏好</h2><p>设置只影响下一次任务；运行中的配置已经固定。</p>
-      <Field label="Codex 思考强度"><Choice value={config.effort} disabled={busy} onChange={e => setConfig({...config, effort: e.target.value})}>{state.agent_options.reasoning_efforts.map(e => <option key={e}>{e}</option>)}</Choice></Field>
+      <Field label="Codex 思考强度"><Choice value={config.effort} disabled={busy} onChange={e => setConfig({...config, effort: e.target.value})}>{codexEfforts(state.agent_options, config.model).map(e => <option key={e}>{e}</option>)}</Choice></Field>
       <div className="button-row spaced"><Checkbox label="任务结束提示音" checked={sound} onChange={(_, d) => setSound(!!d.checked)}/><Button onClick={playSound}>试听</Button></div></section>
       <section className="surface setting-card"><h2>本地记录与隐私</h2><p>新任务的摘要、增量事件和逐轮原文写入本地 runs/workbench.sqlite3。重启后可以回看，不会自动恢复操作。</p><p>既有日志、经验、反馈和权重继续保留；不启用外部遥测，也没有自动清理。原始请求可能包含截图和敏感文字，请按需查看。</p></section></div>
     <div hidden={section !== 'prompts'}><PromptEditor catalog={catalog} busy={busy} onError={onError} visible={visible && section === 'prompts'} onDirty={onPromptDirty}/></div>

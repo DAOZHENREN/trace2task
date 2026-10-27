@@ -34,3 +34,17 @@ def isolated_personal_profiles(tmp_path):
         isolation.delenv('OPENAI_API_KEY', raising=False)
         isolation.setattr(APISettingsStore, '__init__', isolated_init)
         yield
+
+
+@pytest.fixture(autouse=True)
+def offline_codex_catalog():
+    """No model metadata requests to the signed-in account from unit tests."""
+    from trace2task import codex_catalog
+    models = ('gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna')
+    rows = [{'model': model, 'displayName': model, 'isDefault': i == 0,
+             'defaultReasoningEffort': 'low', 'inputModalities': ['text', 'image'],
+             'supportedReasoningEfforts': [{'reasoningEffort': e} for e in ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')]}
+            for i, model in enumerate(models)]
+    with pytest.MonkeyPatch.context() as isolation:
+        isolation.setattr(codex_catalog, 'read_codex_models', lambda root: rows)
+        yield

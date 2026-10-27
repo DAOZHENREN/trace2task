@@ -65,6 +65,8 @@ def test_instruction_invalidates_pending_reply_and_is_submitted_once(phone, tmp_
     assert result['model_io'][0]['execution']['executed'] is False
     assert '只点击右侧按钮' in session.requests[1]['prompt']
     assert '只点击右侧按钮' not in session.requests[2]['prompt']  # Existing provider session retains it.
+    assert 'User update:' not in session.requests[2]['prompt']
+    assert 'Human intervention from the current user' not in session.requests[2]['prompt']
     command = result['interventions']['commands'][0]
     assert command['status'] == 'responded' and command['submitted_round'] == command['responded_round'] == 1
     assert result['assisted_by_user'] and result['interventions']['phase'] == 'closed'

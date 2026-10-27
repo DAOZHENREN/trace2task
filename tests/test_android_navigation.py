@@ -187,7 +187,9 @@ def environment(tmp_path, monkeypatch):
 
 def execute(phone, stop, payload=None, *, core=None, index=0, context=None):
     state, _ = phone.observe(index)
-    core = core or ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    core = core or ExecutionCore(AndroidExecutionBackend(
+        phone, experimental_navigation=payload is None or payload['skill'] == 'navigate_to'),
+        stop, phone.record)
     result = core.execute({'actions': [payload or navigation()]}, target=phone.target,
                           observation_id=str(index), state=state, execution_context=context)
     return result, core
@@ -210,14 +212,19 @@ def test_navigation_payload_is_strict(path, value):
         UnifiedAction.from_payload(payload)
 
 
-def test_unknown_fields_and_unbounded_joystick_are_rejected():
+def test_unknown_fields_and_invalid_joystick_durations_are_rejected():
     for payload in [navigation(), joystick()]:
         payload['args']['shell'] = 'anything'
         with pytest.raises(ValueError):
             UnifiedAction.from_payload(payload)
-    for duration in [1501, -1, True, 1.2]:
+    for duration in [0, -1, True, 1.2, float('nan'), float('inf'), '6000']:
         with pytest.raises(ValueError):
             UnifiedAction.from_payload(joystick(duration))
+
+
+@pytest.mark.parametrize('duration', [1501, 6000, 60000, 10**40])
+def test_joystick_accepts_positive_duration_without_per_action_maximum(duration):
+    assert UnifiedAction.from_payload(joystick(duration)).args['duration_ms'] == duration
 
 
 def test_marker_tracker_rejects_loss_ambiguity_and_textureless_seed():
@@ -301,7 +308,7 @@ def test_lost_target_before_down_closes_empty_helper_without_input(environment):
 def test_three_failed_navigation_attempts_latch_without_hidden_retry(environment):
     phone, stop = environment
     phone.frames = [picture()]
-    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    core = ExecutionCore(AndroidExecutionBackend(phone, experimental_navigation=True), stop, phone.record)
     for index in range(3):
         result, _ = execute(phone, stop, core=core, index=index)
         assert result.receipt['navigation']['outcome'] == 'no_progress'
@@ -309,17 +316,51 @@ def test_three_failed_navigation_attempts_latch_without_hidden_retry(environment
     assert result.status == 'rejected' and len(phone.touches) == 3
 
 
-def test_joystick_holds_not_slowly_drags_and_keeps_action_budget(environment):
+@pytest.mark.parametrize('duration', [1000, 6000, 60000])
+def test_joystick_holds_not_slowly_drags_and_keeps_action_budget(environment, duration):
     phone, stop = environment
     core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record, max_actions=1)
     state, _ = phone.observe(0)
-    result = core.execute({'actions': [joystick(), {'skill': 'click', 'args': {'x': .1, 'y': .1}}]},
+    began = stop.now
+    result = core.execute({'actions': [joystick(duration), {'skill': 'click', 'args': {'x': .1, 'y': .1}}]},
                           target=phone.target, state=state, observation_id='one')
     assert result.status == 'reobserve' and core.attempts == 1 and not phone.other_input
+    assert duration / 1000 <= stop.now - began < duration / 1000 + .03
     assert phone.touches[0].events == [
         {'event': 'down', 'point': (64, 192)}, {'event': 'move', 'point': (64, 156)}, {'event': 'up'}]
     result, _ = execute(phone, stop, joystick(), core=core, index=1)
     assert result.status == 'action_limit' and len(phone.touches) == 1
+
+
+def test_long_joystick_obeys_task_time_budget_and_releases(environment):
+    phone, clock = environment
+    stop = BudgetStop(clock, 2)
+    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    with pytest.raises(TimeBudgetExceeded):
+        execute(phone, stop, joystick(60000), core=core)
+    assert core.stopped and core.attempts == 1 and not phone.other_input
+    assert 2 <= clock.now - 100 < 2.1
+    assert [event['event'] for event in phone.touches[0].events] == ['down', 'move', 'up']
+
+
+def test_joystick_device_failure_is_not_reported_as_normal_duration(environment, monkeypatch):
+    phone, stop = environment
+    original = Touch.check
+    sleep = stop.sleep
+    def release_during_sleep(seconds):
+        sleep(seconds)
+        if stop.now >= 102:
+            phone.touches[0].released.set()
+    def fail_after_release(touch):
+        original(touch)
+        if touch.released.is_set():
+            raise RuntimeError('heartbeat timed out')
+    monkeypatch.setattr(stop, 'sleep', release_during_sleep)
+    monkeypatch.setattr(Touch, 'check', fail_after_release)
+    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    with pytest.raises(RuntimeError, match='heartbeat timed out'):
+        execute(phone, stop, joystick(6000), core=core)
+    assert core.stopped and len(phone.touches) == 1 and phone.touches[0].closed
 
 
 @pytest.mark.parametrize('kind', ['stop', 'budget', 'capture_error', 'scope_change'])
@@ -340,7 +381,7 @@ def test_interruptions_always_release_and_fail_closed(environment, kind):
     phone.capture_hook = change
     expected = {'stop': EmergencyStopRequested, 'budget': TimeBudgetExceeded,
                 'capture_error': TimeoutError, 'scope_change': RuntimeError}[kind]
-    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    core = ExecutionCore(AndroidExecutionBackend(phone, experimental_navigation=True), stop, phone.record)
     with pytest.raises(expected):
         execute(phone, stop, core=core)
     assert core.stopped and core.attempts == 1
@@ -352,7 +393,7 @@ def test_manual_takeover_releases_before_pause_ack(environment):
     phone, stop = environment
     interventions = RunInterventions()
     interventions.activate(phone.record)
-    backend = AndroidExecutionBackend(phone, interventions=interventions)
+    backend = AndroidExecutionBackend(phone, interventions=interventions, experimental_navigation=True)
     core = ExecutionCore(backend, stop, phone.record, interventions=interventions)
     def pause(index):
         if index == 2:
@@ -375,10 +416,11 @@ def test_prepared_snapshot_and_geometry_are_bound(environment):
     assert not phone.touches
 
 
-def test_existing_model_loop_reobserves_then_verifies_not_auto_complete(environment, tmp_path):
+def test_model_loop_rejects_retired_navigation_then_uses_joystick(environment, tmp_path):
     phone, stop = environment
     review = json.dumps({'verdict': 'complete', 'evidence': 'visible interaction result', 'missing': ''})
     session = Session([_reply([navigation(), {'skill': 'click', 'args': {'x': .9, 'y': .8}}]),
+                       _reply([joystick(), {'skill': 'click', 'args': {'x': .9, 'y': .8}}]),
                        _reply(complete=True), review])
     result = run_chat_agent(instruction='approach target', model='fake', reasoning_effort='low',
                             output_root=tmp_path / 'runs', emergency_stop=stop,
@@ -386,8 +428,9 @@ def test_existing_model_loop_reobserves_then_verifies_not_auto_complete(environm
                             android_config={'serial': 'fake'}, android_driver=phone,
                             session=session, max_actions=3, max_seconds=30)
     assert result['actions'] == 1 and result['stop_reason'] == 'visual_completion_reviewed'
-    assert result['history'][0]['navigation']['outcome'] == 'arrival_candidate'
-    assert len(session.requests) == 3 and not phone.other_input
+    assert result['model_io'][0]['status'] == 'format_rejected'
+    assert result['history'][0]['action']['actions'][0]['skill'] == 'joystick_move'
+    assert len(session.requests) == 4 and not phone.other_input
     assert not result['verified']  # Same-model review, not independent evaluation.
     assert phone.broken
 
@@ -412,7 +455,7 @@ def test_slow_feedback_rejected_before_down_and_latched(environment):
     phone, stop = environment
     phone.frames = [picture()]
     phone.capture_hook = lambda _: setattr(stop, 'now', stop.now + .6)
-    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    core = ExecutionCore(AndroidExecutionBackend(phone, experimental_navigation=True), stop, phone.record)
     for index in range(3):
         result, _ = execute(phone, stop, core=core, index=index)
         assert result.receipt['navigation']['outcome'] == 'feedback_too_slow'
@@ -438,7 +481,7 @@ def test_uncertain_release_stops_run_without_next_input(environment, monkeypatch
     phone, stop = environment
     phone.frames = [picture(), picture(), picture((66, 70))]
     monkeypatch.setattr(Touch, 'close', lambda self: None)
-    core = ExecutionCore(AndroidExecutionBackend(phone), stop, phone.record)
+    core = ExecutionCore(AndroidExecutionBackend(phone, experimental_navigation=True), stop, phone.record)
     with pytest.raises(RuntimeError, match='触点释放'):
         execute(phone, stop, core=core)
     assert core.stopped and not phone.other_input

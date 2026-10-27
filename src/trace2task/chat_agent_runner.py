@@ -84,6 +84,11 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
         if kind == "execution_result" and data.get("status") in {
                 "interrupted_or_unknown", "foreground_unavailable"}:
             audit.execution(data)
+        if kind == 'android_capture_retry':
+            status_callback(f'截图读取超过 {data["timeout_seconds"]} 秒，设备与授权应用已核对；'
+                            f'正在第 {data["attempt"] - 1}/{data["max_attempts"] - 1} 次重试截图。')
+        elif kind == 'android_capture_recovered':
+            status_callback('截图已恢复，继续当前任务。')
 
     audit = ChatRunAudit(root, result, record, status_callback, on_round=on_model_round)
     raw_audit = IOAudit(root)
@@ -108,8 +113,25 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             session = CodexAppServerSession(resolve_codex_binary(), model=model,
                                              reasoning_effort=reasoning_effort,
                                              cwd=root, timeout_seconds=300,
+                                             wait_on_rate_limit=True,
+                                             wait_while_active=True,
                                              thread_config=thread_config)
     session.audit = raw_audit
+    if provider == 'codex' and model_adapter is None:
+        def rate_limit_wait(seconds):
+            if isinstance(emergency_stop, BudgetStop):
+                emergency_stop.rate_limit_wait(seconds)
+            audit.rate_limit_until = time.monotonic() + seconds if seconds is not None else 0.0
+            record('model_rate_limit_wait', retry_after_seconds=seconds)
+            status_callback(
+                f'Codex 服务端限流，等待约 {seconds:.0f} 秒后自动继续；冷却不计入执行时间预算，可随时停止。'
+                if seconds is not None else '限流冷却已结束，正在等待模型继续返回。')
+        session.wait_on_rate_limit = True
+        session.rate_limit_callback = rate_limit_wait
+        session.wait_while_active = True
+        session.active_wait_callback = lambda seconds: status_callback(
+            f'模型已等待 {seconds:.0f} 秒；Codex 请求仍在运行，继续等待同一请求。'
+            '总时间预算继续计时，可随时停止。')
     if provider == "api":
         session.system_guidance = prompt_guidance
     from trace2task.cua_desktop import DESKTOP_TARGET
@@ -237,7 +259,7 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                               'browser' if executor_backend == 'browser' else 'desktop') + (
                                   '_agent' if experience is not None else '_baseline')
         if interventions is not None:
-            interventions.activate(record)
+            interventions.activate(record, directory=root)
         run_local_agent_loop(
             observer=observation, initial_target=target, core=core, audit=audit,
             predictor=adapter.predict, instruction=instruction, model=model,
@@ -257,6 +279,14 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
         result["stop_reason"] = "emergency_stop"
     except Exception as error:  # noqa: BLE001 - persist uncertain delivery; never retry it
         result.update(stop_reason="error", error=f"{type(error).__name__}: {error}")
+        if provider == "codex":
+            from trace2task.codex_app_server import CodexTurnError, classify_codex_failure
+
+            category = classify_codex_failure(error)
+            if category is not None:
+                result["failure_category"] = category
+            if isinstance(error, CodexTurnError):
+                result["model_failure_diagnostics"] = error.diagnostics
         record("error", error=result["error"])
     finally:
         if interventions is not None:
@@ -274,6 +304,10 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             session.close()
         emergency_stop.close()
         result["elapsed_seconds"] = time.perf_counter() - started
+        if isinstance(emergency_stop, BudgetStop):
+            emergency_stop.rate_limit_wait(None)
+            if emergency_stop.paused_seconds:
+                result['budget']['rate_limit_wait_seconds'] = round(emergency_stop.paused_seconds, 3)
         audit.finish(result["elapsed_seconds"])
         record("result", **result)
         (root / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2),

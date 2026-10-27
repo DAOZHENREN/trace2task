@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 import pytest
+from test_intervention_images import upload
 from test_run_experience import METHOD, OPTIONS, Session, compile_draft, seed
 from test_run_feedback import REVISED, feedback_run, publish
 
+from trace2task.intervention_images import save_visual
 from trace2task.run_experience import compile_run_draft, prepare_run_experience, read_draft
 from trace2task.trace_library import list_traces, read_body, read_model_input
 
@@ -41,19 +43,46 @@ def test_human_preview_and_saved_provenance_include_all_handoff_images(tmp_path)
     evidence = json.loads(prepared['input'])
     assert prepared['summary']['assisted_by_user'] is True
     assert prepared['summary']['execution_condition'] == 'human-assisted'
-    assert len(prepared['images']) == 10  # Eight sampled observations PLUS both manual images.
+    assert len(prepared['images']) == 3  # Deduplicated observation plus both manual images.
     human = evidence['human_interventions']
     assert human['precise_actions_recorded'] is False and len(human['commands']) == 3
-    assert human['takeovers'][0]['note'] == '我已选好技能，继续'
+    assert human['takeovers'][0]['note_command_index'] == 3
     assert 'SECRET_DEVICE' not in prepared['input'] and 'PRIVATE_DEVICE' not in prepared['input']
     assert str(tmp_path) not in prepared['input']
-    session = Session(METHOD + HUMAN)
+    session = Session(METHOD)
     child = publish(tmp_path, compile_run_draft(tmp_path, prepared, **OPTIONS,
         session_factory=session.factory, binary_resolver=lambda _: 'fake'))
     assert '人工辅助运行' in session.options['base_instructions']
     assert read_body(tmp_path, child)['execution_condition'] == 'human-assisted'
     assert list_traces(tmp_path)[0]['assisted_by_user'] is True
-    assert len(read_model_input(tmp_path, child)['compiler']['images']) == 10
+    assert len(read_model_input(tmp_path, child)['compiler']['images']) == 3
+
+
+@pytest.mark.parametrize('tamper', [False, True])
+def test_visual_reference_survives_experience_projection_and_is_digest_checked(tmp_path, tamper):
+    store, run, _ = seed(tmp_path)
+    assisted(tmp_path, store, run)
+    run['result']['trace_path'] = str(tmp_path / 'runs/source/trace.jsonl')
+    command = run['interventions']['commands'][-1]
+    visual = save_visual(upload(), segment=run['interventions']['takeovers'][0],
+                         directory=Path(run['result']['trace_path']).parent, request_id=command['id'])
+    command['visual'] = visual
+    store.save(run)
+    if tamper:
+        Path(visual['image']['path']).write_bytes(b'tampered')
+        with pytest.raises(ValueError, match='标注截图已变化'):
+            prepare_run_experience(tmp_path, store, run['job_id'])
+        return
+    prepared = prepare_run_experience(tmp_path, store, run['job_id'])
+    reference = json.loads(prepared['input'])['human_interventions']['commands'][-1]['visual']
+    assert reference['origin'] == 'user_upload' and 'strokes' not in reference
+    assert reference['source']['id'] in [i['id'] for i in prepared['images']]
+    assert reference['image']['id'] in [i['id'] for i in prepared['images']]
+    assert str(tmp_path) not in prepared['input'] and 'upload_data_url' not in prepared['input']
+    session = Session(METHOD)
+    child = publish(tmp_path, compile_run_draft(tmp_path, prepared, **OPTIONS,
+        session_factory=session.factory, binary_resolver=lambda _: 'fake'))
+    assert any(p['id'] == reference['image']['id'] for p in read_model_input(tmp_path, child)['compiler']['images'])
 
 
 @pytest.mark.parametrize('change', ['hash', 'external', 'other_run', 'package', 'missing'])
@@ -76,9 +105,9 @@ def test_manual_image_tamper_and_scope_mismatch_rejected_before_model(tmp_path, 
         prepare_run_experience(tmp_path, store, run['job_id'])
 
 
-@pytest.mark.parametrize('output', [METHOD, METHOD + HUMAN.replace('[人工指令 1]', '[人工指令 2]'),
+@pytest.mark.parametrize('output', [METHOD + HUMAN, METHOD + HUMAN.replace('[人工指令 1]', '[人工指令 2]'),
                                   METHOD + HUMAN.replace('[人工接管 1]', '[人工接管 2]')])
-def test_compiler_cannot_omit_or_invent_human_sources(tmp_path, output):
+def test_compiler_keeps_human_reports_out_of_standalone_method(tmp_path, output):
     store, run, _ = seed(tmp_path)
     assisted(tmp_path, store, run)
     with pytest.raises(ValueError, match='人工干预'):
@@ -94,7 +123,7 @@ def test_human_feedback_preserves_actual_parent_without_claiming_improvement(tmp
     assisted(tmp_path, store, run)
     prepared = prepare_run_experience(tmp_path, store, run['job_id'])
     assert json.loads(prepared['input'])['parent_procedure'] == METHOD
-    session = Session(METHOD if unchanged else REVISED + HUMAN)
+    session = Session(METHOD if unchanged else REVISED)
     result = compile_run_draft(tmp_path, prepared, **OPTIONS,
         session_factory=session.factory, binary_resolver=lambda _: 'fake')
     draft = read_draft(tmp_path, result['experience_draft_id'])

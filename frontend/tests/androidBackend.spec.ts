@@ -1,5 +1,9 @@
 import {test, expect} from '@playwright/test';
 
+test.beforeEach(async ({page}) => {
+  await page.route('**/api/android/devices', route => route.fulfill({json: {devices: [], warnings: []}}));
+});
+
 test('scope selects the backend and Android locks ADB; Win32 is retired', async ({page}) => {
   const jobs: unknown[] = [];
   await page.route('**/api/jobs', route => {
@@ -155,7 +159,7 @@ test('Android config is explicit; probe sends no job; confirmation preserves tar
     mobileforge: 'D:/Tools/trace2task-android/MobileForge', cua_target: null, use_experience: false});
 });
 
-test('reuse existing ADB: choose device and app then submit without entering connection parameters', async ({page}) => {
+test('Android scope refreshes automatically, selects the only online device, and preserves custom budgets', async ({page}) => {
   const jobs: any[] = []; const inspected: any[] = [];
   let online = true;
   await page.route('**/api/android/devices', route => route.fulfill({json: {warnings: [], devices: online ? [
@@ -171,16 +175,14 @@ test('reuse existing ADB: choose device and app then submit without entering con
   await page.goto('/');
   await page.getByRole('button', {name: '使用 3090 控制云手机', exact: true}).click();
   await expect(page.getByRole('combobox', {name: '设备 serial', exact: true})).not.toBeVisible();
-  await page.getByRole('button', {name: '刷新已连接设备', exact: true}).click();
-  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('');
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('5037/127.0.0.1:54146');
   await expect(page.getByLabel('已连接设备', {exact: true}).locator('option[value="5038/offline-phone"]')).toBeDisabled();
-  await page.getByLabel('已连接设备', {exact: true}).selectOption('5037/127.0.0.1:54146');
   await expect(page.getByLabel('授权应用', {exact: true})).toHaveValue('com.tencent.nrc');
   expect(inspected[0].android_config.server_port).toBe(5037);
   expect(jobs).toHaveLength(0);
   await page.getByRole('textbox', {name: '任务指令'}).fill('只观察当前画面，不操作手机');
-  await expect(page.getByLabel('动作预算', {exact: true})).toHaveValue('80');
-  await expect(page.getByLabel('时间预算（分钟）', {exact: true})).toHaveValue('20');
+  await expect(page.getByLabel('动作预算', {exact: true})).toHaveValue('160');
+  await expect(page.getByLabel('时间预算（分钟）', {exact: true})).toHaveValue('40');
   await page.getByLabel('动作预算', {exact: true}).fill('120');
   await page.getByLabel('时间预算（分钟）', {exact: true}).fill('30');
   await page.getByRole('button', {name: '开始任务', exact: true}).click();
@@ -197,8 +199,10 @@ test('reuse existing ADB: choose device and app then submit without entering con
   await expect(page.getByText(/未发现已连接设备/)).toBeVisible();
 });
 
-test('RedFinger forwarded channel attaches only after explicit selection', async ({page}) => {
+test('Android scope connects the available RedFinger channel without starting a task', async ({page}) => {
   const requests: any[] = [];
+  const jobs: any[] = [];
+  await page.route('**/api/jobs', route => {jobs.push(route.request().postDataJSON()); return route.fulfill({json: {job_id: 'auto-forwarded', status: 'completed'}});});
   await page.route('**/api/android/devices', route => route.fulfill({json: {warnings: [], devices: [
     {serial: '127.0.0.1:60378', server_port: 5038, adb: 'D:/Tools/trace2task-android/sdk/platform-tools/adb.exe', state: 'forwarded', model: '红手指现有通道', source: 'redfinger'},
   ]}}));
@@ -207,16 +211,84 @@ test('RedFinger forwarded channel attaches only after explicit selection', async
     return route.fulfill({json: {current_package: '', apps: [{package: 'com.tencent.nrc', label: '洛克王国世界'}]}});
   });
   await page.goto('/');
-  await page.getByRole('button', {name: '使用 3090 控制云手机', exact: true}).click();
-  await page.getByRole('button', {name: '刷新已连接设备', exact: true}).click();
+  await page.getByLabel('操作范围', {exact: true}).selectOption('android');
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('5038/127.0.0.1:60378');
   await expect(page.getByLabel('已连接设备', {exact: true}).locator('option[value="5038/127.0.0.1:60378"]')).toBeEnabled();
-  expect(requests).toHaveLength(0);
-  await page.getByLabel('已连接设备', {exact: true}).selectOption('5038/127.0.0.1:60378');
   await expect(page.getByLabel('授权应用', {exact: true})).toBeEnabled();
   await page.getByLabel('授权应用', {exact: true}).selectOption('com.tencent.nrc');
   expect(requests).toHaveLength(1);
   expect(requests[0]).toMatchObject({source: 'redfinger', android_config: {serial: '127.0.0.1:60378', server_port: 5038}});
+  expect(jobs).toHaveLength(0);
   await page.getByRole('textbox', {name: '任务指令'}).fill('观察画面');
   await page.getByRole('button', {name: '开始任务', exact: true}).click();
   await expect(page.getByRole('dialog')).toContainText('将打开授权应用 com.tencent.nrc');
+  await expect(page.getByRole('dialog')).toContainText('160 个动作 / 40 分钟');
+  await page.getByRole('button', {name: '确认开始', exact: true}).click();
+  await expect.poll(() => jobs.length).toBe(1);
+  expect(jobs[0].android_budget).toEqual({max_actions: 160, max_seconds: 2400});
+});
+
+test('multiple cloud channels connect once and leave device choice to the user', async ({page}) => {
+  const requests: any[] = [];
+  const attached = new Set<string>();
+  const serials = ['127.0.0.1:60101', '127.0.0.1:60102'];
+  await page.route('**/api/android/devices', route => route.fulfill({json: {warnings: [], devices: serials.map(serial => (
+    {serial, server_port: 5038, adb: 'D:/Tools/trace2task-android/sdk/platform-tools/adb.exe',
+      state: attached.has(serial) ? 'device' : 'forwarded', source: attached.has(serial) ? undefined : 'redfinger', model: 'Cloud Phone'}))}}));
+  await page.route('**/api/android/device-apps', route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (body.source === 'redfinger') attached.add(body.android_config.serial);
+    return route.fulfill({json: {current_package: 'com.example.current', apps: [
+      {package: 'com.example.current', label: '当前应用'}, {package: 'com.example.selected', label: '指定应用'},
+    ]}});
+  });
+  await page.goto('/');
+  await page.getByLabel('操作范围', {exact: true}).selectOption('android');
+  await expect(page.getByRole('button', {name: '刷新已连接设备', exact: true})).toBeEnabled();
+  expect(requests.filter(r => r.source === 'redfinger')).toHaveLength(2);
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('');
+  await expect(page.getByText('发现 2 台在线设备，请选择本次使用的手机。')).toBeVisible();
+  await page.getByLabel('已连接设备', {exact: true}).selectOption('5038/127.0.0.1:60102');
+  await expect(page.getByLabel('授权应用', {exact: true})).toBeEnabled();
+  await page.getByLabel('授权应用', {exact: true}).selectOption('com.example.selected');
+  await page.getByRole('button', {name: '刷新已连接设备', exact: true}).click();
+  await expect(page.getByLabel('授权应用', {exact: true})).toBeEnabled();
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('5038/127.0.0.1:60102');
+  await expect(page.getByLabel('授权应用', {exact: true})).toHaveValue('com.example.selected');
+  expect(requests.filter(r => r.source === 'redfinger')).toHaveLength(2);
+});
+
+test('leaving Android invalidates an in-flight refresh and reentering refreshes again', async ({page}) => {
+  let discoveryCount = 0, oldHandled = false;
+  let releaseOld!: () => void;
+  const oldResponse = new Promise<void>(resolve => {releaseOld = resolve;});
+  const inspected: string[] = [];
+  await page.route('**/api/android/devices', async route => {
+    const count = ++discoveryCount;
+    if (count === 1) await oldResponse;
+    await route.fulfill({json: {warnings: [], devices: [{serial: count === 1 ? 'stale-phone' : 'current-phone',
+      server_port: 5038, adb: 'D:/Tools/trace2task-android/sdk/platform-tools/adb.exe', state: 'device', model: 'Fixture'}]}});
+    if (count === 1) oldHandled = true;
+  });
+  await page.route('**/api/android/device-apps', route => {
+    inspected.push(route.request().postDataJSON().android_config.serial);
+    return route.fulfill({json: {current_package: 'com.example.game', apps: [{package: 'com.example.game', label: 'Game'}]}});
+  });
+  await page.goto('/');
+  await page.getByLabel('操作范围', {exact: true}).selectOption('android');
+  await expect.poll(() => discoveryCount).toBe(1);
+  await page.getByRole('textbox', {name: '任务指令'}).fill('合成任务');
+  await expect(page.getByRole('button', {name: '开始任务', exact: true})).toBeDisabled();
+  await page.getByLabel('动作预算', {exact: true}).fill('211');
+  await page.getByLabel('时间预算（分钟）', {exact: true}).fill('55');
+  await page.getByLabel('操作范围', {exact: true}).selectOption('desktop');
+  await page.getByLabel('操作范围', {exact: true}).selectOption('android');
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('5038/current-phone');
+  await expect(page.getByLabel('授权应用', {exact: true})).toBeEnabled();
+  releaseOld();
+  await expect.poll(() => oldHandled).toBe(true);
+  await expect(page.getByLabel('已连接设备', {exact: true})).toHaveValue('5038/current-phone');
+  await expect(page.getByLabel('动作预算', {exact: true})).toHaveValue('211');
+  await expect(page.getByLabel('时间预算（分钟）', {exact: true})).toHaveValue('55');
+  expect(inspected).toEqual(['current-phone']);
 });

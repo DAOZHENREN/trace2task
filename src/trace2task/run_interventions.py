@@ -24,7 +24,8 @@ class RunInterventions:
         self.lock = threading.RLock()
         self.on_change = on_change or (lambda state: None)
         self.record = None
-        self.state = {'supported': True, 'phase': 'starting', 'revision': 0, 'version': 0,
+        self.directory = None
+        self.state = {'supported': True, 'visual_supported': True, 'phase': 'starting', 'revision': 0, 'version': 0,
                       'assisted_by_user': False, 'commands': [], 'takeovers': [],
                       'message': '正在准备设备与经验；准备完成后可以干预。'}
 
@@ -41,15 +42,16 @@ class RunInterventions:
             self.record('human_intervention', **value)
         self.on_change(value)
 
-    def activate(self, record):
+    def activate(self, record, *, directory=None):
         with self.lock:
             if self.state['phase'] != 'starting':
                 raise RuntimeError('干预会话不能重新启动')
             self.record = record
+            self.directory = directory
             self.state.update(phase='running', message='可以追加指令，或先暂停再接管手机。')
             self._publish()
 
-    def request(self, *, request_id, kind, text=''):
+    def request(self, *, request_id, kind, text='', visual=None):
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', request_id):
             raise ValueError('干预请求缺少有效的唯一标识')
         if kind not in {'instruction', 'pause', 'resume'}:
@@ -59,10 +61,17 @@ class RunInterventions:
         text = text.strip()
         if kind == 'instruction' and not text:
             raise ValueError('请输入补充指令')
+        visual_digest = None
+        if visual is not None:
+            from trace2task.intervention_images import validate_visual
+            if kind != 'resume':
+                raise ValueError('请先暂停，再把截图与说明一起交还模型')
+            visual = copy.deepcopy(visual)
+            visual_digest = validate_visual(visual)
         with self.lock:
             for previous in self.state['commands']:
                 if previous['id'] == request_id:
-                    if (previous['kind'], previous['text']) != (kind, text):
+                    if (previous['kind'], previous['text'], previous.get('visual_digest')) != (kind, text, visual_digest):
                         raise ValueError('相同请求标识不能提交不同内容')
                     return self.snapshot()
             phase = self.state['phase']
@@ -81,10 +90,17 @@ class RunInterventions:
                 raise ValueError('已保留最后一个干预名额用于交还模型')
             if kind == 'pause' and len(self.state['commands']) >= MAX_COMMANDS - 1:
                 raise ValueError('剩余干预名额不足以完成一次接管与交还')
+            attachment = None
+            if visual is not None:
+                from trace2task.intervention_images import save_visual
+                attachment = save_visual(visual, segment=self.state['takeovers'][-1],
+                                         directory=self.directory, request_id=request_id)
             self.state['revision'] += 1
             command = {'id': request_id, 'index': len(self.state['commands']) + 1,
                        'kind': kind, 'text': text, 'requested_at': now(), 'status': 'queued',
                        'revision': self.state['revision']}
+            if attachment is not None:
+                command.update(visual=attachment, visual_digest=visual_digest)
             self.state['commands'].append(command)
             self.state['assisted_by_user'] = True
             if kind == 'pause':

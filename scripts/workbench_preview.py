@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from trace2task.api_settings import APISettingsStore
+from trace2task.codex_catalog import CodexModelCatalog
 from trace2task.web_console import WebConsoleController, create_web_server
 
 if __name__ == '__main__':
@@ -22,6 +23,10 @@ if __name__ == '__main__':
         # Never load personal deployment settings or saved API credentials in previews.
         os.environ['TRACE2TASK_RSI_PROFILE'] = str(root / 'missing-rsi-profile.json')
         controller = WebConsoleController(root, api_settings_store=APISettingsStore(root / 'model-api.json'))
+        controller.codex_catalog = CodexModelCatalog(root, loader=lambda _: [
+            {'model': model, 'displayName': model, 'isDefault': i == 0, 'defaultReasoningEffort': 'low',
+             'supportedReasoningEfforts': [{'reasoningEffort': e} for e in ('low', 'medium', 'high', 'xhigh', 'max')]}
+            for i, model in enumerate(('gpt-6.1-sol', 'gpt-6-luna'))])
         server = create_web_server(root, port=args.port, controller=controller)
         server.RequestHandlerClass.controller._rsi_client = None
         server.RequestHandlerClass.controller._rsi_profile_error = '隔离 UI 验证不连接远程 RSI'

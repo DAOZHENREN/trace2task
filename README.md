@@ -29,7 +29,7 @@ Record a workflow, choose what the model receives, and review what actually happ
 <sub>Actual interface in an isolated, read-only preview with a synthetic task. No model call or desktop action was run for this image. The current UI is Chinese.</sub>
 
 - **See the exact input.** Inspect the complete saved experience text and the historical images that will be sent.
-- **Keep versions, not mysteries.** Generation timestamps, duplicate-generation confirmation, preserved originals, and a restorable library trash.
+- **Keep a clear current version.** The library and automatic selection use current versions. History preserves older versions for inspection and rollback, without automatic deletion.
 - **Separate the choices.** Model provider, inference engine, execution backend, and authorized targets are visible before a task starts.
 - **Review the run.** Follow incremental rounds, model requests and replies, dispatched actions, receipts, and stop reasons.
 
@@ -80,8 +80,10 @@ The repository provides [installer build scripts](docs/desktop-app.md), not bund
 1. **Record.** OpenCUA captures a demonstration on the primary display. Finish with **F8**, cancel with **F9**; required components and recording limitations are [documented separately](docs/opencua-recording.md).
 2. **Generate.** Create **D** for actions alone or **A** for actions with visual evidence locally. Compile a reviewed **B** procedure with the selected Codex compiler, or combine its frozen evidence into **C** without another model call.
 3. **Inspect.** Open **查看模型原文** (“View model input”) to read the exact saved text and, for A, see every selected image. Raw files and audit metadata are separate.
-4. **Choose the reference mode.** Let the execution agent search reviewed B summaries and load one applicable method, pin a specific version, or run without experience. Unsaved drafts never enter automatic selection.
+4. **Choose the reference mode.** Let the execution agent search current reviewed B summaries and load one applicable method, select a current version manually, or run without experience. Unsaved drafts never enter automatic selection.
 5. **Execute and review.** Observe the current screen, plan within the chosen scope, execute, and observe again. Review the run evidence instead of treating a stop signal as proof of success.
+
+After a run, compile its evidence into a method organized by phases, conditions and observed feedback. Review or edit the draft, then choose **a new version of an existing experience** or **a new independent experience**. Independent experiences keep their own history and remain separate automatic-selection candidates, while preserving the original source evidence. See the [workbench guide](docs/workbench.md).
 
 ### What reaches the model?
 
@@ -129,7 +131,7 @@ llama-server is the default local engine when no explicit setting exists. Existi
 
 ### Android from the desktop workbench
 
-The [ADB backend](docs/android-backend.md) discovers existing connections, binds one device/app, and supports bounded single-touch actions, short joystick holds and experimental minimap correction. The general visual agent also supports extra instructions and acknowledged human takeover. Stop/F9, device identity, app scope and action/time budgets remain enforced; this is not full 3D pathfinding or proof of game-task success. [MobileForge](docs/mobileforge.md) is a separate pinned policy integration with narrower capabilities.
+The [ADB backend](docs/android-backend.md) discovers existing connections, binds one device/app, and supports single-touch actions, joystick holds with model-selected duration and continuous camera swipes. Minimap correction remains an internal experiment, disabled by default. The general visual agent supports extra instructions, annotated reference images and acknowledged human takeover. Stop/F9, device identity, app scope and action/time budgets remain enforced; this is not full 3D pathfinding or proof of game-task success. [MobileForge](docs/mobileforge.md) is a separate pinned policy integration with narrower capabilities.
 
 ### Standalone Android preview
 

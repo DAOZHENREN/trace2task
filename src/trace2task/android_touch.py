@@ -1,4 +1,4 @@
-"""Pinned-transport, single-gesture client for the device-side 1500 ms lease.
+"""Pinned-transport, single-gesture client with a device-side heartbeat watchdog.
 
 No automatic reconnect or replay. UP/EOF cleanup deliberately bypasses a stop
 request: cancellation must release our own contact, not suppress its release.
@@ -28,7 +28,8 @@ def helper_artifact():
     folder = Path(__file__).with_name('android_touch')
     metadata = json.loads((folder / 'build.json').read_text(encoding='utf-8'))
     jar = folder / 'bounded-touch.jar'
-    if (metadata.get('protocol') != 'T2T1' or metadata.get('max_duration_ms') != 1500
+    if (metadata.get('protocol') != 'T2T2' or metadata.get('heartbeat_timeout_ms') != 1500
+            or 'max_duration_ms' not in metadata or metadata['max_duration_ms'] is not None
             or hashlib.sha256(jar.read_bytes()).hexdigest() != metadata.get('jar_sha256')
             or hashlib.sha256((folder / 'BoundedTouch.java').read_bytes()).hexdigest()
             != metadata.get('source_sha256')):
@@ -46,6 +47,11 @@ class BoundedTouchSession:
         self.released = threading.Event()
         self._done = threading.Event()
         self._release_requested = threading.Event()
+        self._keepalive = threading.Event()
+        self._heartbeat_ack = threading.Event()
+        self._heartbeat_ack.set()
+        self._next_heartbeat = 0.0
+        self._heartbeat_count = 0
         self._write_lock = threading.Lock()
         self._messages = queue.Queue()
         self._interruption = None
@@ -103,25 +109,52 @@ class BoundedTouchSession:
     def _read(self):
         try:
             for line in iter(lambda: self._process.stdout.readline(2 * 1024 * 1024), ''):
-                if line.startswith('T2T1 '):
+                if line.startswith('T2T2 '):
                     if not line.endswith('\n'):
                         self._messages.put('ERROR oversized_or_truncated_response')
                         self.release()
                         return
                     message = line[5:].strip()
+                    if message == 'ALIVE':
+                        self._heartbeat_count += 1
+                        self._heartbeat_ack.set()
+                        continue
+                    if message.startswith('ERROR ') and not self.released.is_set():
+                        self._interruption = self._interruption or RuntimeError(
+                            f'Android touch helper failed: {message[6:120]}; no retry')
                     if message.startswith('RELEASED '):
+                        if message == 'RELEASED heartbeat_timeout' and self._interruption is None:
+                            self._interruption = RuntimeError('Android touch heartbeat timed out; contact released, no retry')
                         self.released.set()
                     self._messages.put(message)
                 # Android runtime warnings are not protocol or model instructions.
         finally:
+            if not self.released.is_set() and not self._release_requested.is_set():
+                self._interruption = self._interruption or RuntimeError(
+                    'Android touch transport ended without release confirmation; no reconnect or replay')
             self._messages.put('EOF')
 
     def _watch(self):
         while not self._done.wait(.02):
             try:
                 self.check()
+                if (self._keepalive.is_set() and not self.released.is_set()
+                        and self._heartbeat_ack.is_set() and time.monotonic() >= self._next_heartbeat):
+                    # At most one heartbeat in flight: queued pulses must not keep
+                    # a disconnected host's contact alive indefinitely.
+                    self._heartbeat_ack.clear()
+                    try:
+                        sent = self._send('KEEPALIVE')
+                    except (OSError, ValueError):
+                        sent = False
+                    if not sent:
+                        # A normal deadline may close stdin before its receipt is
+                        # read. The reader distinguishes that from unexpected EOF.
+                        self._keepalive.clear()
+                    self._next_heartbeat = time.monotonic() + .25
             except Exception as error:  # noqa: BLE001 - any broken stop/guard must release the contact
-                self._interruption = error
+                if not self._release_requested.is_set():
+                    self._interruption = error
                 self.release()
                 return
 
@@ -158,8 +191,8 @@ class BoundedTouchSession:
         self.check()
         # The pinned device process checks the bound activity/display immediately
         # before DOWN and every MOVE. It cannot survive a reboot or reconnect.
-        if type(duration_ms) is not int or not 1 <= duration_ms <= 1500:
-            raise ValueError('Sustained touch duration must be 1..1500 ms')
+        if type(duration_ms) is not int or duration_ms < 1:
+            raise ValueError('Sustained touch duration must be a positive integer')
         remaining = getattr(self.stop, 'deadline', None)
         if remaining is not None:
             duration_ms = min(duration_ms, int(max(0, remaining - time.monotonic()) * 1000))
@@ -170,7 +203,13 @@ class BoundedTouchSession:
                      duration_ms=duration_ms)
         if not self._send('START {} {} {} {} {}'.format(duration_ms, *center, *endpoint)):
             raise RuntimeError('Android touch process exited before START; no retry')
-        return self._await('STARTED')
+        if duration_ms > 1500:
+            self._next_heartbeat = time.monotonic() + .25
+            self._keepalive.set()
+        # Cloud ADB can acknowledge an already-started contact after >1 second.
+        # Waiting longer never resends START or extends the device-side duration;
+        # the watchdog, budget and user stop remain active throughout this wait.
+        return self._await('STARTED', timeout=5)
 
     def capture_region(self, region, path):
         """Fresh, device-guarded minimap pixels, without repeated ADB round trips."""
@@ -222,11 +261,12 @@ class BoundedTouchSession:
         if self._release_requested.is_set():
             return
         self._release_requested.set()
+        self._keepalive.clear()
         try:
             self._record('release_requested')
             self._send('UP')
         except (OSError, ValueError):
-            pass  # The independent phone-side lease remains bounded to 1500 ms.
+            pass  # The phone releases independently when the last heartbeat expires.
         finally:
             try:
                 if self._process is not None:
@@ -250,4 +290,5 @@ class BoundedTouchSession:
             self._watcher.join(timeout=.2)
         if self._reader is not None:
             self._reader.join(timeout=.2)
-        self._record('closed', release_confirmed=self.released.is_set())
+        self._record('closed', release_confirmed=self.released.is_set(),
+                     heartbeat_count=self._heartbeat_count)

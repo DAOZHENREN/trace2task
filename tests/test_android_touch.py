@@ -71,6 +71,8 @@ def injections(output):
 def test_packaged_artifact_matches_current_reviewable_source():
     jar, meta = helper_artifact()
     assert jar.stat().st_size < 100_000 and meta['min_api'] == 29
+    assert meta['protocol'] == 'T2T2'
+    assert meta['max_duration_ms'] is None and meta['heartbeat_timeout_ms'] == 1500
 
 
 def test_device_watchdog_releases_without_host_up(java_helper):
@@ -81,7 +83,17 @@ def test_device_watchdog_releases_without_host_up(java_helper):
     assert events[1][2:4] == events[2][2:4] == ['64.0', '150.0']
     assert len({e[5] for e in events}) == 1  # Same downTime through MOVE and UP.
     assert 100 <= int(events[-1][6]) - int(events[0][6]) < 800
-    assert 'T2T1 RELEASED deadline' in output
+    assert 'T2T2 RELEASED deadline' in output
+
+
+@pytest.mark.parametrize('duration', [60000, 2**63 - 1])
+def test_long_gesture_releases_on_lost_heartbeat_without_host_up(java_helper, duration):
+    output = output_for(java_helper, f'START {duration} 64 192 64 150\n', keep_open=True)
+    events = injections(output)
+    assert [e[1] for e in events] == ['0', '2', '1']
+    assert len({e[5] for e in events}) == 1
+    assert 1400 <= int(events[-1][6]) - int(events[0][6]) < 2500
+    assert 'T2T2 RELEASED heartbeat_timeout' in output
 
 
 def test_device_eof_and_explicit_up_release_immediately(java_helper):
@@ -90,7 +102,7 @@ def test_device_eof_and_explicit_up_release_immediately(java_helper):
         events = injections(output)
         assert [e[1] for e in events] == ['0', '2', '1']
         assert int(events[-1][6]) - int(events[0][6]) < 500
-        assert 'T2T1 RELEASED requested' in output
+        assert 'T2T2 RELEASED requested' in output
 
 
 def test_device_direction_updates_preserve_contact_and_down_time(java_helper):
@@ -103,50 +115,57 @@ def test_device_direction_updates_preserve_contact_and_down_time(java_helper):
 
 
 @pytest.mark.parametrize('command', [
-    'START 1501 64 192 64 150\n', 'START 0 64 192 64 150\n',
+    'START -1 64 192 64 150\n', 'START 0 64 192 64 150\n',
     'START 1000 -1 192 64 150\n', 'START 1000 64 192 320 150\n',
     'START 1000 NaN 192 64 150\n', 'shell something\n',
 ])
 def test_device_refuses_bad_commands_before_input(java_helper, command):
     output = output_for(java_helper, command)
-    assert not injections(output) and 'T2T1 ERROR' in output
+    assert not injections(output) and 'T2T2 ERROR' in output
 
 
 def test_device_refuses_wrong_scope_before_input(java_helper):
     for options in ({'package': 'com.other.app'}, {'width': 321}, {'activity': '.Other'}):
         output = output_for(java_helper, 'START 1000 64 192 64 150\n', **options)
-        assert not injections(output) and 'T2T1 ERROR' in output
+        assert not injections(output) and 'T2T2 ERROR' in output
 
 
 def test_device_rejects_focused_overlay_even_when_top_activity_matches(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\n',
                         flags=('-Dtest.windowFocus=com.android.systemui/NotificationShade',))
-    assert not injections(output) and 'T2T1 ERROR' in output
+    assert not injections(output) and 'T2T2 ERROR' in output
 
 
 def test_device_rejects_reused_transport_after_boot_change(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\n', flags=('-Dtest.boot=' + 'b'*36,))
-    assert not injections(output) and 'T2T1 ERROR' in output
+    assert not injections(output) and 'T2T2 ERROR' in output
 
 
 def test_focus_change_before_correction_releases_instead_of_moving(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\nMOVE 80 160\n',
                         flags=('-Dtest.focusChangesAt=3',))
     assert [e[1] for e in injections(output)] == ['0', '2', '1']
-    assert 'T2T1 ERROR' in output
+    assert 'T2T2 ERROR' in output
+
+
+def test_focus_change_before_heartbeat_releases_without_direction_change(java_helper):
+    output = output_for(java_helper, 'START 60000 64 192 64 150\nKEEPALIVE\n',
+                        flags=('-Dtest.focusChangesAt=3',))
+    assert [e[1] for e in injections(output)] == ['0', '2', '1']
+    assert 'T2T2 ERROR' in output and 'T2T2 ALIVE' not in output
 
 
 def test_device_exception_after_down_still_sends_up(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\n',
                         flags=('-Dtest.failMove=true',))
     assert [e[1] for e in injections(output)] == ['0', '2', '1']
-    assert 'T2T1 ERROR' in output
+    assert 'T2T2 ERROR' in output
 
 
 def test_duplicate_start_cannot_extend_lease(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\nSTART 1000 64 192 80 150\n')
     assert [e[1] for e in injections(output)] == ['0', '2', '1']
-    assert 'T2T1 ERROR' in output
+    assert 'T2T2 ERROR' in output
 
 
 class EventStop:
@@ -177,13 +196,23 @@ def client(java_helper, monkeypatch, tmp_path):
         return (metadata['jar_sha256'] + ' remote.jar').encode()
     phone = SimpleNamespace(adb='bound-adb', port=5038, transport=7, package='com.example.game', root=tmp_path,
                             target={'serial': 'phone', 'transport_id': 7}, _run=run,
+                            touch_output=[],
                             state=lambda: dict(state), record=lambda kind, **data: events.append((kind, data)))
     def popen(args, **kwargs):
         launches.append(args)
         # Launch the real helper against fake framework classes, not the requested ADB executable.
         with monkeypatch.context() as context:
             context.setattr(subprocess, 'Popen', real_popen)
-            return java_helper(flags=getattr(phone, 'test_flags', ()))
+            process = java_helper(flags=getattr(phone, 'test_flags', ()))
+        output = process.stdout
+        def readline(*args):
+            line = output.readline(*args)
+            if line.startswith('T2T2 STARTED'):
+                time.sleep(getattr(phone, 'start_ack_delay', 0))
+            phone.touch_output.append(line)
+            return line
+        process.stdout = SimpleNamespace(readline=readline, close=output.close)
+        return process
     monkeypatch.setattr(subprocess, 'Popen', popen)
     return phone, state, EventStop(), launches, events, commands
 
@@ -206,6 +235,91 @@ def test_client_uses_pinned_transport_and_records_release(client):
     assert len(events) == before  # Idempotent cleanup.
 
 
+def test_client_keeps_one_contact_past_old_limits_and_cannot_extend_duration(client):
+    phone, state, stop, launches, events, _commands = client
+    session = BoundedTouchSession(phone, state, stop)
+    try:
+        session.open()
+        assert session.begin((64, 192), (64, 150), 6000)
+        assert session.released.wait(8)
+        session.check()
+    finally:
+        session.close()
+    injected = injections(''.join(phone.touch_output))
+    assert [e[1] for e in injected] == ['0', '2', '1']
+    assert len({e[5] for e in injected}) == 1
+    assert injected[1][2:4] == injected[2][2:4] == ['64.0', '150.0']
+    assert 5900 <= int(injected[-1][6]) - int(injected[0][6]) < 7000
+    assert 'T2T2 RELEASED deadline\n' in phone.touch_output
+    assert events[-1][1]['heartbeat_count'] >= 10
+    assert len(launches) == 1
+    assert len([e for e in session.events if e['event'] == 'start_requested']) == 1
+
+
+def test_delayed_start_ack_does_not_shorten_or_extend_device_hold(client):
+    phone, state, stop, launches, _events, _commands = client
+    phone.start_ack_delay = 1.2
+    session = BoundedTouchSession(phone, state, stop)
+    try:
+        session.open()
+        began = time.monotonic()
+        assert session.begin((64, 192), (64, 150), 2000)
+        assert time.monotonic() - began >= 1.2
+        assert session.released.wait(2)
+        session.check()
+    finally:
+        session.close()
+    injected = injections(''.join(phone.touch_output))
+    assert [e[1] for e in injected] == ['0', '2', '1']
+    assert 1900 <= int(injected[-1][6]) - int(injected[0][6]) < 2800
+    assert len(launches) == 1
+    assert len([e for e in session.events if e['event'] == 'start_requested']) == 1
+
+
+def test_stop_during_start_ack_wait_remains_immediate(monkeypatch):
+    stop = EventStop()
+    driver = SimpleNamespace(target={}, record=lambda *a, **kw: None)
+    session = BoundedTouchSession(driver, {}, stop)
+    commands = []
+    monkeypatch.setattr(session, '_send', lambda command: commands.append(command) or True)
+    timer = threading.Timer(.1, stop.event.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with pytest.raises(EmergencyStopRequested):
+            session.begin((64, 192), (64, 150), 6000)
+        assert time.monotonic() - began < .5
+        assert commands == ['START 6000 64 192 64 150']
+    finally:
+        timer.join(1)
+
+
+@pytest.mark.parametrize('kind', ['heartbeat', 'focus', 'transport'])
+def test_long_hold_failures_surface_even_without_waiting_for_more_commands(client, kind):
+    phone, state, stop, launches, _events, _commands = client
+    if kind == 'focus':
+        phone.test_flags = ('-Dtest.focusChangesAt=3',)
+    session = BoundedTouchSession(phone, state, stop)
+    try:
+        session.open()
+        assert session.begin((64, 192), (64, 150), 60000)
+        if kind == 'heartbeat':
+            session._keepalive.clear()  # Simulate a stalled host heartbeat producer.
+        elif kind == 'transport':
+            session._process.kill()
+            session._process.wait(timeout=2)
+        session._reader.join(timeout=3)
+        with pytest.raises(RuntimeError):
+            session.check()
+    finally:
+        session.close()
+    assert len(launches) == 1
+    if kind != 'transport':
+        assert [e[1] for e in injections(''.join(phone.touch_output))] == ['0', '2', '1']
+    if kind == 'heartbeat':
+        assert session.released.is_set()
+
+
 @pytest.mark.parametrize('kind', ['stop', 'budget', 'intervention'])
 def test_host_watchdog_releases_while_main_thread_is_busy(client, kind):
     phone, state, base, launches, _events, _commands = client
@@ -214,7 +328,7 @@ def test_host_watchdog_releases_while_main_thread_is_busy(client, kind):
     session = BoundedTouchSession(phone, state, stop, is_current=lambda: current[0])
     try:
         session.open()
-        assert session.begin((64, 192), (64, 150), 1500)
+        assert session.begin((64, 192), (64, 150), 60000)
         began = time.monotonic()
         if kind == 'budget':
             stop.deadline = time.monotonic() - .01
@@ -309,7 +423,7 @@ def test_frame_in_flight_does_not_block_device_release(client, kind):
     session = BoundedTouchSession(phone, state, stop, is_current=lambda: current[0])
     try:
         session.open()
-        session.begin((64, 192), (64, 150), 1500)
+        session.begin((64, 192), (64, 150), 60000)
         assert session._send('FRAME 10 20 32 24')
         time.sleep(.05)  # Capture remains in flight, but its worker must not own stdin.
         began = time.monotonic()
@@ -349,7 +463,7 @@ def test_device_capture_failure_after_down_releases_and_fails_closed(client):
     session = BoundedTouchSession(phone, state, stop)
     try:
         session.open()
-        session.begin((64, 192), (64, 150), 1500)
+        session.begin((64, 192), (64, 150), 60000)
         with pytest.raises(RuntimeError, match='capture failed'):
             session.capture_region((10, 20, 42, 44), phone.root / 'failed.png')
         assert session.released.is_set()
@@ -369,14 +483,15 @@ def test_malformed_or_oversized_region_payload_is_never_a_frame(client, monkeypa
     assert not (phone.root / 'invalid.png').exists() and not launches
 
 
-def test_device_lease_clamped_to_remaining_time_budget(client):
+@pytest.mark.parametrize('duration', [60000, 10**40])
+def test_device_lease_clamped_to_remaining_time_budget(client, duration):
     phone, state, base, _launches, _events, _commands = client
     stop = BudgetStop(base, 10)
     session = BoundedTouchSession(phone, state, stop)
     try:
         session.open()
         stop.deadline = time.monotonic() + .3
-        session.begin((64, 192), (64, 150), 1500)
+        session.begin((64, 192), (64, 150), duration)
         start = next(e for e in session.events if e['event'] == 'start_requested')
         assert 1 <= start['duration_ms'] <= 300
         assert session.released.wait(.8)

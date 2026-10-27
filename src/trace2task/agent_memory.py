@@ -1,4 +1,4 @@
-"""Task-start, agent-selected Procedure B memory; no device actions or library writes."""
+"""Task-start, agent-selected current Procedure B; no device actions or bundle edits."""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +8,8 @@ from pathlib import Path
 
 from trace2task.chat_model_adapter import ChatModelAdapter, _unique_keys
 from trace2task.model_text import model_json
-from trace2task.trace_library import execution_context, list_traces, read_body
+from trace2task.trace_library import execution_context, read_body
+from trace2task.trace_versions import current_version_ids, list_versions
 
 MAX_SEARCHES = 2
 SCHEMA = {
@@ -48,22 +49,15 @@ class MemoryCatalog:
         self.root, self.scope, self.package = Path(root).resolve(), scope, package
         self.entries = {}
         self.excluded = 0
-        seen, families = set(), set()
-        for entry in list_traces(self.root):
-            if entry['representation'] != 'B':
+        for entry in list_versions(self.root):
+            if entry['representation'] != 'B' or not entry['is_current']:
                 continue
             try:
                 item = self._entry(entry['id'])
             except (OSError, ValueError, KeyError, TypeError):
                 self.excluded += 1
                 continue
-            # Keep the newest published version per source, not per display name.
-            source = item.pop('_source') or entry['id']
-            family = (item.get('lineage') or {}).get('root_id', entry['id'])
-            if source in seen or family in families:
-                continue
-            seen.add(source)
-            families.add(family)
+            item.pop('_source')
             self.entries[entry['id']] = item
 
     def _entry(self, identifier):
@@ -110,7 +104,8 @@ class MemoryCatalog:
 
     def search(self, query):
         tokens = _tokens(query)
-        ranked = sorted(self.entries.values(), key=lambda item: -len(tokens & _tokens(
+        current = current_version_ids(self.root)
+        ranked = sorted((item for item in self.entries.values() if item['id'] in current), key=lambda item: -len(tokens & _tokens(
             ' '.join(str(item[k]) for k in ('name', 'description', 'package', 'scope')))))
         return ranked[:8]
 
@@ -118,6 +113,8 @@ class MemoryCatalog:
         expected = self.entries.get(identifier)
         if expected is None:
             raise ValueError('Memory ID is outside the authorized catalog')
+        if identifier not in current_version_ids(self.root):
+            raise ValueError('Memory is no longer the current version; restart selection')
         current = self._entry(identifier)
         if current['metadata_sha256'] != expected['metadata_sha256']:
             raise ValueError('Memory changed after catalog creation; restart the task')
@@ -128,6 +125,8 @@ class MemoryCatalog:
         # Check again after loading; use only the frozen text from here onward.
         if self._entry(identifier)['metadata_sha256'] != expected['metadata_sha256']:
             raise ValueError('Memory changed during loading; restart the task')
+        if identifier not in current_version_ids(self.root):
+            raise ValueError('Memory version changed during loading; restart selection')
         return context
 
 

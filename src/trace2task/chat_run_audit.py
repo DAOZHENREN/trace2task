@@ -64,6 +64,8 @@ class ChatRunAudit:
                 predictor, stop, task,
                 on_poll=_unused.get('on_poll'),
                 on_progress=lambda seconds: self.status(
+                    f"[{label} {step + 1}] Codex 限流冷却中，约 {max(0, self.rate_limit_until - time.monotonic()):.0f} 秒后自动继续；可随时停止。"
+                    if getattr(self, 'rate_limit_until', 0) > time.monotonic() else
                     f"[{label} {step + 1}] 模型已等待 {seconds:.0f} 秒；可停止，迟到回答不会执行。"),
                 screenshot=screenshot, history=history, context=context,
                 previous_screenshot=previous_screenshot,

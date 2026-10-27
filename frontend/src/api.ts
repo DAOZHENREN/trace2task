@@ -1,4 +1,5 @@
 import type {Config} from './types';
+import {DEFAULT_ANDROID_BUDGET} from './types';
 import {AUTO_MEMORY} from './experience';
 
 export async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
@@ -14,7 +15,7 @@ export async function api<T>(path: string, body?: unknown, signal?: AbortSignal)
 export function requestFor(config: Config, instruction: string) {
   const localGUI = config.provider === 'local';
   return {instruction, mode: 'execute', execution_scope: config.scope === 'android' ? 'android' : config.scope === 'browser' ? 'browser' : 'desktop', orchestration: 'legacy', continuous: true,
-    ...(config.executor === 'android' ? {android_config: config.android, android_budget: config.androidBudget || {max_actions: 80, max_seconds: 1200}, mobileforge: config.mobileforge || '',
+    ...(config.executor === 'android' ? {android_config: config.android, android_budget: config.androidBudget || DEFAULT_ANDROID_BUDGET, mobileforge: config.mobileforge || '',
       android_model_profile: config.androidModelProfile || ''} : {}),
     provider: localGUI ? 'trained_d' : config.provider === 'codex' ? 'codex' : 'api',
     model: config.provider === 'local' ? (config.localModel === 'trained_d' ? 'D-5970' : config.localModel)

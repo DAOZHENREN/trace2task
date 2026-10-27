@@ -30,7 +30,8 @@ def test_generate_list_and_lazy_read(tmp_path):
     identity = generate_d(tmp_path, path)["id"]
     headers = list_traces(tmp_path)
     assert headers[0]["trace_name"] == "演示"
-    assert set(headers[0]) == {"id", "trace_name", "description", "representation", "created_at", "created_at_source"}
+    assert set(headers[0]) == {"id", "trace_name", "description", "representation", "created_at", "created_at_source", "source_recording"}
+    assert headers[0]["source_recording"] == str(tmp_path / "runs" / "demo")
     assert datetime.fromisoformat(headers[0]['created_at']).tzinfo is not None
     assert headers[0]['created_at_source'] == 'metadata'
     assert read_body(tmp_path, identity)["actions"][0]["action"] == "Single left Click"

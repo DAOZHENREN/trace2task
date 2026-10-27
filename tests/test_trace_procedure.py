@@ -238,7 +238,7 @@ def test_missing_all_frames_does_not_fabricate_compiler_images(tmp_path):
 
 def test_unsupported_model_does_not_prepare_evidence_or_call_agent(tmp_path):
     trace, _ = recording(tmp_path, 3)
-    with pytest.raises(ValueError, match='不支持'):
+    with pytest.raises(ValueError, match='不包含'):
         compile_b(tmp_path, trace, model='unsupported', reasoning_effort='high')
     assert not (tmp_path / 'trace-library').exists()
 

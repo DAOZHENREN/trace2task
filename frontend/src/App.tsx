@@ -1,7 +1,7 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {Button, Spinner} from '@fluentui/react-components';
 import {api} from './api';
-import {AUTO_MEMORY} from './experience';
+import {AUTO_MEMORY, usableTrace} from './experience';
 import {useConfirm} from './ConfirmDialog';
 import type {AppState, Catalog, Config, Page, Run, ServiceSnapshot} from './types';
 import {loadedService, modelLabel, visibleService} from './LocalServices';
@@ -72,11 +72,18 @@ export function App() {
   const refreshCatalog = useCallback(async () => {
     await Promise.all([api<Catalog>('/api/runtime-catalog').then(setCatalog), refreshServices()]);
   }, [refreshServices]);
+  const refreshCodex = useCallback(async () => {
+    try {
+      const options = await api<AppState['agent_options']>('/api/codex/models?refresh=1');
+      setState(current => current ? {...current, agent_options: {...current.agent_options, ...options}} : current);
+      setConfig(current => !current.model ? {...current, model: options.defaults.model, effort: options.defaults.reasoning_effort} : current);
+    } catch (e) {setError(String(e));}
+  }, []);
   const refresh = useCallback(async () => {
     const [next, history] = await Promise.all([api<AppState>('/api/state?compact=1'), api<{runs: Run[]}>('/api/workbench/runs')]);
     setState(next); setRuns(history.runs);
     setConfig(current => current.experience.startsWith('trace-library/') &&
-      !next.trace_representations.some(t => current.experience === `trace-library/${t.id}/model-input.txt`)
+      !next.trace_representations.some(t => usableTrace(t) && current.experience === `trace-library/${t.id}/model-input.txt`)
       ? {...current, experience: ''} : current);
   }, []);
   const historyBatch = useBatchTrash(runs.map(run => ({id: run.job_id, name: run.instruction || run.task_id,
@@ -172,7 +179,7 @@ export function App() {
           action={<Button onClick={() => void initialize()}>重新连接</Button>}/> : <>
           <div hidden={page !== 'tasks'}><PageHeading eyebrow="WORKSPACE" title="任务工作台" copy="描述目标，确认执行范围，查看每一步结果。"
             action={selectedRun && !busy ? <Button icon={<Icon name="plus" size={17}/>} onClick={() => setSelectedRun(null)}>新任务</Button> : undefined}/>
-            <TaskComposer config={config} setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey]} onRun={onRun} onModels={() => go('models')} onError={setError}/>
+            <TaskComposer config={config} setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey]} onRun={onRun} onModels={() => go('models')} onRefreshCodex={refreshCodex} onError={setError}/>
             <RunInspector id={selectedRun} state={state} busy={busy} onRun={onRun} onError={setError}
               onLibrary={id => {void refresh().then(() => {setRequestedTraceId(id); go('library');}).catch(e => setError(String(e)));}}/></div>
           <div hidden={page !== 'models'}>{visited.has('models') && <Models catalog={catalog} config={config} setConfig={setConfig} busy={busy} refresh={refreshCatalog}

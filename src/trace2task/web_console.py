@@ -31,13 +31,12 @@ import yaml
 from trace2task import __version__
 from trace2task.api_settings import APISettingsStore
 from trace2task.codex_app_server import (
-    CODEX_MODELS,
     CODEX_REASONING_EFFORTS,
-    CODEX_SELECTABLE_MODELS,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_REASONING_EFFORT,
     classify_codex_failure,
 )
+from trace2task.codex_catalog import CodexModelCatalog
 from trace2task.compiler import compile_trace, confirm_taskpack
 from trace2task.experience import route_experience
 from trace2task.model_api import (
@@ -59,7 +58,7 @@ from trace2task.rsi_remote import (
     RSIRemoteRequestError,
 )
 from trace2task.speech_transcription import TurboTranscriber
-from trace2task.trace_library import list_traces
+from trace2task.trace_versions import list_versions, restore_version, rollback_version
 from trace2task.waa_results import materialize_waa_feedback_candidates
 from trace2task.windows_capture import GdiWindowCapture
 from trace2task.windows_control import Win32Backend, WindowSelector, list_window_records
@@ -102,6 +101,7 @@ DEFAULT_WAA_CONTAINER = "winarena"
 RETRYABLE_CODEX_FAILURE_CATEGORIES = frozenset(
     {
         "codex_connectivity",
+        "codex_rate_limit",
         "first_token_timeout",
         "response_in_progress_timeout",
         "hard_timeout",
@@ -283,6 +283,13 @@ def _compiler_failure(error: BaseException, *, fallback: str) -> tuple[str, bool
 def _compiler_failure_summary(category: str) -> str:
     return {
         "codex_connectivity": "Codex 连接中断",
+        "codex_access_denied": "Codex 请求被服务端拒绝（HTTP 403）",
+        "codex_rate_limit": "Codex 服务端限流，请在冷却时间结束后重试",
+        "codex_usage_limit": "Codex 会话或账户额度已耗尽",
+        "codex_context_limit": "Codex 上下文窗口已满",
+        "codex_interrupted": "Codex 模型轮次已中断",
+        "codex_thread_error": "Codex 会话发生系统错误",
+        "codex_server_error": "Codex 服务端暂时不可用",
         "first_token_timeout": "Codex 在首个响应期限内没有开始输出",
         "response_in_progress_timeout": "Codex 已开始输出，但随后长时间没有新进度",
         "hard_timeout": "Codex 编译超过总时限",
@@ -696,6 +703,7 @@ class WebConsoleController:
         from trace2task.components import ComponentManager
         self.components = ComponentManager(self.project_root)
         self.api_settings = api_settings_store or APISettingsStore()
+        self.codex_catalog = CodexModelCatalog(self.project_root)
         self.task_root = (self.project_root / "taskpacks").resolve()
         self.candidate_root = (self.project_root / "runs" / "candidates").resolve()
         from trace2task.local_trash import LocalTrash
@@ -930,6 +938,8 @@ class WebConsoleController:
             self._require_idle()
             if raw_path.startswith('workbench-run/'):
                 return self.run_store.trash_action(raw_path.removeprefix('workbench-run/'), 'restore')
+            if self.trash.describe(raw_path)['kind'] == 'trace_experience':
+                return restore_version(self.project_root, lambda: self.trash.restore(raw_path))
             return self.trash.restore(raw_path)
 
     def purge_trashed_asset(self, raw_path: str, *, confirmed=False) -> dict[str, Any]:
@@ -1542,11 +1552,8 @@ class WebConsoleController:
             )).with_credentials()
             model = validate_api_model(model)
             adaptive_reasoning = False
-        if provider == "codex" and model not in CODEX_MODELS:
-            raise ValueError(
-                f"当前是 Codex 模式，不支持的模型：{model}。"
-                "自定义 API 模型请先将“执行模型来源”切换为“模型 API”。"
-            )
+        if provider == "codex":
+            self.codex_catalog.validate(model, reasoning_effort)
         allowed_efforts = API_REASONING_EFFORTS if provider == "api" else CODEX_REASONING_EFFORTS
         if reasoning_effort not in allowed_efforts:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
@@ -1678,10 +1685,7 @@ class WebConsoleController:
             raise ValueError("经验名称不能超过 80 个字符")
         if re.search(r"[\\/:*?\"<>|\x00-\x1f]", normalized_task_id):
             raise ValueError("经验名称包含 Windows 路径不支持的字符")
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
         if not isinstance(defer_compilation, bool):
@@ -1740,10 +1744,7 @@ class WebConsoleController:
             raise ValueError("经验名称不能超过 80 个字符")
         if re.search(r"[\\/:*?\"<>|\x00-\x1f]", normalized_task_id):
             raise ValueError("经验名称包含 Windows 路径不支持的字符")
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         if not isinstance(narrated, bool):
             raise TypeError("讲解录制开关必须是布尔值")
         if not isinstance(defer_compilation, bool):
@@ -2196,10 +2197,7 @@ class WebConsoleController:
         metadata_path = trace_path.with_name("metadata.json")
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         task_id = str(metadata.get("task_id") or trace_path.parent.name)
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         with self._lock:
             self._require_idle()
             confirmation = self._compilation_confirmation(trace_path)
@@ -2231,8 +2229,7 @@ class WebConsoleController:
                                     confirm_duplicate: bool = False) -> dict[str, Any]:
         from trace2task.trace_library import duplicate_confirmation, recording_source
 
-        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError('不支持的 Agent 编译模型或思考强度')
+        self.codex_catalog.validate(model, reasoning_effort)
         with self._lock:
             self._require_idle()
             _, trace_path, _ = recording_source(self.project_root, raw_path)
@@ -2276,28 +2273,40 @@ class WebConsoleController:
     def start_run_experience(self, run_id: str, *, source_sha256: str,
                              model: str = DEFAULT_COMPILER_MODEL,
                              reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
-                             confirm_duplicate: bool = False) -> dict[str, Any]:
-        from trace2task.run_experience import prepare_run_experience, preview_run_experience
+                             confirm_duplicate: bool = False, guidance: str = '',
+                             draft_id: str = '', draft_sha256: str = '') -> dict[str, Any]:
+        from trace2task.run_experience import (
+            prepare_draft_revision,
+            prepare_run_experience,
+            preview_run_experience,
+            with_compilation_guidance,
+        )
 
-        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError('不支持的经验提炼模型或思考强度')
+        self.codex_catalog.validate(model, reasoning_effort)
         with self._lock:
             self._require_idle()
-            prepared = prepare_run_experience(self.project_root, self.run_store, run_id)
-            if prepared['source_sha256'] != source_sha256:
-                raise ValueError('来源轨迹或截图已变化，请重新预览后提炼')
-            previous = preview_run_experience(self.project_root, self.run_store, run_id)['drafts']
+            if draft_id:
+                prepared = prepare_draft_revision(self.project_root, draft_id,
+                    draft_sha256=draft_sha256, guidance=guidance)
+                run_id = prepared['summary']['run_id']
+                previous = []
+            else:
+                prepared = prepare_run_experience(self.project_root, self.run_store, run_id)
+                if prepared['source_sha256'] != source_sha256:
+                    raise ValueError('来源轨迹或截图已变化，请重新预览后提炼')
+                prepared = with_compilation_guidance(prepared, guidance)
+                previous = preview_run_experience(self.project_root, self.run_store, run_id)['drafts']
             if previous and confirm_duplicate is not True:
                 return {'confirmation_required': True, 'representation': 'B', 'existing_versions': previous,
                         'message': '这次运行已有经验草稿。再次提炼会调用模型并保存独立草稿，不覆盖已有内容。'}
             job = ConsoleJob(job_id=uuid.uuid4().hex, task_path='', task_id=run_id,
-                instruction=f"{'反馈修订经验' if prepared['lineage'] else '提炼运行经验'}：{prepared['summary']['instruction']}", mode='compile',
+                instruction=f"{'按意见修订经验' if draft_id else '反馈修订经验' if prepared['lineage'] else '提炼运行经验'}：{prepared['summary']['instruction']}", mode='compile',
                 kind='experience_compilation', model=model, reasoning_effort=reasoning_effort)
             job.run_facts = {'run_id': job.job_id, 'model': model, 'profile': 'run-experience-compiler',
                 'inference_backend': 'codex-app-server', 'execution_backend': 'none',
                 'operation_scope': 'none', 'input_mode': 'none', 'data_flow': 'remote',
                 'destination': 'Codex 订阅 · 经验提炼', 'experience_path': '',
-                'context_description': '一次模型调用，发送本次实际使用的原经验（如有）、轨迹投影与最多 8 张历史截图；生成草稿，不入库、不执行。'}
+                'context_description': '发送冻结的轨迹证据、历史截图及本次提炼要求/待修改草稿（如有）；生成独立草稿，不入库、不执行。'}
             self._register_job(job)
         threading.Thread(target=self._run_experience_compilation, args=(job, prepared),
                          name=f'trace2task-experience-{job.job_id[:8]}', daemon=True).start()
@@ -2321,19 +2330,27 @@ class WebConsoleController:
             self._update(job, status='failed', error=f'{type(error).__name__}: {error}',
                          log='未发布经验草稿；模型已返回的原文保留在逐轮记录中。')
 
-    def save_run_experience(self, draft_id: str, *, draft_sha256: str, confirmed: bool) -> dict[str, Any]:
+    def save_run_experience(self, draft_id: str, *, draft_sha256: str, confirmed: bool,
+                            save_mode=None, revision_parent_id=None, expected_revision=None) -> dict[str, Any]:
         from trace2task.run_experience import save_draft
         with self._lock:
             self._require_idle()
-            return save_draft(self.project_root, draft_id, draft_sha256=draft_sha256, confirmed=confirmed)
+            return save_draft(self.project_root, draft_id, draft_sha256=draft_sha256, confirmed=confirmed,
+                              save_mode=save_mode, revision_parent_id=revision_parent_id,
+                              expected_revision=expected_revision)
+
+    def edit_run_experience(self, draft_id: str, *, draft_sha256: str, content: str) -> dict[str, Any]:
+        from trace2task.run_experience import edit_draft
+        with self._lock:
+            self._require_idle()
+            return edit_draft(self.project_root, draft_id, draft_sha256=draft_sha256, content=content)
 
     def start_procedure_evolution(self, run_id: str, *, model: str = DEFAULT_COMPILER_MODEL,
                                   reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
                                   confirm_duplicate: bool = False) -> dict[str, Any]:
         from trace2task.procedure_evolution import evolution_confirmation, prepare_evolution
 
-        if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError('不支持的改进模型或思考强度')
+        self.codex_catalog.validate(model, reasoning_effort)
         with self._lock:
             self._require_idle()
             prepared = prepare_evolution(self.project_root, self.run_store, run_id)
@@ -2396,10 +2413,7 @@ class WebConsoleController:
             raise ValueError("请输入对这次运行的改进意见")
         if len(normalized_feedback) > 2_000:
             raise ValueError("改进意见不能超过 2000 个字符")
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
         if not isinstance(candidate, dict):
             raise TypeError("候选经验格式无效")
@@ -2469,10 +2483,7 @@ class WebConsoleController:
             raise ValueError("请输入要修正的阶段、状态、转移或结束条件")
         if len(normalized_feedback) > 2_000:
             raise ValueError("任务结构反馈不能超过 2000 个字符")
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         candidate = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
         if not isinstance(candidate, dict):
             raise TypeError("候选经验格式无效")
@@ -2571,10 +2582,7 @@ class WebConsoleController:
         reasoning_effort: str,
         status_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
-        if model not in CODEX_MODELS:
-            raise ValueError(f"不支持的模型：{model}")
-        if reasoning_effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"不支持的思考强度：{reasoning_effort}")
+        self.codex_catalog.validate(model, reasoning_effort)
         report = status_callback or (lambda message: None)
         existing_task = self._find_taskpack_for_trace(trace_path)
         recording_metadata = json.loads(
@@ -3248,6 +3256,12 @@ class WebConsoleController:
                 kind="recording",
             )
 
+    def rollback_trace_version(self, identifier: str, *, expected_revision, model_input_sha256) -> dict[str, Any]:
+        with self._lock:
+            self._require_idle()
+            return rollback_version(self.project_root, identifier, expected_revision=expected_revision,
+                                    model_input_sha256=model_input_sha256)
+
     def delete_trace_experience(self, identifier: str) -> dict[str, Any]:
         with self._lock:
             self._require_idle()
@@ -3255,6 +3269,7 @@ class WebConsoleController:
             target = (root / identifier).resolve()
             if not identifier or target.parent != root or not (target / "header.json").is_file():
                 raise ValueError("请选择有效的任务经验")
+            list_versions(self.project_root)
             return self._move_to_trash(target, allowed_root=root,
                 trash_root=root / ".trash", kind="trace_experience")
 
@@ -3343,8 +3358,8 @@ class WebConsoleController:
             self.run_store.save(job.snapshot(details=False))
 
     def intervene_job(self, job_id, payload):
-        if not isinstance(payload, dict) or set(payload) - {'request_id', 'kind', 'text'}:
-            raise ValueError('干预请求只能包含 request_id、kind 和 text')
+        if not isinstance(payload, dict) or set(payload) - {'request_id', 'kind', 'text', 'visual'}:
+            raise ValueError('干预请求只能包含 request_id、kind、text 和 visual')
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -3357,7 +3372,7 @@ class WebConsoleController:
         # Never enter the intervention lock under the console lock: its publish
         # callback persists snapshots through _intervention_update.
         return control.request(request_id=payload.get('request_id'), kind=payload.get('kind'),
-                               text=payload.get('text', ''))
+                               text=payload.get('text', ''), visual=payload.get('visual'))
 
     def stop_job(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -4582,7 +4597,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     },
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
-                    "trace_representations": list_traces(self.controller.project_root),
+                    "trace_representations": list_versions(self.controller.project_root),
                     "trash": self.controller.trash.list() + self.controller.run_store.trash_list(),
                     "candidates": self.controller.list_candidates(),
                     "active_job": (self.controller._jobs[self.controller._active_job_id].snapshot(details=False)
@@ -4594,26 +4609,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                             "reasoning_efforts": list(API_REASONING_EFFORTS),
                             "saved_settings": self.controller.api_settings.public_settings(),
                         },
-                        "models": list(CODEX_SELECTABLE_MODELS),
-                        "reasoning_efforts": list(CODEX_REASONING_EFFORTS),
-                        "defaults": {
-                            "model": DEFAULT_CODEX_MODEL,
-                            "reasoning_effort": DEFAULT_CODEX_REASONING_EFFORT,
-                        },
-                        "compiler_defaults": {
-                            "model": DEFAULT_COMPILER_MODEL,
-                            "reasoning_effort": DEFAULT_COMPILER_REASONING_EFFORT,
-                        },
-                        "revision_defaults": {
-                            "model": DEFAULT_REVISION_MODEL,
-                            "reasoning_effort": DEFAULT_REVISION_REASONING_EFFORT,
-                        },
-                        "task_model_revision_defaults": {
-                            "model": DEFAULT_TASK_MODEL_REVISION_MODEL,
-                            "reasoning_effort": (
-                                DEFAULT_TASK_MODEL_REVISION_REASONING_EFFORT
-                            ),
-                        },
+                        **self.controller.codex_catalog.options(),
                         "waa_defaults": {
                             "root": str(DEFAULT_WAA_ROOT),
                             "example_path": (
@@ -4624,6 +4620,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     },
                 }
             )
+            return
+        if parsed.path == '/api/codex/models':
+            self._json(self.controller.codex_catalog.options(refresh=parse_qs(parsed.query).get('refresh') == ['1']))
             return
         if parsed.path == "/api/windows":
             self._json({"windows": self.controller.list_windows()})
@@ -4709,9 +4708,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             self._require_api_same_origin()
+            from trace2task.intervention_images import MAX_VISUAL_REQUEST_BYTES
             payload = self._read_json(
                 max_bytes=(
-                    MAX_NARRATION_REQUEST_BYTES
+                    MAX_VISUAL_REQUEST_BYTES
+                    if re.fullmatch(r'/api/jobs/[^/]+/interventions', parsed.path)
+                    else MAX_NARRATION_REQUEST_BYTES
                     if parsed.path
                     in {
                         "/api/trained-model/predict",
@@ -5036,7 +5038,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     source_sha256=payload.get('source_sha256', ''),
                     model=payload.get('model', DEFAULT_COMPILER_MODEL),
                     reasoning_effort=payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT),
-                    confirm_duplicate=payload.get('confirm_duplicate', False))
+                    confirm_duplicate=payload.get('confirm_duplicate', False),
+                    guidance=payload.get('guidance', ''), draft_id=payload.get('draft_id', ''),
+                    draft_sha256=payload.get('draft_sha256', ''))
                 self._json(result, status=HTTPStatus.OK if result.get('confirmation_required') else HTTPStatus.ACCEPTED)
                 return
             if parsed.path == '/api/run-experience/draft':
@@ -5045,7 +5049,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == '/api/run-experience/save':
                 self._json(self.controller.save_run_experience(payload.get('draft_id', ''),
-                    draft_sha256=payload.get('draft_sha256', ''), confirmed=payload.get('confirmed', False)))
+                    draft_sha256=payload.get('draft_sha256', ''), confirmed=payload.get('confirmed', False),
+                    save_mode=payload.get('save_mode'), revision_parent_id=payload.get('revision_parent_id'),
+                    expected_revision=payload.get('expected_revision')))
+                return
+            if parsed.path == '/api/run-experience/edit':
+                self._json(self.controller.edit_run_experience(payload.get('draft_id', ''),
+                    draft_sha256=payload.get('draft_sha256', ''), content=payload.get('content', '')))
                 return
             if parsed.path == '/api/traces/evolve':
                 result = self.controller.start_procedure_evolution(payload.get('run_id', ''),
@@ -5072,6 +5082,11 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/traces/delete":
                 self._json(self.controller.delete_trace_experience(payload.get("id", "")))
+                return
+            if parsed.path == "/api/traces/rollback":
+                self._json(self.controller.rollback_trace_version(payload.get('id', ''),
+                    expected_revision=payload.get('expected_revision'),
+                    model_input_sha256=payload.get('model_input_sha256', '')))
                 return
             if parsed.path == "/api/taskpacks/delete":
                 self._json(self.controller.delete_taskpack(payload.get("task_path", "")))

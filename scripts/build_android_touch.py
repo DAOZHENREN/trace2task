@@ -34,10 +34,10 @@ def main():
             entry = zipfile.ZipInfo('classes.dex', (2026, 1, 1, 0, 0, 0))
             entry.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(entry, (dex / 'classes.dex').read_bytes())
-        metadata = {'protocol': 'T2T1', 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        metadata = {'protocol': 'T2T2', 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
                     'jar_sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(),
                     'compiler_sha256': hashlib.sha256(args.r8.read_bytes()).hexdigest(),
-                    'min_api': 29, 'max_duration_ms': 1500}
+                    'min_api': 29, 'max_duration_ms': None, 'heartbeat_timeout_ms': 1500}
         (folder / 'build.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
         print(json.dumps(metadata, indent=2))
 

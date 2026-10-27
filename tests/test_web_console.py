@@ -21,7 +21,7 @@ import yaml
 
 from trace2task import web_console
 from trace2task.api_settings import APISettingsStore
-from trace2task.codex_app_server import CodexTurnTimeoutError
+from trace2task.codex_app_server import CodexTurnError, CodexTurnTimeoutError
 from trace2task.speech_transcription import LocalTranscription
 from trace2task.web_console import ConsoleJob, WebConsoleController, create_web_server
 from trace2task.windows_runner import WindowsAgentRunFailed
@@ -2478,6 +2478,10 @@ def test_waa_narration_pair_preserves_trace_and_compiler_variants(
             ),
             "response_in_progress_timeout",
         ),
+        (
+            CodexTurnError("codex_rate_limit", "HTTP 429; retry in 589 seconds"),
+            "codex_rate_limit",
+        ),
     ],
 )
 def test_waa_narration_pair_stops_on_retryable_failure_and_reuses_trace_on_retry(
@@ -3188,22 +3192,14 @@ def test_web_server_serves_console_state_and_job_api(
     ]
     assert summary_result["summary"] == "人工微调后的摘要"
     assert summary_updates == [("runs/candidates/example", "人工微调后的摘要")]
-    assert state["agent_options"]["models"] == [
-        "gpt-6.1-sol",
-        "gpt-6-luna",
-    ]
+    assert state["agent_options"]["models"] == [m["model"] for m in state["agent_options"]["model_details"]]
+    assert state["agent_options"]["catalog_status"] == "ready"
     assert state["agent_options"]["defaults"] == {
         "model": "gpt-6.1-sol",
         "reasoning_effort": "low",
     }
-    assert state["agent_options"]["compiler_defaults"] == {
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "high",
-    }
-    assert state["agent_options"]["revision_defaults"] == {
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "high",
-    }
+    assert state["agent_options"]["compiler_defaults"] == state["agent_options"]["defaults"]
+    assert state["agent_options"]["revision_defaults"] == state["agent_options"]["defaults"]
     assert completed["status"] == "completed"
     assert completed["model"] == "gpt-5.6-luna"
     assert completed["reasoning_effort"] == "medium"

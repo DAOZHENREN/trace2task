@@ -7,10 +7,12 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import pygame
+import pytest
 from PIL import Image
 
 from trace2task.chat_agent_runner import run_chat_agent
 from trace2task.chat_model_adapter import ChatModelAdapter, plan_schema
+from trace2task.codex_app_server import CodexTurnError
 from trace2task.model_api import ModelAPIConfig, ModelAPISession
 
 
@@ -90,6 +92,36 @@ def _reply(actions=None, *, complete=False):
 
 def _capture_round(sink, entry):
     sink.append(dict(entry))
+
+
+@pytest.mark.parametrize("category,message,diagnostics", [
+    ("codex_rate_limit", "HTTP 429; retry in 589 seconds",
+     {"http_status_code": 429, "retry_after_seconds": 589}),
+    ("codex_access_denied", "Codex thread entered systemError; last retry failed with HTTP 403",
+     {"http_status_code": 403, "thread_status": "systemError", "error_source": "last_retry"}),
+])
+def test_codex_failure_is_archived_without_dispatching_or_resending(tmp_path, category, message, diagnostics):
+
+    class LimitedSession(Session):
+        def run_turn(self, **request):
+            self.requests.append(request)
+            raise CodexTurnError(category, message, diagnostics=diagnostics)
+
+    session = LimitedSession([])
+    driver = Driver(tmp_path)
+    result = run_chat_agent(
+        instruction="synthetic test", model="fake-chat", reasoning_effort="low",
+        output_root=tmp_path, emergency_stop=Stop(), status_callback=lambda _: None,
+        executor_backend="cua", cua_target=Driver.target, cua_driver=driver, session=session,
+    )
+    assert result["stop_reason"] == "error"
+    assert result["failure_category"] == category
+    assert result["model_failure_diagnostics"] == diagnostics
+    assert result["actions"] == 0 and driver.calls == []
+    assert len(session.requests) == 1
+    saved = json.loads(Path(result["trace_path"]).with_name("result.json").read_text("utf-8"))
+    assert saved["model_failure_diagnostics"] == diagnostics
+    assert message in saved["model_io"][0]["error"]
 
 
 def test_adapter_keeps_chat_json_and_rejects_malformed_plan_without_dispatch(tmp_path):

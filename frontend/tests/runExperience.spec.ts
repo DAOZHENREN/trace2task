@@ -6,7 +6,8 @@ async function fixture(page: Page) {
     created_at: '2026-10-22T14:21:00Z', updated_at: '2026-10-22T14:34:00Z',
     result: {stop_reason: 'visual_completion_reviewed'}};
   const generated = {...source, job_id: 'experience-job', kind: 'experience_compilation',
-    instruction: '提炼运行经验：帮我完成精灵对战', result: {experience_draft_id: 'draft-1'}};
+    instruction: '提炼运行经验：帮我完成精灵对战', interventions: {},
+    result: {experience_draft_id: 'draft-1'}};
   const summary = {run_id: source.job_id, instruction: source.instruction, status: source.status,
     outcome: '模型视觉复核完成 · 非独立验证', stop_reason: 'visual_completion_reviewed', scope: 'android',
     package: 'com.example.game', model: 'test-model', round_count: 32, delivered_count: 30, image_count: 4};
@@ -34,7 +35,24 @@ async function fixture(page: Page) {
   await page.goto('/');
   await page.getByRole('button', {name: '运行记录', exact: true}).click();
   await page.locator('.history-row').filter({hasText: source.instruction}).click();
-  return {source, writes};
+  return {source, generated, writes, content, summary, images};
+}
+
+for (const unsupported of [{}, {supported: false}]) {
+  test(`completed compilation opens its existing draft with interventions ${JSON.stringify(unsupported)}`, async ({page}) => {
+    const errors: string[] = [];
+    page.on('pageerror', error => errors.push(error.message));
+    const f = await fixture(page);
+    f.generated.interventions = unsupported;
+    await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [f.generated]}}));
+    await page.getByRole('button', {name: '运行记录', exact: true}).click();
+    await page.locator('.history-row').filter({hasText: f.generated.instruction}).click();
+    await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+    await expect(page.getByRole('dialog')).toContainText('对战过程中的状态判断');
+    await expect(page.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+    expect(errors).toEqual([]);
+    expect(f.writes.map(write => write.path)).toEqual(['/api/run-experience/draft']);
+  });
 }
 
 test('preview discloses real source and sends nothing until generate; cancellation is safe', async ({page}, info) => {
@@ -63,18 +81,75 @@ test('draft is digest-bound, saved only after review, never selected or executed
   const dialog = page.getByRole('dialog');
   await expect(dialog).toContainText('对战过程中的状态判断');
   await expect(dialog.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+  await expect(dialog.getByRole('radio', {name: '成为新的独立经验'})).toBeChecked();
+  await expect(dialog.getByRole('radio', {name: '成为已有经验的新版本'})).toBeDisabled();
   await dialog.getByRole('checkbox').check();
   await dialog.screenshot({path: info.outputPath('experience-draft.png'), animations: 'disabled'});
   await dialog.getByRole('button', {name: '保存到经验库', exact: true}).click();
   await expect(dialog.getByRole('status')).toContainText('没有启动新任务');
   expect(f.writes.find(w => w.path.endsWith('/generate'))?.body).toMatchObject({run_id: f.source.job_id, source_sha256: 'source-digest'});
-  expect(f.writes.find(w => w.path.endsWith('/save'))?.body).toEqual({draft_id: 'draft-1', draft_sha256: 'draft-digest', confirmed: true});
+  expect(f.writes.find(w => w.path.endsWith('/save'))?.body).toEqual({draft_id: 'draft-1', draft_sha256: 'draft-digest', confirmed: true,
+    save_mode: 'independent'});
   await dialog.getByRole('button', {name: '稍后再看', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
   expect(f.writes.every(w => w.path.startsWith('/api/run-experience/'))).toBe(true);
   await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
   await expect(page.getByRole('button', {name: '到经验库查看', exact: true})).toBeVisible();
 });
+
+for (const mode of ['revision', 'independent'] as const) {
+  test(`save choice ${mode} resets confirmation and persists the selected membership`, async ({page}, info) => {
+    const f = await fixture(page);
+    const parent = {id: 'parent-current', trace_name: '原始对战经验', description: '原始方法', representation: 'B',
+      created_at: '2026-10-26T10:00:00Z', version_revision: 4};
+    const other = {...parent, id: 'another-current', trace_name: '另一份对战经验', version_revision: 9};
+    let saved: {mode: 'revision' | 'independent'; parent_id: string | null} | null = null;
+    await page.route('**/api/run-experience/draft', route => route.fulfill({json: {
+      draft_id: 'draft-choice', draft_sha256: 'choice-digest', content: f.content, trace_name: '提炼方法',
+      description: '测试', summary: f.summary, compiler_images: [], saved_trace_id: saved ? 'saved-choice' : null,
+      saved_versioning: saved, save_options: {default_mode: 'revision', default_parent_id: parent.id,
+        revision_targets: [parent, other]}}}));
+    await page.route('**/api/run-experience/save', route => {
+      const body = route.request().postDataJSON();
+      expect(body.save_mode).toBe(mode);
+      saved = {mode, parent_id: mode === 'revision' ? body.revision_parent_id : null};
+      return route.fulfill({json: {id: 'saved-choice', versioning: saved}});
+    });
+    await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+    await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+    await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+    const dialog = page.getByRole('dialog');
+    const confirmation = dialog.getByRole('checkbox');
+    const save = dialog.getByRole('button', {name: '保存到经验库', exact: true});
+    await expect(dialog.getByRole('radio', {name: '成为已有经验的新版本'})).toBeChecked();
+    await expect(dialog.getByLabel('接续哪份经验', {exact: true})).toHaveValue(parent.id);
+    await confirmation.check();
+    await dialog.getByRole('radio', {name: '成为新的独立经验'}).check();
+    await expect(confirmation).not.toBeChecked();
+    await expect(save).toBeDisabled();
+    await expect(dialog).toContainText('已有经验的当前版本不变');
+    if (mode === 'revision') {
+      await dialog.getByRole('radio', {name: '成为已有经验的新版本'}).check();
+      await confirmation.check();
+      await dialog.getByLabel('接续哪份经验', {exact: true}).selectOption(other.id);
+      await expect(confirmation).not.toBeChecked();
+      await expect(save).toBeDisabled();
+    }
+    expect(f.writes.filter(w => w.path.endsWith('/save'))).toHaveLength(0);
+    await confirmation.check();
+    await dialog.screenshot({path: info.outputPath(`save-${mode}.png`), animations: 'disabled'});
+    await save.click();
+    expect(f.writes.find(w => w.path.endsWith('/save'))?.body).toEqual({draft_id: 'draft-choice',
+      draft_sha256: 'choice-digest', confirmed: true, save_mode: mode,
+      ...(mode === 'revision' ? {revision_parent_id: other.id, expected_revision: 9} : {})});
+    await expect(dialog.getByRole('status')).toContainText(mode === 'independent' ? '新的独立经验' : '已保存为新版本');
+    await expect(dialog.getByRole('radiogroup', {name: '保存方式'})).toHaveCount(0);
+    await dialog.getByRole('button', {name: '稍后再看', exact: true}).click();
+    await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+    await expect(dialog.getByRole('status')).toContainText(mode === 'independent' ? '新的独立经验' : '已保存为新版本');
+    expect(f.writes.filter(w => w.path.endsWith('/save'))).toHaveLength(1);
+  });
+}
 
 test('source preview error does not expose generation or leak old source', async ({page}) => {
   const f = await fixture(page);
@@ -139,4 +214,86 @@ test('studio fits a narrow window and leaves footer actions reachable', async ({
       .map(c => ({tag: c.tagName, classes: c.className, width: c.getBoundingClientRect().width})),
   }));
   expect(overflow.scroll, JSON.stringify(overflow)).toBeLessThanOrEqual(overflow.width + 1);
+});
+
+test('author can guide compilation before submitting evidence', async ({page}) => {
+  const f = await fixture(page);
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  await page.getByLabel('提炼要求（可选）', {exact: true}).fill('只保留状态判断，注明尚未验证的结论。');
+  expect(f.writes.map(w => w.path)).toEqual(['/api/run-experience/preview']);
+  await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  expect(f.writes.find(w => w.path.endsWith('/generate'))?.body.guidance).toBe('只保留状态判断，注明尚未验证的结论。');
+});
+
+test('editing creates an independent draft and resets confirmation without a model request', async ({page}, info) => {
+  const f = await fixture(page);
+  const updated = f.content.replace('对战过程中的状态判断', '人工修订的状态判断');
+  await page.route('**/api/run-experience/edit', route => route.fulfill({json: {
+    draft_id: 'draft-2', draft_sha256: 'new-digest', content: updated, trace_name: '人工修订的状态判断',
+    description: '测试', saved_trace_id: null, summary: f.summary, compiler_images: f.images,
+    authoring: {kind: 'edit', guidance: '', revision: 1}}}));
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+  const before = f.writes.length;
+  await page.getByRole('checkbox').check();
+  await page.getByRole('button', {name: '直接编辑正文', exact: true}).click();
+  await page.getByLabel('经验正文（Markdown）', {exact: true}).fill(updated);
+  await expect(page.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+  await page.getByRole('dialog').screenshot({path: info.outputPath('experience-edit.png')});
+  await page.getByRole('button', {name: '保存修改为新草稿', exact: true}).click();
+  await expect(page.getByRole('dialog')).toContainText('人工编辑版');
+  await expect(page.getByRole('checkbox')).not.toBeChecked();
+  await expect(page.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+  expect(f.writes.slice(before).map(w => w.path)).toEqual(['/api/run-experience/edit']);
+  expect(f.writes.at(-1)?.body).toEqual({draft_id: 'draft-1', draft_sha256: 'draft-digest', content: updated});
+  await page.getByRole('checkbox').check();
+  await page.getByRole('button', {name: '保存到经验库', exact: true}).click();
+  expect(f.writes.at(-1)?.body).toEqual({draft_id: 'draft-2', draft_sha256: 'new-digest', confirmed: true, save_mode: 'independent'});
+});
+
+test('feedback revision is bound to the current draft and disables premature save', async ({page}) => {
+  const f = await fixture(page);
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+  await page.getByRole('checkbox').check();
+  await page.getByLabel('希望怎样修改', {exact: true}).fill('精简重复等待，补充结算画面的判断。');
+  await expect(page.getByRole('checkbox')).not.toBeChecked();
+  await expect(page.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+  await page.getByRole('button', {name: '按意见修订', exact: true}).click();
+  const requests = f.writes.filter(w => w.path.endsWith('/generate'));
+  expect(requests).toHaveLength(2);
+  expect(requests[1].body).toMatchObject({draft_id: 'draft-1', draft_sha256: 'draft-digest',
+    guidance: '精简重复等待，补充结算画面的判断。'});
+  expect(f.writes.some(w => w.path.endsWith('/save'))).toBe(false);
+});
+
+test('failed edit keeps user text and offers correction without generating again', async ({page}) => {
+  const f = await fixture(page);
+  await page.route('**/api/run-experience/edit', route => route.fulfill({status: 400, json: {error: '草稿缺少有效的来源轮次引用；未入库'}}));
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+  await page.getByRole('button', {name: '直接编辑正文', exact: true}).click();
+  await page.getByLabel('经验正文（Markdown）', {exact: true}).fill('尚未完成的修改');
+  await page.getByRole('button', {name: '保存修改为新草稿', exact: true}).click();
+  await expect(page.getByRole('alert')).toContainText('来源轮次');
+  await expect(page.getByLabel('经验正文（Markdown）', {exact: true})).toHaveValue('尚未完成的修改');
+  expect(f.writes.filter(w => w.path.endsWith('/generate'))).toHaveLength(1);
+  await expect(page.getByRole('button', {name: '保存到经验库', exact: true})).toBeDisabled();
+});
+
+test('cooldown status remains visible outside folded logs', async ({page}) => {
+  const f = await fixture(page);
+  const running = {...f.generated, status: 'running'};
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [running]}}));
+  await page.route('**/api/workbench/runs/experience-job?after=*', route => route.fulfill({json: {
+    session: running, cursor: 1, has_more: false,
+    events: route.request().url().endsWith('after=0') ? [{name: 'run.log', seq: 1,
+      attributes: {message: 'Codex 服务端限流，等待约 590 秒后自动继续提炼；可随时停止。'}}] : []}}));
+  await page.getByRole('button', {name: '运行记录', exact: true}).click();
+  await page.locator('.history-row').filter({hasText: running.instruction}).click();
+  await expect(page.locator('.notice[role="status"]')).toContainText('590 秒后自动继续');
+  await expect(page.locator('.notice[role="status"]')).toBeVisible();
 });

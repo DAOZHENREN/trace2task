@@ -11,7 +11,8 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from trace2task.codex_agent import resolve_codex_binary
-from trace2task.codex_app_server import CODEX_MODELS, CODEX_REASONING_EFFORTS, CodexAppServerSession
+from trace2task.codex_app_server import CodexAppServerSession
+from trace2task.codex_catalog import CodexModelCatalog
 from trace2task.procedure_prompt import PROCEDURE_PROMPT, PROMPT_VERSION
 from trace2task.trace_evidence import digest, export_a
 from trace2task.trace_library import duplicate_confirmation, recording_source
@@ -28,16 +29,17 @@ def _check_cancel(stop_event):
         raise ProcedureCompileCancelled('Agent 编译已停止，未发布 B 版本')
 
 
-def validate_procedure(text):
+def validate_procedure(text, *, phase_method=False):
     """Validate format only; semantic correctness still requires human inspection."""
     if not isinstance(text, str):
         raise TypeError('Agent 未返回文本 Procedure')
     value = text.strip()
     title = re.match(r'^# ([^\r\n]+)\r?\n', value)
-    steps = re.search(r'^## 步骤\s*\r?\n', value, re.MULTILINE)
+    steps = re.search(r'^(?:## \S[^\r\n]*\r?\n|\d+[.)] +(?=\S))' if phase_method else r'^## 步骤\s*\r?\n', value, re.MULTILINE)
     if (not title or not steps or re.search(r'^\s*(```|~~~)', value, re.MULTILINE)
-            or not re.search(r'^\s*\d+[.)]\s+\S', value[steps.end():], re.MULTILINE)):
-        raise ValueError('Agent 未形成约定的 Markdown Procedure（方法名称、用途、有序步骤）；原文已保留，未发布 B 版本')
+            or (not phase_method and not re.search(r'^\s*\d+[.)]\s+\S', value[steps.end():], re.MULTILINE))
+            or not value[steps.end():].strip()):
+        raise ValueError('Agent 未形成可用的 Markdown Procedure（方法名称、用途、阶段步骤）；原文已保留，未发布 B 版本')
     description = next((line.strip() for line in value[title.end():steps.start()].splitlines()
                         if line.strip() and not line.lstrip().startswith(('#', '输入：', '输入:'))), '')
     if not description:
@@ -48,13 +50,13 @@ def validate_procedure(text):
 def compile_b(project_root, trace_path, *, model, reasoning_effort, confirm_duplicate=False,
               stop_event=None, progress=None, on_round=None, publish_lock=None,
               session_factory=None, binary_resolver=None):
-    if model not in CODEX_MODELS or reasoning_effort not in CODEX_REASONING_EFFORTS:
-        raise ValueError('不支持的 Agent 编译模型或思考强度')
+    stop_event = stop_event or threading.Event()
+    _check_cancel(stop_event)
+    CodexModelCatalog(project_root).validate(model, reasoning_effort)
     root, trace, derivation = recording_source(project_root, trace_path)
     confirmation = duplicate_confirmation(root, trace, 'B')
     if confirmation and confirm_duplicate is not True:
         return confirmation
-    stop_event = stop_event or threading.Event()
     report = progress or (lambda message: None)
     record_round = on_round or (lambda entry: None)
     _check_cancel(stop_event)

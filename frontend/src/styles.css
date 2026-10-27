@@ -16,6 +16,15 @@
 .handoff-pictures figure {margin:0; border:1px solid #d3e1d6; background:#fff; border-radius:8px; overflow:hidden;}
 .handoff-pictures figcaption,.handoff-image-missing {padding:10px; font-size:12px;}
 .handoff-pictures img {display:block; width:100%; max-height:260px; object-fit:contain;}
+.image-annotator {margin-top:14px; padding:14px; border:1px solid #d3e1d6; border-radius:10px; background:#fff; min-width:0; scroll-margin-top:80px;}
+.image-annotator:focus-visible {outline:2px solid #25644d; outline-offset:2px;}
+.annotation-toolbar {display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:10px;}
+.annotation-toolbar strong {margin-right:auto;}
+.annotation-toolbar .quiet {margin-left:auto;}
+.annotation-surface {position:relative; margin:12px auto; background:#fff; border-radius:6px; overflow:hidden;}
+.annotation-surface img {display:block; width:100%; height:auto; user-select:none;}
+.annotation-surface svg {position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair;}
+.annotation-surface svg>* {pointer-events:none;}
 @media(max-width:600px) {.run-interventions {padding:14px;} .run-interventions>.row-between {flex-wrap:wrap; gap:8px;} .handoff-pictures {grid-template-columns:1fr;}}
 
 /* Run-to-experience studio: evidence on the left, a readable method on paper. */
@@ -83,6 +92,9 @@
 .method-step>span {font:11px/25px Consolas,monospace; background:#eaf0e0; color:#577043; min-width:25px; text-align:center; border-radius:6px; margin-top:2px;}
 .method-step p {margin:0;}
 .studio-review {border-top:1px solid #e5e7db; margin-top:25px; padding-top:18px;}
+.studio-save-options {margin-top:24px; padding:18px; border:1px solid #dfe5da; border-radius:12px; background:#f1f5ea;}
+.studio-save-options h3 {margin:0 0 10px; font-size:15px;}
+.studio-save-options .field {margin-top:12px;}
 .studio-review p {display:flex; align-items:flex-start; gap:8px; color:#35664b; font-size:12px;}
 .studio-review p svg {flex-shrink:0; margin-top:2px;}
 .studio-actions {display:flex!important; align-items:center!important; gap:10px!important; padding:17px 26px!important; background:#fff; border-top:1px solid #e3e8de;}
@@ -209,6 +221,9 @@ main {width:100%; max-width:1280px; margin:0 auto; padding:28px 32px 36px; flex:
 .task-textarea textarea::placeholder {color:#9aa69a;}
 .task-textarea:focus-within {outline:2px solid #c1d4c5; outline-offset:6px;}
 .composer-fields {display:grid; grid-template-columns:1fr 1.5fr 1.5fr; gap:16px; margin:16px 0 20px;}
+.composer-fields.codex-fields {grid-template-columns:minmax(0,.85fr) minmax(0,1.4fr) minmax(0,.65fr) minmax(0,1.6fr);}
+.composer-fields.codex-fields .field:last-child {grid-column:auto;}
+@media(max-width:1100px) {.composer-fields.codex-fields {grid-template-columns:1fr 1fr;}}
 .scope-row {display:grid; grid-template-columns:1.25fr 1fr 1fr; align-items:end; gap:16px; margin-bottom:4px;}
 .execution-setup {margin:0 -24px; padding:18px 24px 22px; background:#fafbfa; border-top:1px solid var(--line);}
 .setup-heading {display:flex; align-items:center; justify-content:space-between; gap:12px;}
@@ -276,6 +291,7 @@ details>summary {color:#657665; font-size:12px; cursor:pointer; padding:9px 0; m
 .model-input-image img {display:block; width:100%; max-height:150px; object-fit:contain; background:#eef1e9;}
 .model-input-image a span {display:block; font-size:11px; margin-top:6px;}
 .model-input-extra {margin-top:8px;}
+.execution-receipt>summary {font-size:13px; font-weight:600; color:inherit; margin-top:10px;}
 .verification {border-left:2px solid #b4c98d; padding:8px 12px; background:#f6f9ed; font-size:12px;}
 .log-disclosure {border-top:1px solid var(--line); padding:10px 24px;}
 .log-scroll {max-height:350px; overflow:auto; background:#f6f8f3; border-radius:8px; padding:12px;}
@@ -451,3 +467,8 @@ details>summary {color:#657665; font-size:12px; cursor:pointer; padding:9px 0; m
 .cloud-phone-connection p {margin: 6px 0 12px;}
 .cloud-phone-connection code {overflow-wrap: anywhere;}
 .cloud-phone-connection.compact {padding: 10px 16px; margin-bottom: 12px;}
+.studio-guidance,.studio-revision {margin-top:24px;}
+.studio-revision {padding-top:20px; border-top:1px solid var(--line);}
+.studio-editor textarea {min-height:360px; font:13px/1.7 Consolas,monospace;}
+.studio-guidance textarea,.studio-revision textarea {min-height:100px;}
+.studio-edit-actions {display:flex; gap:10px; flex-wrap:wrap; margin:12px 0;}
