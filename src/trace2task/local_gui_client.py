@@ -134,7 +134,8 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
                 execution_context=None,
                 request_id=None, audit_dir=None, previous_image=None, execution_feedback=None,
                 experience_context=None, prompt_profile=None, cursor_position=None,
-                conversation_id=None, conversation_start=False, expected_backend=None):
+                conversation_id=None, conversation_start=False, expected_backend=None, guided_history=None,
+                guided_history_offset=None, guided_knowledge=None):
     if model not in MODELS:
         raise ValueError('Unknown local model')
     if previous_image is not None:
@@ -184,6 +185,12 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
             if expected_backend is not None and (health.get('backend') != expected_backend
                     or not health.get('capabilities', {}).get('expected_backend')):
                 raise RuntimeError('运行引擎与本次配置不符，或服务版本过旧；请重启所选服务。未发送截图。')
+            if guided_history is not None and not health.get('capabilities', {}).get('guided_history_v6'):
+                raise RuntimeError('本地模型服务尚未支持 v6 已执行历史，请重启本地模型服务；未发送截图。')
+            if guided_history_offset is not None and not health.get('capabilities', {}).get('guided_task_conversations'):
+                raise RuntimeError('请重启本地模型服务以启用混合模式连续会话；未发送截图。')
+            if guided_knowledge is not None and not health.get('capabilities', {}).get('guided_application_knowledge'):
+                raise RuntimeError('请重启本地模型服务以加载混合模式底层知识；未发送截图。')
             if conversation_id and not health.get('capabilities', {}).get('task_conversations'):
                 raise RuntimeError('本地服务尚不支持连续会话，请关闭并重启本地模型服务')
             if conversation_id and not health.get('capabilities', {}).get('image_only_history_eviction'):
@@ -197,6 +204,8 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
                 raise RuntimeError('本地模型服务仍是旧版；请点击“关闭本地模型服务”后重新启动，避免忽略自定义提示词')
             if model == 'gui-owl-2b' and not health.get('capabilities', {}).get('official_owl_adapter'):
                 raise RuntimeError('本地模型服务仍是旧版；请关闭并重新启动服务以使用官方动作适配器')
+            if model == 'gui-decisions-2b' and not health.get('capabilities', {}).get('official_slotread_adapter'):
+                raise RuntimeError('本地模型服务尚未支持官方 SlotRead，请关闭并重新启动服务；未发送截图')
         except Exception:
             stop_started_process(started_process)
             raise
@@ -223,6 +232,14 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
                 'request_id':request_id or secrets.token_hex(16)}
         if expected_backend is not None:
             body['expected_backend'] = expected_backend
+        if guided_history is not None:
+            if bool(conversation_id) != (guided_history_offset is not None) or experience_context is not None:
+                raise ValueError('Guided history requires its own subgoal context')
+            body['guided_history'] = guided_history
+        if guided_history_offset is not None:
+            body['guided_history_offset'] = guided_history_offset
+        if guided_knowledge is not None:
+            body['guided_knowledge'] = guided_knowledge
         if cursor_position is not None:
             body['cursor_position'] = cursor_position
         if conversation_id:

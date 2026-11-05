@@ -14,7 +14,7 @@ from trace2task.chat_run_audit import ChatRunAudit
 from trace2task.execution_budget import BudgetStop, TimeBudgetExceeded
 from trace2task.execution_core import ExecutionCore
 from trace2task.io_audit import IOAudit
-from trace2task.local_agent_loop import run_local_agent_loop
+from trace2task.local_agent_loop import observe_with_timing, run_local_agent_loop
 from trace2task.windows_runner import EmergencyStopRequested
 
 
@@ -24,7 +24,8 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                    max_actions=80, max_seconds=None, on_model_round=None, session=None, prompt_guidance="",
                    backend=None, capture=None, size=None, cua_driver=None, browser_driver=None,
                    android_config=None, android_driver=None, model_adapter=None,
-                   memory_mode=None, memory_root=None, on_memory_selection=None, interventions=None):
+                   memory_mode=None, memory_root=None, on_memory_selection=None, interventions=None,
+                   hybrid=None, hybrid_executor_api_config=None, application_knowledge=None):
     """Execute a primary-desktop or explicitly selected-window chat task.
 
     This is the shared-loop route. Legacy single-window taskpack semantics and
@@ -32,6 +33,17 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
     """
     if executor_backend not in {"win32", "cua", "browser", "android"}:
         raise ValueError("Unknown execution backend")
+    if hybrid is not None:
+        from trace2task.model_registry import profile_for
+        if model_adapter is not None or executor_backend not in {'cua', 'android'}:
+            raise ValueError('混合模型需要 Cua / Android 执行后端')
+        executor_provider = hybrid.get('provider', 'local')
+        if executor_provider == 'local':
+            profile_for(hybrid['local_model'], hybrid['inference_backend'])
+        elif executor_provider not in {'codex', 'api'}:
+            raise ValueError('Unknown hybrid executor provider')
+        if (executor_provider == 'api') != (hybrid_executor_api_config is not None):
+            raise ValueError('Hybrid API executor requires its own API connection')
     if executor_backend == "cua" and cua_target is None:
         raise ValueError("Cua execution requires an explicit selected-window scope")
     if executor_backend == 'browser' and cua_target is not None:
@@ -84,11 +96,11 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
         if kind == "execution_result" and data.get("status") in {
                 "interrupted_or_unknown", "foreground_unavailable"}:
             audit.execution(data)
-        if kind == 'android_capture_retry':
-            status_callback(f'截图读取超过 {data["timeout_seconds"]} 秒，设备与授权应用已核对；'
-                            f'正在第 {data["attempt"] - 1}/{data["max_attempts"] - 1} 次重试截图。')
-        elif kind == 'android_capture_recovered':
-            status_callback('截图已恢复，继续当前任务。')
+        if kind.startswith('android_capture_'):
+            from trace2task.android_execution import capture_status
+            message = capture_status(kind, data)
+            if message:
+                status_callback(message)
 
     audit = ChatRunAudit(root, result, record, status_callback, on_round=on_model_round)
     raw_audit = IOAudit(root)
@@ -102,8 +114,8 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
         else:
             from trace2task.codex_agent import resolve_codex_binary
             from trace2task.codex_app_server import CodexAppServerSession
-            thread_config = {"model_auto_compact_token_limit": 2_000_000_000}
-            if executor_backend in {'browser', 'android'} or memory_mode == 'auto':
+            thread_config = {} if hybrid is not None else {"model_auto_compact_token_limit": 2_000_000_000}
+            if executor_backend in {'browser', 'android'} or memory_mode == 'auto' or hybrid is not None:
                 thread_config.update(web_search='disabled', project_doc_max_bytes=0,
                                      include_environment_context=False,
                                      skills={'include_instructions': False},
@@ -112,7 +124,7 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                                                'multi_agent': False, 'code_mode_host': False})
             session = CodexAppServerSession(resolve_codex_binary(), model=model,
                                              reasoning_effort=reasoning_effort,
-                                             cwd=root, timeout_seconds=300,
+                                             cwd=root, timeout_seconds=600 if hybrid is not None else 300,
                                              wait_on_rate_limit=True,
                                              wait_while_active=True,
                                              thread_config=thread_config)
@@ -133,14 +145,39 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             f'模型已等待 {seconds:.0f} 秒；Codex 请求仍在运行，继续等待同一请求。'
             '总时间预算继续计时，可随时停止。')
     if provider == "api":
-        session.system_guidance = prompt_guidance
+        session.system_guidance = '' if hybrid is not None else prompt_guidance
     from trace2task.cua_desktop import DESKTOP_TARGET
     cua_desktop = executor_backend == "cua" and cua_target == DESKTOP_TARGET
     adapter = model_adapter or ChatModelAdapter(session, selected_windows=executor_backend == "cua" and not cua_desktop,
                                provider=provider, prompt_guidance=prompt_guidance,
                                evidence_directory=root / 'experience-images',
                                browser=executor_backend == 'browser',
-                               android=executor_backend == 'android')
+                               android=executor_backend == 'android', application_knowledge=application_knowledge)
+    chat_executor = None
+    if hybrid is not None:
+        from trace2task.hybrid_model_adapter import HybridModelAdapter
+        from trace2task.hybrid_v7_profile import PROMPT_REVISION, PROMPT_SHA256, PROTOCOL
+        adapter.prompt_guidance = ''  # Single-model prompt overrides are not the v7 supervisor prompt.
+        if executor_provider != 'local':
+            from trace2task.hybrid_chat_executor import HybridChatExecutor
+            chat_executor = HybridChatExecutor(provider=executor_provider, model=hybrid['model'],
+                reasoning_effort=hybrid.get('reasoning_effort', 'low'), root=root / 'hybrid-executor',
+                stop=emergency_stop, android=executor_backend == 'android',
+                selected_windows=executor_backend == 'cua' and not cua_desktop,
+                api_config=hybrid_executor_api_config)
+        adapter = HybridModelAdapter(adapter, root=root, stop=emergency_stop,
+            record=record, status_callback=status_callback,
+            local_model=hybrid.get('local_model', hybrid.get('model')),
+            inference_backend=hybrid.get('inference_backend', executor_provider),
+            prompt_profile=hybrid.get('prompt_profile'), chat_executor=chat_executor,
+            controller_config=hybrid.get('controller_config'), application_knowledge=application_knowledge)
+        result.update(execution_mode='hybrid', hybrid={
+            **{k: v for k, v in hybrid.items() if k != 'prompt_profile'},
+            'protocol': PROTOCOL, 'controller_config': adapter.controller_config,
+            'prompt_revision': PROMPT_REVISION, 'prompt_sha256': PROMPT_SHA256,
+            'history_images': ('current_only_slotread' if hybrid.get('inference_backend') == 'slotread'
+                               else 'retained_within_context_budget'),
+            'verification': 'local_visual_review_not_remote_environment_scorer'})
     if model_adapter is not None:
         result['model_adapter'] = model_adapter.provenance
         result['instruction'] = instruction
@@ -269,9 +306,11 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             interventions=interventions,
         )
         if executor_backend == 'android':
-            _, _, final_path = observation.observe(target, len(result['model_io']))
+            _, _, final_path, capture_ms = observe_with_timing(
+                observation, target, len(result['model_io']), audit=audit, record=record,
+                status_callback=status_callback, phase='final')
             result['final_screenshot'] = str(final_path)
-            record('final_capture', screenshot=str(final_path))
+            record('final_capture', screenshot=str(final_path), elapsed_ms=capture_ms)
     except TimeBudgetExceeded:
         result.update(stop_reason='time_limit', task_complete=False, verified=False)
         status_callback('时间预算耗尽，任务未完成；已停止后续输入，迟到的模型回答不会执行。')
@@ -289,6 +328,11 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                 result["model_failure_diagnostics"] = error.diagnostics
         record("error", error=result["error"])
     finally:
+        if chat_executor is not None:
+            chat_executor.close()
+        if hybrid is not None:
+            result['hybrid'].update(guide_calls=adapter.guide_calls, executor_decisions=adapter.decisions,
+                                    stage_count=len(adapter.stage_goals))
         if interventions is not None:
             interventions.close(result['stop_reason'])
             result['interventions'] = interventions.snapshot()

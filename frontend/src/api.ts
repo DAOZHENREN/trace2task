@@ -1,5 +1,5 @@
-import type {Config} from './types';
-import {DEFAULT_ANDROID_BUDGET} from './types';
+import type {Config, KnowledgeProfile} from './types';
+import {DEFAULT_ANDROID_BUDGET, DEFAULT_HYBRID_LIMITS} from './types';
 import {AUTO_MEMORY} from './experience';
 
 export async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
@@ -12,11 +12,22 @@ export async function api<T>(path: string, body?: unknown, signal?: AbortSignal)
   return data as T;
 }
 
-export function requestFor(config: Config, instruction: string) {
+export function requestFor(config: Config, instruction: string, knowledge?: KnowledgeProfile) {
+  const hybrid = config.executionMode === 'hybrid';
+  if (hybrid) config = {...config, provider: config.hybridDirectorProvider || 'codex', mobileforge: '', androidModelProfile: ''};
+  const executor = config.hybridExecutor;
+  const executorSelection = !executor || executor.provider === 'local'
+    ? {local_model: config.localModel, inference_backend: config.inference}
+    : {provider: executor.provider, model: executor.model, reasoning_effort: executor.provider === 'codex' ? executor.effort : 'default',
+      ...(executor.provider === 'api' ? {api: {base_url: executor.apiUrl, api_key: executor.apiKey,
+        response_format: executor.apiFormat || 'json_schema', timeout_seconds: 120, context_window_tokens: 32768}} : {})};
   const localGUI = config.provider === 'local';
   return {instruction, mode: 'execute', execution_scope: config.scope === 'android' ? 'android' : config.scope === 'browser' ? 'browser' : 'desktop', orchestration: 'legacy', continuous: true,
     ...(config.executor === 'android' ? {android_config: config.android, android_budget: config.androidBudget || DEFAULT_ANDROID_BUDGET, mobileforge: config.mobileforge || '',
       android_model_profile: config.androidModelProfile || ''} : {}),
+    execution_mode: hybrid ? 'hybrid' : 'original',
+    ...(knowledge ? {knowledge_selection: {id: knowledge.id, sha256: knowledge.sha256}} : {}),
+    ...(hybrid ? {hybrid: {...executorSelection, controller_config: config.hybridLimits || DEFAULT_HYBRID_LIMITS}} : {}),
     provider: localGUI ? 'trained_d' : config.provider === 'codex' ? 'codex' : 'api',
     model: config.provider === 'local' ? (config.localModel === 'trained_d' ? 'D-5970' : config.localModel)
       : config.provider === 'api' ? config.apiModel : config.model,

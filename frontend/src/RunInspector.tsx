@@ -39,11 +39,11 @@ function useRun(id: string | null) {
   return {run, rounds: Object.values(rounds).sort((a, b) => a.step_index - b.step_index), logs, error};
 }
 
-function RoundObservation({path, step}: {path: string; step: number}) {
+function RoundObservation({path, step, label = '观察画面'}: {path: string; step: number; label?: string}) {
   const [failed, setFailed] = useState(false);
   const url = `/api/local-image?path=${encodeURIComponent(path)}`;
   return <figure className="round-observation">
-    <figcaption><strong>第 {step + 1} 轮 · 观察画面</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
+    <figcaption><strong>第 {step + 1} 轮 · {label}</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
     {failed ? <p className="quiet" role="status">画面加载失败，原运行记录仍保留；可尝试打开原图。</p>
       : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={`第 ${step + 1} 轮归档观察截图`} loading="lazy"
         onError={() => setFailed(true)}/></a>}
@@ -64,25 +64,35 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
   }, [open, round]);
   const status = round.status === 'pending' ? round.purpose === 'memory' ? 'Agent 选择经验中' : round.purpose === 'compile' ? 'Agent 编译中' : '观察与规划中'
     : round.status === 'memory_requested' ? '经验工具请求已返回 · 未发送操作输入'
+    : round.status === 'handoff' ? '模型交接 · 重新截图后继续'
     : round.status === 'compiled' ? 'Procedure 已返回 · 未执行任务' : round.status === 'predicted' ? '已生成动作' : round.status;
   return <article className="round-card">
     <div className="round-number">{String(round.step_index + 1).padStart(2, '0')}</div>
     <div className="round-content"><div className="row-between"><h3>{round.purpose === 'memory' ? 'Agent 经验检索 / 按需加载' : round.purpose === 'improve' ? '固定改进器：执行反馈 → 候选方法' : round.purpose === 'compile' ? 'Agent 编译：历史证据 → Procedure' : ['review', 'verification', 'verify_completion'].includes(round.purpose || '') ? '完成复核' : '观察 → 规划 → 执行'}</h3>
       <span className="quiet mono">{round.duration_ms != null ? `${(round.duration_ms / 1000).toFixed(1)} s` : '等待回包'}</span></div>
       <div className="round-status"><span className={`status-dot ${round.status === 'pending' ? 'pulsing' : ''}`}/>{status}
-        {round.executed !== undefined && <span className="receipt">{round.executed ? '操作输入已交付 · 效果待核对' : '未发送操作输入'}</span>}
+        {round.submitted_steps != null ? <span className="receipt">已提交 {round.submitted_steps} 帧手柄输入 · 游戏效果待核对</span>
+          : round.executed !== undefined && <span className="receipt">{round.executed ? '操作输入已交付 · 效果待核对' : '未发送操作输入'}</span>}
         {round.execution_status && <span className="quiet">{round.execution_status}</span>}</div>
       {round.error && <p className="inline-warning">{round.error}</p>}
+      {round.model_role && <p className="quiet">{round.model_role === 'director' ? '指导模型 · 指导与验收' : `${round.actual_model || '执行模型'} · 子任务执行`}</p>}
+      {round.subtask && <><p><strong>{round.subtask.goal || round.subtask.objective}</strong><br/>完成条件：{round.subtask.completion_hint || round.subtask.completion}</p>
+        {!!(round.subtask.notices ?? round.subtask.constraints)?.length && <ul aria-label="执行提示与限制">
+          {(round.subtask.notices ?? round.subtask.constraints)?.map((notice, index) => <li key={index}>{notice}</li>)}
+        </ul>}</>}
       {round.execution_status === 'intervened' && <p className="inline-warning">人工干预使本轮剩余计划或核验结论作废；已交付动作以回执为准。</p>}
       {round.verification && <p className="verification"><strong>模型视觉复核：{round.verification.verdict}</strong> · {round.verification.evidence} {round.verification.missing}</p>}
       <div className="round-actions">{round.screenshot && <Button size="small" appearance="subtle" icon={<Icon name="screen" size={16}/>}
         aria-expanded={imageOpen} onClick={() => setImageOpen(value => !value)}>{imageOpen ? '收起该轮画面' : '查看该轮画面'}</Button>}
         {round.tokens?.input_tokens != null && <span className="quiet mono">IN {round.tokens.input_tokens.toLocaleString()} · OUT {round.tokens.output_tokens ?? '—'}</span>}</div>
       {imageOpen && round.screenshot && <RoundObservation key={round.screenshot} path={round.screenshot} step={round.step_index}/>}
+      {imageOpen && round.after_screenshot && <RoundObservation key={round.after_screenshot} path={round.after_screenshot} step={round.step_index} label="动作后画面"/>}
       <details open={open} onToggle={e => setOpen(e.currentTarget.open)}><summary>模型输入、输出与执行回执</summary>
         {error ? <p role="alert">{error}</p> : !raw ? <Spinner size="tiny" label="读取该轮记录"/> : <div className="raw-round">
           <ModelInput raw={raw} provider={provider}/>
-          <h4>模型输出</h4><pre>{raw.raw_output || JSON.stringify(raw.prediction || raw.verification || raw.error || '等待模型返回', null, 2)}</pre>
+          <h4>模型输出</h4>
+          {Array.isArray(raw.button_order) && <p className="quiet">按键列顺序 · {raw.button_order.join('、')}</p>}
+          <pre>{raw.raw_output || JSON.stringify(raw.prediction || raw.verification || raw.error || '等待模型返回', null, 2)}</pre>
           <details className="execution-receipt"><summary>执行回执</summary>
             <pre>{JSON.stringify(raw.execution || '尚无执行回执；模型输出不代表已执行', null, 2)}</pre></details>
           <details><summary>原始请求 / 完整记录（可能含敏感内容）</summary><pre>{JSON.stringify(raw, null, 2)}</pre></details>
@@ -92,10 +102,12 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
   </article>;
 });
 
-export function RunInspector({id, onLibrary, state, busy = false, onRun, onError}: {id: string | null;
+export function RunInspector({id, onLibrary, state, busy = false, onRun, onError, onKnowledgeSaved}: {id: string | null;
   onLibrary?: (traceId: string) => void; state?: AppState; busy?: boolean;
-  onRun?: (run: Run) => void; onError?: (text: string) => void}) {
+  onRun?: (run: Run) => void; onError?: (text: string) => void; onKnowledgeSaved?: () => Promise<void>}) {
   const {run, rounds, logs, error} = useRun(id);
+  const latestStatus = logs.at(-1)?.message || '';
+  const performance = run?.result?.performance;
   if (!id) return <section className="idle-stage"><Icon name="history" size={20}/><div className="stage-copy">
     <h2>运行结果将在这里呈现</h2><p>截图、模型判断与执行回执按步骤记录；模型自报完成不等于核验成功。</p></div></section>;
   return <section className="run-workspace">
@@ -103,11 +115,14 @@ export function RunInspector({id, onLibrary, state, busy = false, onRun, onError
       <span className={`status-tag ${active(run) ? 'live' : ''}`}>{labels[run?.status || ''] || run?.status || '载入'}</span></div>
       {run && <RunInterventions key={`interventions:${run.job_id}`} run={run}/>}
       {run && state && onRun && <RunExperience key={`experience:${run.job_id}`} run={run} state={state} busy={busy}
-        onRun={onRun} onLibrary={onLibrary}/>}
+        onRun={onRun} onLibrary={onLibrary} onKnowledgeSaved={onKnowledgeSaved}/>}
       {error && <p className="error-inline" role="alert">{error} · 正在重试，不会重复启动任务。</p>}
       {run?.error && <p className="error-inline" role="alert">{run.error}</p>}
-      {active(run) && /限流|冷却/.test(logs.at(-1)?.message || '') && <p className="notice" role="status">{logs.at(-1)?.message}</p>}
-      {run?.result?.stop_reason && <p className="notice">停止原因：{run.result.stop_reason === 'action_limit' ? '动作预算耗尽，任务未完成' : run.result.stop_reason === 'time_limit' ? '时间预算耗尽，任务未完成' : run.result.stop_reason}</p>}
+      {active(run) && /限流|冷却|^\[capture |^正在读取手机截图|^截图读取超过|^截图已恢复|^请切换到游戏窗口|^NitroGen 实时模式|^游戏已失去焦点|^已切回游戏|^以撒手柄绑定/.test(latestStatus) && <p className="notice" role="status">{latestStatus}</p>}
+      {run?.result?.stop_reason && <p className="notice">停止原因：{run.result.stop_reason === 'action_limit' ? '动作预算耗尽，任务未完成' : run.result.stop_reason === 'time_limit' ? '时间预算耗尽，任务未完成' : run.result.stop_reason === 'focus_timeout' ? '游戏未恢复前台焦点' : run.result.stop_reason === 'controller_setup_timeout' ? '手柄绑定未完成' : run.result.stop_reason}</p>}
+      {performance && <p className="quiet" aria-label="阶段耗时">累计耗时：{[
+        ['capture_ms', '截图'], ['model_roundtrip_ms', '模型往返'], ['action_ms', '动作'], ['total_elapsed_ms', '总计'],
+      ].filter(([key]) => Number.isFinite(performance[key])).map(([key, label]) => `${label} ${(performance[key] / 1000).toFixed(2)} 秒`).join(' · ')}</p>}
       {run?.result?.compiled_trace_id && <div className="notice"><p>{run.result.representation === 'R' ? '改进候选 R 已生成，尚未获准试用或证明效果提升。' : 'Agent 方法 B 已生成独立版本，未自动选为任务经验。'}</p>
         {onLibrary && <Button onClick={() => onLibrary(run.result!.compiled_trace_id!)}>{run.result.representation === 'R' ? '到经验库审查改进候选' : '到经验库查看 Procedure B'}</Button>}</div>}
       {run && state && onRun && onError && <ProcedureImprovement key={`improvement:${run.job_id}`} run={run} state={state} busy={busy} onRun={onRun} onError={onError}/>}

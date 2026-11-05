@@ -223,7 +223,7 @@ class ActionCall:
         if self.skill == "wait":
             _require_exact_args(self.skill, args, required={"duration_ms"})
             return {
-                "duration_ms": _duration(args["duration_ms"], maximum=10_000, skill=self.skill)
+                "duration_ms": _duration(args["duration_ms"], maximum=100_000, skill=self.skill)
             }
         raise AssertionError(f"Unhandled motor skill: {self.skill}")
 
@@ -360,7 +360,7 @@ def parameterized_action_schema(
             {
                 "type": "object",
                 "properties": {
-                    "duration_ms": {"type": "integer", "minimum": 1, "maximum": 10_000}
+                    "duration_ms": {"type": "integer", "minimum": 1, "maximum": 100_000}
                 },
                 "required": ["duration_ms"],
             },

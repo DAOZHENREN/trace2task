@@ -148,6 +148,11 @@ def choose_data_root(explicit=None):
 
 def main(argv: list[str] | None = None) -> None:
     """Windowless launcher: preserve startup errors instead of silently disappearing."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ['--chatgpt-browser']:
+        from trace2task.chatgpt_browser import main as browser_main
+        browser_main(arguments[1:])
+        return
     import argparse
     import ctypes
     import hashlib

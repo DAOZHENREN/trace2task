@@ -15,6 +15,42 @@ test.beforeEach(async ({page}) => {page.on('dialog', async dialog => {
 
 test.afterEach(async ({page}) => {await page.unrouteAll({behavior: 'wait'});});
 
+test('application knowledge has its own searchable library tab and editor', async ({page}) => {
+  let game = {id: 'game', scope: 'android', application: 'com.example.game', sha256: 'original', revision: 1,
+    content: '战斗工具栏包含自动战斗控件。'};
+  const desktop = {id: 'editor', scope: 'desktop', application: '文本编辑器', sha256: 'desktop', revision: 1};
+  await page.route('**/api/state?compact=1', async route => {
+    const state = await (await route.fetch()).json();
+    return route.fulfill({json: {...state, application_knowledge: [game, desktop]}});
+  });
+  await page.route('**/api/application-knowledge/read', route => route.fulfill({json: game}));
+  await page.route('**/api/application-knowledge/save', route => {
+    const body = route.request().postDataJSON();
+    expect(body).toMatchObject({scope: 'android', application: game.application, expected_sha256: 'original'});
+    game = {...game, content: body.content, sha256: 'updated', revision: 2};
+    return route.fulfill({json: game});
+  });
+  await page.goto('/');
+  await page.getByRole('button', {name: '经验库', exact: true}).click();
+  await expect(page.getByRole('textbox', {name: '搜索经验', exact: true})).toBeVisible();
+  await page.getByRole('tab', {name: '底层知识 · 2'}).click();
+  await expect(page.getByRole('textbox', {name: '搜索经验', exact: true})).toHaveCount(0);
+  await expect(page.getByRole('heading', {name: '文本编辑器'})).toBeVisible();
+  await page.getByRole('textbox', {name: '搜索底层知识'}).fill('android');
+  await expect(page.getByRole('heading', {name: '文本编辑器'})).toHaveCount(0);
+  await page.getByRole('button', {name: '打开 com.example.game'}).click();
+  await expect(page.getByRole('textbox', {name: '底层知识正文'})).toHaveValue(game.content);
+  await page.getByRole('textbox', {name: '底层知识正文'}).fill('自动战斗控件在战斗工具栏右侧。');
+  await page.getByRole('button', {name: '保存底层知识'}).click();
+  await expect(page.getByText('已保存 com.example.game · v2')).toBeVisible();
+  await page.getByRole('button', {name: '返回列表', exact: true}).click();
+  await expect(page.getByText('Android · v2', {exact: true})).toBeVisible();
+  await page.getByRole('button', {name: '新建底层知识'}).click();
+  await expect(page.getByRole('textbox', {name: '底层知识正文'})).toHaveValue('');
+  await page.getByRole('tab', {name: /^经验版本/}).click();
+  await expect(page.getByRole('textbox', {name: '搜索经验', exact: true})).toBeVisible();
+});
+
 test('C combines the explicitly selected B, previews evidence and requires explicit use', async ({page}, info) => {
   const b = {id: 'b-selected', trace_name: '保存文档', representation: 'B', description: '选定版本', created_at: '2026-10-08T10:00:00Z'};
   const other = {...b, id: 'b-other', description: '另一版本', created_at: '2026-10-07T10:00:00Z'};

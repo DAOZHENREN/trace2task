@@ -1,0 +1,32 @@
+{
+  "seed": 20261103,
+  "sampling": "User selected the same GIMP task from the frozen random4 allocation; no new sampling",
+  "manifest_sha256": "c5c8743702472e6c0afff2b6dd00552b64cf13afb052dd541398dd8ff24e0b14",
+  "tasks": [
+    {
+      "app_type": "gimp",
+      "historical_312_training_pool_member": false,
+      "historical_office_split": null,
+      "instruction_sha256": "b892dbd28da256c0e0be5aef3752df9791b3faddf5c5c6019241e4bf2018afff",
+      "known_source_issues": [],
+      "source_member_sha256": {
+        "config.json": "e9e8eb55d57260580c84d674c5752a4f1f3dd8a83bae0ba856e7ba38497044cd",
+        "initial_setup.py": "e097afa85f3aad76764ea2e38d0d7aea549196d405a5420d70b14f2e32bd8869",
+        "reward.py": "149d3b44c50217300c36022bc82ec8675c40a8fecf76e4779c09a24fc8e5d7d1"
+      },
+      "task_id": "1e89745f-c4b9-43ed-9e43-694c7ca90359"
+    }
+  ],
+  "config": {
+    "max_decisions": 60,
+    "max_guide_calls": 8,
+    "review_interval": 12,
+    "repeated_no_change_limit": 3
+  },
+  "automatic_retry": false,
+  "training": false,
+  "heldout_evaluation": false,
+  "protocol": "terra-guided-v6-all-subgoals",
+  "comparison_run": "runs/terra-guided-gimp-20261103-v4",
+  "comparison_plan_sha256": "ca2d4bc8ec8694bef13bdd7e65f9c11fc24c804801b2d709b6375bc81fda9ded"
+}

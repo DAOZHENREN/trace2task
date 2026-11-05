@@ -19,7 +19,8 @@ from trace2task.windows_runner import EmergencyStopRequested
 
 
 def run_cua_local(*, instruction, output_root, emergency_stop, status_callback, model, cua_target=None,
-                  experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None):
+                  experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None,
+                  application_knowledge=None):
     if model == 'D-5970' and experience_context is not None:
         raise ValueError('D-5970 冻结输入结构不支持经验指导')
     root = Path(output_root)/(datetime.now(UTC).strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:8]+'-cua')
@@ -68,9 +69,11 @@ def run_cua_local(*, instruction, output_root, emergency_stop, status_callback, 
             status_callback(f"已绑定初始窗口；仅允许本次选中的 {len(scope.selection['targets'])} 个目标，不提供全机应用目录。")
         backend = CuaDesktopExecutionBackend(driver) if desktop else CuaExecutionBackend(driver, scope)
         core = ExecutionCore(backend, emergency_stop, record)
+        from trace2task.application_knowledge import knowledge_prompt
+
         run_local_agent_loop(
             observer=CuaDesktopObservation(driver) if desktop else CuaWindowObservation(scope, driver), initial_target=target,
-            core=core, audit=audit, predictor=predictor, instruction=instruction,
+            core=core, audit=audit, predictor=predictor, instruction=instruction + knowledge_prompt(application_knowledge),
             model=model, root=root, result=result, record=record,
             stop=emergency_stop, status_callback=status_callback,
             experience_context=experience_context,

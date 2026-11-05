@@ -9,6 +9,7 @@ import {active, labels} from './types';
 import {TaskComposer, host, isLocal} from './TaskComposer';
 import {RunInspector} from './RunInspector';
 import {Models} from './Models';
+import {ChatGPTBrowser} from './ChatGPTBrowser';
 import {Empty, Icon, PageHeading, Refresh} from './ui';
 import {Library} from './Library';
 import {RecordingPanel} from './RecordingPanel';
@@ -22,7 +23,8 @@ const navigation: {id: Page; label: string; group: string}[] = [
   {id: 'tasks', label: '任务工作台', group: '工作空间'}, {id: 'record', label: '录制示范', group: '工作空间'},
   {id: 'library', label: '经验库', group: '工作空间'}, {id: 'history', label: '运行记录', group: '工作空间'},
   {id: 'trash', label: '回收站', group: '管理'},
-  {id: 'models', label: '模型与连接', group: '管理'}, {id: 'settings', label: '设置与工具', group: '管理'},
+  {id: 'models', label: '模型与连接', group: '管理'}, {id: 'chatgpt', label: 'ChatGPT 网页', group: '管理'},
+  {id: 'settings', label: '设置与工具', group: '管理'},
   {id: 'experiments', label: '实验室', group: '探索'},
 ];
 const initialConfig: Config = {provider: 'codex', model: '', localModel: 'gui-owl-2b', inference: 'llama-server',
@@ -42,10 +44,10 @@ export function App() {
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [config, setConfig] = useState(initialConfig);
   useEffect(() => {
-    if (config.experience === AUTO_MEMORY && (config.provider === 'local' || config.mobileforge))
-      setConfig(current => current.experience === AUTO_MEMORY && (current.provider === 'local' || current.mobileforge)
+    if (config.executionMode !== 'hybrid' && config.experience === AUTO_MEMORY && (config.provider === 'local' || config.mobileforge))
+      setConfig(current => current.executionMode !== 'hybrid' && current.experience === AUTO_MEMORY && (current.provider === 'local' || current.mobileforge)
         ? {...current, experience: ''} : current);
-  }, [config.experience, config.provider, config.mobileforge]);
+  }, [config.experience, config.provider, config.mobileforge, config.executionMode]);
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(true);
   const [stopping, setStopping] = useState(false);
@@ -144,14 +146,14 @@ export function App() {
     catch (e) {setError(String(e));} finally {setStopping(false);}
   }
   const flow = liveRun?.run_facts;
-  const promptKey = config.provider === 'local'
+  const promptKey = config.executionMode === 'hybrid' ? (config.hybridDirectorProvider || 'codex') : config.provider === 'local'
     ? `${config.localModel}:${config.executor}` : config.provider === 'codex' ? 'codex' : 'api';
   const activityDestination = liveRun && !flow ? (isRecording(liveRun)
     ? liveRun.defer_compilation ? '本地录制' : '本地录制 → Codex 编译'
     : ['compilation', 'revision', 'task_model_revision'].includes(liveRun.kind) ? 'Codex 编译 / 修订' : '') : '';
   const local = flow ? flow.data_flow === 'local' : activityDestination ? activityDestination === '本地录制'
-    : !cloudPhoneSelected(config) && (config.provider === 'local' || config.provider === 'api' && isLocal(config.apiUrl));
-  const destination = flow?.destination || activityDestination || (cloudPhoneSelected(config) ? cloudPhoneDestination : config.provider === 'codex' ? 'Codex 订阅' : config.provider === 'local' ? '本机模型' : host(config.apiUrl));
+    : config.executionMode !== 'hybrid' && !cloudPhoneSelected(config) && (config.provider === 'local' || config.provider === 'api' && isLocal(config.apiUrl));
+  const destination = flow?.destination || activityDestination || (config.executionMode === 'hybrid' ? '指导模型 + 主要执行模型' : cloudPhoneSelected(config) ? cloudPhoneDestination : config.provider === 'codex' ? 'Codex 订阅' : config.provider === 'local' ? '本机模型' : host(config.apiUrl));
   const loaded = serviceError ? [] : services?.services.filter(loadedService) || [];
   const localStatus = serviceError ? '本地模型 · 状态未知' : !services ? '本地模型 · 检测中' : loaded.length
     ? `后台模型 · ${loaded.map(s => catalog ? modelLabel(s.model, catalog) : s.model).join(' / ')}`
@@ -164,8 +166,8 @@ export function App() {
     <aside className="sidebar"><a className="brand" href="#" onClick={e => {e.preventDefault(); go('tasks');}} aria-label="Trace2Task 工作台">
       <span className="brand-symbol"><span/><span/><span/></span><span>Trace2Task<small>EXPERIENCE IN MOTION</small></span></a>
       <nav aria-label="主导航">{['工作空间', '管理', '探索'].map(group => <div className="nav-group" key={group}><div className="nav-label">{group}</div>
-        {navigation.filter(n => n.group === group).map(n => <button key={n.id} aria-label={n.label} aria-current={page === n.id ? 'page' : undefined}
-          className={page === n.id ? 'active' : ''} onClick={() => go(n.id)}><Icon name={n.id}/><span>{n.label}</span>{n.id === 'tasks' && busy && <i/>}</button>)}</div>)}</nav>
+        {navigation.filter(n => n.group === group).map(n => <button key={n.id} title={n.label} aria-label={n.label} aria-current={page === n.id ? 'page' : undefined}
+          className={page === n.id ? 'active' : ''} onClick={() => go(n.id)}><Icon name={n.id === 'chatgpt' ? 'models' : n.id}/><span>{n.label}</span>{n.id === 'tasks' && busy && <i/>}</button>)}</div>)}</nav>
       <div className="sidebar-foot"><span className="small-mark">T2</span><div>桌面工作台<small>Python + WebView2 · v{state?.version || '—'}</small></div></div>
     </aside>
     <div className="main-shell"><header className="app-header"><div className="breadcrumb">{navigation.find(n => n.id === page)?.group} <span>/</span> <strong>{navigation.find(n => n.id === page)?.label}</strong></div>
@@ -179,12 +181,14 @@ export function App() {
           action={<Button onClick={() => void initialize()}>重新连接</Button>}/> : <>
           <div hidden={page !== 'tasks'}><PageHeading eyebrow="WORKSPACE" title="任务工作台" copy="描述目标，确认执行范围，查看每一步结果。"
             action={selectedRun && !busy ? <Button icon={<Icon name="plus" size={17}/>} onClick={() => setSelectedRun(null)}>新任务</Button> : undefined}/>
-            <TaskComposer config={config} setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey]} onRun={onRun} onModels={() => go('models')} onRefreshCodex={refreshCodex} onError={setError}/>
-            <RunInspector id={selectedRun} state={state} busy={busy} onRun={onRun} onError={setError}
+            <TaskComposer config={config} setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey] || config.executionMode === 'hybrid' && (!config.hybridExecutor || config.hybridExecutor.provider === 'local') && !!promptDrafts[`${config.localModel}:${config.executor}`]} onRun={onRun} onModels={() => go('models')} onRefreshCodex={refreshCodex} onError={setError}/>
+            <RunInspector id={selectedRun} state={state} busy={busy} onRun={onRun} onError={setError} onKnowledgeSaved={refresh}
               onLibrary={id => {void refresh().then(() => {setRequestedTraceId(id); go('library');}).catch(e => setError(String(e)));}}/></div>
           <div hidden={page !== 'models'}>{visited.has('models') && <Models catalog={catalog} config={config} setConfig={setConfig} busy={busy} refresh={refreshCatalog}
             services={services} serviceError={serviceError}
-            onError={setError} onComponents={() => {setSettingsSection('components'); go('settings');}}/>}</div>
+            onError={setError} onRun={onRun} onChatGPT={() => go('chatgpt')} onComponents={() => {setSettingsSection('components'); go('settings');}}/>}</div>
+          {page === 'chatgpt' && <><PageHeading eyebrow="CHATGPT WEB" title="ChatGPT 网页"
+            copy="打开可直接操作的小窗口，在里面登录你的 ChatGPT 账户。"/><ChatGPTBrowser busy={busy}/></>}
           <div hidden={page !== 'library'}>{visited.has('library') && <Library state={state} busy={busy} refresh={refresh} onRun={onRun} onError={setError} onUse={trace => {
             setConfig(c => ({...c, experience: `trace-library/${trace.id}/model-input.txt`})); go('tasks');}}
             requestedTraceId={requestedTraceId} onRequestedTraceHandled={() => setRequestedTraceId(undefined)}

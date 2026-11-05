@@ -88,7 +88,7 @@ export function RunInterventions({run}: {run: Run}) {
       </div>
       </>}
       {(phase === 'paused' || phase === 'resuming') && <div className="handoff-return">
-        {showImage && segment ? <ImageAnnotator key={segment.id} picture={segment.before} takeoverId={segment.id}
+        {showImage && segment ? <ImageAnnotator key={segment.id} picture={segment.before} takeoverId={segment.id} runId={run.job_id}
           disabled={!editable || phase !== 'paused'} onChange={setVisual} onRemove={() => {setShowImage(false); setVisual(null);}}/> :
           state.visual_supported && <Button disabled={!editable || phase !== 'paused'} onClick={openImage}>添加截图与标注</Button>}
         <label className="intervention-label" htmlFor={`handoff-note-${run.job_id}`}>接管说明（可选）</label>
@@ -111,7 +111,9 @@ export function RunInterventions({run}: {run: Run}) {
         {command.text && <p className="intervention-text">{command.text}</p>}
         {command.visual && <details className="handoff-evidence"><summary>查看截图指导 · {command.visual.strokes.length} 个标注</summary>
           <div className="handoff-pictures"><HandoffImage picture={command.visual.source} label={`人工指令 ${command.index} · 参考原图`}/>
-            <HandoffImage picture={command.visual.image} label={`人工指令 ${command.index} · 用户标注图`}/></div>
+            <HandoffImage picture={command.visual.image} label={`人工指令 ${command.index} · 用户标注图`}/>
+            {command.visual.extras?.map((extra, i) => <HandoffImage key={i} picture={extra.source}
+              label={`人工指令 ${command.index} · 附图 ${i + 1}`}/>)}</div>
         </details>}
         <p className="quiet">{commandStatus(command, ended)}</p>
       </li>)}</ol>

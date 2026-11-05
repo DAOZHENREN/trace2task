@@ -1,4 +1,4 @@
-export type Page = 'tasks' | 'record' | 'library' | 'models' | 'history' | 'trash' | 'settings' | 'experiments';
+export type Page = 'tasks' | 'record' | 'library' | 'models' | 'chatgpt' | 'history' | 'trash' | 'settings' | 'experiments';
 export type Target = {pid: number; window_id: number} | {launch_path: string};
 export type Profile = {id: string; label: string; repository: string; revision: string; adapter: string;
   engines: string[]; maturity: string; note: string;
@@ -20,9 +20,10 @@ export type MemorySelection = {mode: string; status: string; reason?: string; er
   operations: {tool: string; query: string; memory_id: string; reason: string; returned_ids?: string[]}[]};
 export type HandoffPicture = {path: string; sha256: string; package: string; width: number; height: number};
 export type AnnotationStroke = {tool: 'circle' | 'cross' | 'pen'; points: [number, number][]};
-export type VisualInput = ({takeover_id: string; source_sha256: string} | {upload_data_url: string}) & {strokes: AnnotationStroke[]};
-export type VisualReference = {origin: 'takeover_snapshot' | 'user_upload'; source: HandoffPicture; image: HandoffPicture;
-  strokes: AnnotationStroke[]};
+export type VisualSource = {takeover_id: string; source_sha256: string; capture_id?: string} | {upload_data_url: string};
+export type VisualInput = VisualSource & {strokes: AnnotationStroke[]; extras?: (VisualSource & {strokes: []})[]};
+export type VisualReference = {origin: 'takeover_snapshot' | 'user_upload' | 'live_snapshot'; source: HandoffPicture; image: HandoffPicture;
+  strokes: AnnotationStroke[]; extras?: VisualReference[]};
 export type InterventionCommand = {id: string; index: number; kind: 'instruction' | 'pause' | 'resume';
   text: string; status: string; requested_at: string; revision: number; submitted_round?: number; responded_round?: number; takeover_id?: string;
   visual?: VisualReference};
@@ -41,7 +42,11 @@ export type Run = {job_id: string; task_id: string; instruction: string; status:
     memory_selection?: MemorySelection; assisted_by_user?: boolean;
     trace_path?: string; output_directory?: string; narration?: {transcript?: string; segments?: unknown[]; engine?: string}}};
 export type Round = {step_index: number; status: string; purpose: string; duration_ms?: number;
+  model_role?: 'director' | 'executor'; actual_model?: string;
+  subtask?: {objective?: string; completion?: string; goal?: string; completion_hint?: string;
+    notices?: string[]; constraints?: string[]};
   tokens: Record<string, number>; screenshot?: string; executed?: boolean; execution_status?: string;
+  submitted_steps?: number; after_screenshot?: string;
   verification?: {verdict: string; evidence: string; missing: string}; error?: string; artifact_ref: string};
 export type RunEvent = {seq: number; name: string; time: string; trace_id: string;
   attributes: Round & {message?: string; status?: string}};
@@ -85,7 +90,9 @@ export type TaskPack = {path: string; local_path: string; task_id: string; instr
     states: unknown[]; history: unknown[]; [key: string]: unknown};
   human_guidance?: {summary: string; revision: number; rules: unknown[]; history: unknown[]}; [key: string]: unknown};
 export type ModelChoice = {model: string; reasoning_effort: string};
+export type KnowledgeProfile = {id: string; scope: 'android' | 'desktop'; application: string; sha256: string; revision: number};
 export type AppState = {version: string; active_job: Run | null; trace_representations: Trace[];
+  application_knowledge?: KnowledgeProfile[];
   trash?: TrashItem[];
   recordings: Recording[]; candidates: Candidate[]; taskpacks: TaskPack[];
   agent_options: {models: string[]; reasoning_efforts: string[]; defaults: {model: string; reasoning_effort: string};
@@ -97,8 +104,18 @@ export type AppState = {version: string; active_job: Run | null; trace_represent
     api_defaults: {saved_settings?: {model?: string; base_url?: string; has_saved_key?: boolean;
       response_format?: string; timeout_seconds?: number; context_window_tokens?: number}}}};
 export const DEFAULT_ANDROID_BUDGET = {max_actions: 160, max_seconds: 2400};
+export const DEFAULT_HYBRID_LIMITS = {
+  max_decisions: 120, max_guide_calls: 12, review_interval: 24, repeated_no_change_limit: 3,
+};
 
 export type Config = {provider: 'codex' | 'api' | 'local'; model: string; localModel: string;
+  executionMode?: 'original' | 'hybrid';
+  hybridDirectorProvider?: 'codex' | 'api';
+  hybridLimits?: typeof DEFAULT_HYBRID_LIMITS;
+  androidKnowledgeOff?: boolean;
+  desktopKnowledgeId?: string;
+  hybridExecutor?: {provider: 'local' | 'codex' | 'api'; model: string; effort: string;
+    apiUrl: string; apiKey: string; apiFormat?: string};
   inference: string; executor: 'cua' | 'browser' | 'android'; scope: 'desktop' | 'selected_windows' | 'browser' | 'android';
   android?: {adb: string; serial: string; package: string; server_port: number; launch_app?: boolean};
   androidBudget?: {max_actions: number; max_seconds: number};

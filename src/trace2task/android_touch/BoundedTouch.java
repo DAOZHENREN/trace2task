@@ -19,6 +19,7 @@ import java.util.zip.DeflaterOutputStream;
  */
 public final class BoundedTouch {
     private static final int HEARTBEAT_TIMEOUT_MS = 1500;
+    private static final int CONTROL_ACTIVATION_MS = 80;
 
     interface WindowScope {
         String read() throws Exception;
@@ -49,10 +50,10 @@ public final class BoundedTouch {
     static final class Gesture {
         private final Input input;
         private final int width, height;
-        private boolean started, pressed, finished;
+        private boolean started, pressed, activated, finished;
         private final long idleDeadline;
         private long down, deadline, heartbeatDeadline;
-        private float x, y;
+        private float x, y, endX, endY;
         private int moves;
 
         Gesture(Input input, int width, int height) {
@@ -84,16 +85,37 @@ public final class BoundedTouch {
                 heartbeatDeadline = down + HEARTBEAT_TIMEOUT_MS;
                 x = cx;
                 y = cy;
+                endX = ex;
+                endY = ey;
                 // Mark before injection: a throwing Binder call may have delivered DOWN.
                 pressed = true;
                 input.send(0, down, x, y);
-                if (input.uptime() >= deadline) {
-                    release();
-                    return;
+            }
+        }
+
+        boolean activate() throws Exception {
+            // Let a frame-based floating control observe DOWN at its origin.
+            // Immediate DOWN/MOVE can otherwise initialize it at the endpoint.
+            // Activation consumes the original lease; never hold the release lock
+            // while waiting or checking focus, so the watchdog can always send UP.
+            long activateAt = down + CONTROL_ACTIVATION_MS;
+            while (input.uptime() < activateAt) {
+                synchronized (this) {
+                    if (finished || expiryReason() != null) return false;
                 }
-                x = ex;
-                y = ey;
+                Thread.sleep(Math.min(10, Math.max(1, activateAt - input.uptime())));
+            }
+            synchronized (this) {
+                if (finished || expiryReason() != null) return false;
+            }
+            input.checkScope();
+            synchronized (this) {
+                if (finished || !pressed || expiryReason() != null) return false;
+                x = endX;
+                y = endY;
                 input.send(2, down, x, y);
+                activated = true;
+                return true;
             }
         }
 
@@ -102,6 +124,7 @@ public final class BoundedTouch {
             input.checkScope();
             synchronized (this) {
                 if (finished || !pressed || expiryReason() != null) return false;
+                if (!activated) throw new IllegalStateException("control not activated");
                 if (++moves > 32) throw new IllegalArgumentException("too many corrections");
                 x = px;
                 y = py;
@@ -398,7 +421,19 @@ public final class BoundedTouch {
                     if (capturing.get()) throw new IllegalArgumentException("frame pending");
                     active.begin(Long.parseLong(parts[1]), Float.parseFloat(parts[2]),
                             Float.parseFloat(parts[3]), Float.parseFloat(parts[4]), Float.parseFloat(parts[5]));
-                    reply("STARTED");
+                    // Keep stdin free for UP/EOF while the control activates or
+                    // its final focus check waits on Android's window service.
+                    Thread activation = new Thread(() -> {
+                        try {
+                            if (active.activate()) reply("STARTED");
+                        } catch (Exception error) {
+                            try { active.release(); }
+                            catch (Exception releaseError) { reply("ERROR release"); }
+                            reply("ERROR activation_" + error.getClass().getSimpleName());
+                        }
+                    }, "bounded-touch-activation");
+                    activation.setDaemon(true);
+                    activation.start();
                 } else if (parts.length == 1 && parts[0].equals("KEEPALIVE")) {
                     String expired = active.keepAlive();
                     if (expired != null) {

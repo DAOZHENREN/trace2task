@@ -134,3 +134,22 @@ def test_intervention_http_requires_same_origin_and_csrf(tmp_path):
         server.shutdown()
         server.server_close()
         worker.join(timeout=2)
+
+
+def test_live_capture_routes_only_to_active_job_control(tmp_path, monkeypatch):
+    controller, job = controller_job(tmp_path)
+    control = job.intervention_control
+    calls = []
+    def capture(takeover_id):
+        calls.append(takeover_id)
+        return {'capture_id': 'a' * 32, 'picture': {'path': 'live.png'}}
+    monkeypatch.setattr(control, 'capture_reference', capture)
+    payload = {'kind': 'capture', 'takeover_id': 'takeover-1'}
+    assert controller.intervene_job(job.job_id, payload)['capture_id'] == 'a' * 32
+    assert calls == ['takeover-1']
+    with pytest.raises(ValueError):
+        controller.intervene_job(job.job_id, {**payload, 'path': 'external.png'})
+    job.stop_requested = True
+    with pytest.raises(RuntimeError):
+        controller.intervene_job(job.job_id, payload)
+    assert calls == ['takeover-1']

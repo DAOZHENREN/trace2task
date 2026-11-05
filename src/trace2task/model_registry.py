@@ -49,6 +49,8 @@ class InferenceBackend:
 
 
 INFERENCE_BACKENDS = {
+    "slotread": InferenceBackend("slotread", "官方 SlotRead · Transformers", "current_image_text_history",
+        "常驻官方槽位读取器；每轮使用当前截图、原任务、完整文字经验与动作历史；不支持历史图片和文本生成。"),
     "transformers": InferenceBackend("transformers", "Transformers", "vram_images_only",
         "按显存清理历史图片；任务、经验与文字历史保留。"),
     "llama-server": InferenceBackend("llama-server", "llama.cpp", "langchain_summary_then_native_image_eviction",
@@ -78,6 +80,10 @@ MODEL_PROFILES = {
         ModelProfile("gui-owl-2b", "GUI-Owl 1.5 · 2B", "mPLUG/GUI-Owl-1.5-2B-Instruct",
             "528ceaec795bbfbe6103bd79e03db849feadfb24", "owl-computer-use",
             ("windows",), ("llama-server", "transformers")),
+        ModelProfile("gui-decisions-2b", "GUI-Decisions · 2B", "infinitylogesh/GUI-Decisions-2B",
+            "c2cedfd0a5344ecaa058080555ddd4b85be3284d", "official-slotread",
+            ("windows",), ("slotread",), "experimental",
+            "复用 D:/Models/GUI-Decisions-2B 的官方读取器，权重常驻。支持点击、拖动、按键、滚动和等待；不生成文本，结束声明需人工核对。"),
         ModelProfile("mai-ui-2b", "MAI-UI · 2B", "Tongyi-MAI/MAI-UI-2B",
             "503050934809558c8dfd2ddedaf9621fa74ac2de", "mai-mobile-desktop-subset",
             ("android", "windows-experimental"), ("transformers",), "experimental",

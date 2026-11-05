@@ -113,8 +113,12 @@ def runtime_catalog(root):
     for item in result["models"]:
         item["availability"] = {}
         for backend in item["engines"]:
-            paths = ([python, models / item["id"] / "verified.json"] if backend == "transformers" else
-                     [python, *required_runtime_paths(models, item["id"])])
+            if backend == 'slotread':
+                from trace2task.local_gui_slots import required_paths
+                paths = [python, *required_paths()]
+            else:
+                paths = ([python, models / item["id"] / "verified.json"] if backend == "transformers" else
+                         [python, *required_runtime_paths(models, item["id"])])
             missing = [str(p) for p in paths if not p.exists()]
             item["availability"][backend] = {"files_present": not missing, "missing": missing,
                 "validation": "checksums_on_load", "task_quality": "not_certified"}
@@ -149,7 +153,10 @@ def round_summary(entry):
     return {"step_index": entry["step_index"], "status": entry.get("status"),
             "purpose": entry.get("purpose", "plan"), "duration_ms": entry.get("model_roundtrip_ms"),
             "tokens": entry.get("tokens") or {}, "screenshot": entry.get("screenshot"),
+            "model_role": entry.get('model_role'), "actual_model": entry.get('actual_model'),
+            "subtask": entry.get('subtask'),
             "execution_status": execution.get("status"), "executed": execution.get("executed"),
+            **{key: execution[key] for key in ("submitted_steps", "after_screenshot") if key in execution},
             "verification": entry.get("verification"), "error": str(entry.get("error") or "")[:1000]}
 
 

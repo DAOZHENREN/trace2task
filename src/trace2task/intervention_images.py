@@ -6,19 +6,32 @@ import hashlib
 import io
 import json
 import math
+import re
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024
-MAX_VISUAL_REQUEST_BYTES = 6 * 1024 * 1024
+MAX_IMAGES = 8
+MAX_VISUAL_REQUEST_BYTES = MAX_IMAGES * 6 * 1024 * 1024
 MAX_STROKES = 64
 MAX_POINTS = 2000
 
 
 def validate_visual(value):
+    if isinstance(value, dict) and 'extras' in value:
+        extras = value['extras']
+        if not isinstance(extras, list) or len(extras) >= MAX_IMAGES:
+            raise ValueError(f'一次最多添加 {MAX_IMAGES} 张截图')
+        for extra in extras:
+            if not isinstance(extra, dict) or 'extras' in extra or extra.get('strokes') != []:
+                raise ValueError('附加截图不支持标注')
+            validate_visual(extra)
+        validate_visual({k: v for k, v in value.items() if k != 'extras'})
+        return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
     if not isinstance(value, dict) or set(value) not in (
-        {'takeover_id', 'source_sha256', 'strokes'}, {'upload_data_url', 'strokes'}
+        {'takeover_id', 'source_sha256', 'strokes'}, {'upload_data_url', 'strokes'},
+        {'takeover_id', 'capture_id', 'source_sha256', 'strokes'}
     ):
         raise ValueError('截图输入必须是本次接管截图或上传的图片，不能指定文件路径')
     strokes = value['strokes']
@@ -46,6 +59,9 @@ def validate_visual(value):
             raise ValueError('上传截图不能超过 4 MB')
     elif not isinstance(value['takeover_id'], str) or not isinstance(value['source_sha256'], str):
         raise ValueError('缺少接管截图标识')
+    if 'capture_id' in value and (not isinstance(value['capture_id'], str)
+                                  or not re.fullmatch(r'[a-f0-9]{32}', value['capture_id'])):
+        raise ValueError('实时截图标识无效')
     # Bind retry identity to the exact image and annotations without persisting base64.
     return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
@@ -81,6 +97,26 @@ def _write(image, path):
 
 def save_visual(value, *, segment, directory, request_id):
     """Called after phase/id checks; never capture a device on an HTTP thread."""
+    validate_visual(value)
+    if 'extras' in value:
+        saved = []
+        try:
+            main = save_visual({k: v for k, v in value.items() if k != 'extras'},
+                               segment=segment, directory=directory, request_id=request_id)
+            saved.append(main)
+            extras = []
+            for i, extra in enumerate(value['extras']):
+                item = save_visual(extra, segment=segment, directory=directory,
+                                   request_id=f'{request_id}-extra-{i + 1}')
+                saved.append(item)
+                extras.append(item)
+            return {**main, 'extras': extras}
+        except Exception:
+            for item in saved:
+                Path(item['image']['path']).unlink(missing_ok=True)
+                if item['origin'] != 'takeover_snapshot':
+                    Path(item['source']['path']).unlink(missing_ok=True)
+            raise
     if directory is None:
         raise ValueError('本次运行没有截图归档目录')
     directory = Path(directory) / 'interventions'
@@ -98,19 +134,23 @@ def save_visual(value, *, segment, directory, request_id):
             raise ValueError('上传截图不能超过 4 MB')
         origin = 'user_upload'
     else:
-        source = segment.get('before')
+        live = value.get('capture_id')
+        source = segment.get('captures', {}).get(live) if live else segment.get('before')
         if (value['takeover_id'] != segment['id'] or not source
                 or value['source_sha256'] != source['sha256']):
             raise ValueError('截图与当前接管不匹配，请重新选择截图')
         path = Path(source['path'])
-        if path.resolve() != (directory / f'{segment["id"]}-before.png').resolve():
+        suffix = f'live-{live}' if live else 'before'
+        if path.resolve() != (directory / f'{segment["id"]}-{suffix}.png').resolve():
             raise ValueError('截图不属于本次运行')
         if not path.is_file() or path.stat().st_size > 10_000_000:
             raise ValueError('接管截图缺失或过大')
         data = path.read_bytes()
         if hashlib.sha256(data).hexdigest() != source['sha256']:
             raise ValueError('接管截图已变化，请重新选择截图')
-        origin = 'takeover_snapshot'
+        origin = 'live_snapshot' if live else 'takeover_snapshot'
+        if live:
+            source = None  # Freeze a normalized, command-owned copy for export.
     image = _decode(data)
     directory.mkdir(parents=True, exist_ok=True)
     written = []

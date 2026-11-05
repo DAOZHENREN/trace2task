@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
 from trace2task.model_registry import MODEL_PROFILES
 
-REPOS = {p.id: (p.repository, p.revision) for p in MODEL_PROFILES.values()}
+REPOS = {p.id: (p.repository, p.revision) for p in MODEL_PROFILES.values()
+         if 'transformers' in p.engines or p.prebuilt_gguf}
 
 def curl(url, *args):
     return subprocess.run(['curl.exe', '--noproxy', '*', '--ssl-revoke-best-effort',

@@ -99,6 +99,8 @@ class ComponentManager:
                 raise RuntimeError('组件安装正在进行，请等待或取消')
             if action == 'model' and model not in MODELS:
                 raise ValueError('请选择支持的公开模型')
+            if action == 'model' and model == 'gui-decisions-2b':
+                raise ValueError('GUI-Decisions 复用独立官方部署，请配置 TRACE2TASK_GUI_DECISIONS_ROOT；通用模型下载器不安装 SlotRead 环境')
             folder = Path(directory or str(self.data / 'components')).expanduser()
             if not folder.is_absolute() or folder == Path(folder.anchor):
                 raise ValueError('请选择绝对路径下的专用组件文件夹，不能使用磁盘根目录')

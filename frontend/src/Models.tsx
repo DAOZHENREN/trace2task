@@ -2,14 +2,15 @@ import {useState} from 'react';
 import {Button, Input, Spinner} from '@fluentui/react-components';
 import {api} from './api';
 import {useConfirm} from './ConfirmDialog';
-import type {Catalog, Config, ServiceSnapshot} from './types';
+import type {Catalog, Config, Run, ServiceSnapshot} from './types';
+import {NitrogenTask} from './NitrogenTask';
 import {LocalServices, loadedService, modelLabel} from './LocalServices';
 import {Choice, Field, Icon, PageHeading, Refresh} from './ui';
 
-export function Models({catalog, config: c, setConfig, busy, refresh, onError, onComponents, services, serviceError}: {
+export function Models({catalog, config: c, setConfig, busy, refresh, onError, onComponents, onChatGPT, onRun, services, serviceError}: {
   catalog: Catalog; config: Config; setConfig: (c: Config) => void; busy: boolean; refresh: () => Promise<void>;
   services: ServiceSnapshot | null; serviceError: string;
-  onError: (e: string) => void; onComponents: () => void}) {
+  onError: (e: string) => void; onComponents: () => void; onChatGPT: () => void; onRun: (run: Run) => void}) {
   const confirm = useConfirm();
   const [pending, setPending] = useState('');
   const [message, setMessage] = useState('');
@@ -41,6 +42,9 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
     <PageHeading eyebrow="MODELS & CONNECTIONS" title="选模型，也选对运行方式。" copy="模型负责理解，推理引擎负责计算，执行后端负责操作。三者可以独立选择。"
       action={<Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/>}/>
     <LocalServices snapshot={services} error={serviceError} catalog={catalog}/>
+    <NitrogenTask busy={busy || !!pending} onRun={onRun} onError={onError}/>
+    <div className="notice row-between"><span>使用 ChatGPT 网页会话</span>
+      <Button onClick={onChatGPT}>前往 ChatGPT 网页</Button></div>
     <div className="model-grid">{catalog.models.map(p => <button key={p.id} className={`model-card ${c.localModel === p.id ? 'selected' : ''}`}
       disabled={busy || !!pending} onClick={() => setConfig({...c, provider: 'local', localModel: p.id,
         inference: p.engines.includes(c.inference) ? c.inference : p.engines[0]})}>
@@ -62,7 +66,7 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
         当前后台为 {modelLabel(gui.model, catalog)} / {gui.backend}，与所选配置不同。选择卡片不会切换模型；启动所选服务会替换当前 GUI 服务。</p>}
       <p className="quiet">关闭 GUI 服务会关闭它实际加载的模型，而不是只关闭所选卡片。</p>
       {availability && !availability.files_present && <div className="missing-files"><strong>先准备这些文件</strong>{availability.missing.map(p => <code key={p}>{p}</code>)}
-        <p>GGUF 使用注册表中的固定版本：2B 需本机转换，8B 使用官方量化文件；不会覆盖已有 GGUF。组件页可安装环境和下载模型。</p><Button size="small" onClick={onComponents}>管理组件与模型文件</Button></div>}
+        <p>{c.inference === 'slotread' ? 'GUI-Decisions 需要独立官方部署。默认目录 D:/Models/GUI-Decisions-2B，可通过 TRACE2TASK_GUI_DECISIONS_ROOT 修改。' : 'GGUF 使用注册表中的固定版本：2B 需本机转换，8B 使用官方量化文件；不会覆盖已有 GGUF。组件页可安装环境和下载模型。'}</p><Button size="small" onClick={onComponents}>管理组件与模型文件</Button></div>}
       {c.inference === 'llama-server' && !catalog.summary_model_present && <p className="inline-warning">摘要模型尚未找到；长对话压缩不可用，达到预算时会明确报错，不会声称全部文本永久保留。</p>}
       <p className="quiet">{catalog.inference_backends.find(b => b.id === c.inference)?.context_description} 文件存在不等于真实任务能力已通过验收。</p>
     </section>

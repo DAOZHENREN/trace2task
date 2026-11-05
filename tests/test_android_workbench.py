@@ -31,7 +31,7 @@ def test_android_job_routes_and_freezes_target(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('change', [dict(execution_scope='desktop'), dict(executor_backend='win32'),
-    dict(provider='trained_d'), dict(use_experience=True), dict(execute=False),
+    dict(use_experience=True), dict(execute=False),
     dict(cua_target={'kind': 'desktop'}), dict(background=True), dict(resume_from='runs/old')])
 def test_android_rejects_mixed_routes(tmp_path, change):
     controller = WebConsoleController(tmp_path)
@@ -96,3 +96,65 @@ def test_worker_routes_android_and_keeps_stop_control(
     else:
         assert calls[0]['interventions'] is controller._jobs[job['job_id']].intervention_control
         assert result['interventions']['phase'] == 'closed'
+
+
+@pytest.mark.parametrize('model,engine', [('D-5970', None), ('qwen3-vl-2b', 'llama-server'),
+                                        ('gui-decisions-2b', 'slotread')])
+def test_local_android_worker_keeps_device_budget_and_engine(
+        tmp_path, monkeypatch, synthetic_console_hotkey, model, engine):
+    from trace2task import trained_model_runner
+
+    calls = []
+    monkeypatch.setattr('trace2task.android_workbench.prepare', lambda value: {})
+    if engine:
+        monkeypatch.setattr('trace2task.local_gui_llama.read_backend', lambda root: engine)
+    def run(**kwargs):
+        calls.append(kwargs)
+        return {'stop_reason': 'emergency_stop', 'task_complete': False, 'verified': False}
+    monkeypatch.setattr(trained_model_runner, 'run_trained_desktop', run)
+    controller = WebConsoleController(tmp_path)
+    config = configuration(tmp_path)
+    job = controller.start_job(task_path='', instruction='Pause stopwatch', execute=True,
+        provider='trained_d', model=model, inference_backend=engine,
+        executor_backend='android', execution_scope='android', android_config=config,
+        android_budget={'max_actions': 12, 'max_seconds': 60})
+    result = controller.wait(job['job_id'])
+    assert result['status'] == 'stopped'
+    assert calls[0]['android_config'] == config
+    assert calls[0]['executor_backend'] == 'android'
+    assert (calls[0]['max_actions'], calls[0]['max_seconds']) == (12, 60)
+    assert calls[0]['inference_backend'] == (engine or 'frozen-d')
+    assert job['run_facts']['data_flow'] == 'local'
+    assert job['run_facts']['input_mode'] == 'remote_android'
+    assert job['interventions'] == {}
+
+
+def test_local_android_rejects_mobileforge_before_device_work(tmp_path):
+    controller = WebConsoleController(tmp_path)
+    with pytest.raises(ValueError, match='MobileForge'):
+        controller.start_job(task_path='', instruction='test', execute=True,
+            provider='trained_d', model='gui-decisions-2b', mobileforge='source',
+            executor_backend='android', execution_scope='android', android_config=configuration(tmp_path))
+
+
+def test_local_android_approval_wait_obeys_time_budget(tmp_path, monkeypatch, synthetic_console_hotkey):
+    from trace2task import trained_model_runner
+    from trace2task.execution_budget import BudgetStop, TimeBudgetExceeded
+
+    stopped = []
+    monkeypatch.setattr('trace2task.android_workbench.prepare', lambda value: {})
+    def run(**kwargs):
+        assert isinstance(kwargs['emergency_stop'], BudgetStop)
+        kwargs['emergency_stop'].deadline = 0
+        with pytest.raises(TimeBudgetExceeded):
+            kwargs['approve']({'actions': [], 'step': 0})
+        stopped.append(True)
+        return {'stop_reason': 'time_limit', 'task_complete': False, 'verified': False}
+    monkeypatch.setattr(trained_model_runner, 'run_trained_desktop', run)
+    controller = WebConsoleController(tmp_path)
+    job = controller.start_job(task_path='', instruction='test', execute=True,
+        provider='trained_d', model='D-5970', continuous=False,
+        executor_backend='android', execution_scope='android', android_config=configuration(tmp_path))
+    result = controller.wait(job['job_id'])
+    assert stopped == [True]
+    assert result['pending_batch'] is None

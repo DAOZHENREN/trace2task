@@ -1,3 +1,7 @@
 # This source is byte-hashed alongside the bundled Android helper.
 /src/trace2task/android_touch/BoundedTouch.java text eol=lf
 /src/trace2task/android_touch/bounded-touch.jar -text
+# Preserve the exact downloaded bytes used by the v6 provenance checks.
+/docs/evidence/terra-guided-v6/** -text
+
+/docs/evidence/terra-guided-v7/** -text

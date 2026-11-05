@@ -390,3 +390,37 @@ def test_owned_gui_llama_is_not_classified_as_independent_8b():
     assert process_service(process) == 'gui'
     process['CommandLine'] = 'llama-server.exe -m D:/other/model.gguf'
     assert not is_model_process(process)
+
+
+
+def test_v6_replay_reaches_actual_llama_wire_with_two_history_images(engine, monkeypatch):
+    calls = []
+    monkeypatch.setattr(engine.llama, 'complete', lambda payload, cancelled: calls.append(payload) or reply())
+    encoded = request('v6-image')['image']
+    history = [{'raw_output': 'old native output'}, {'raw_output': 'recent one', 'image': encoded},
+               {'raw_output': 'recent two', 'image': encoded}]
+    result = engine.predict(request('v6-first', guided_history=history, task='Current subgoal'))
+    assert result['status'] == 'predicted', result
+    messages = calls[0]['messages']
+    assert [m['content'] for m in messages if m['role'] == 'assistant'] == [h['raw_output'] for h in history]
+    assert sum(p['type'] == 'image_url' for m in messages if isinstance(m['content'], list) for p in m['content']) == 3
+    assert result['context_management']['policy'] == 'guided_v6_all_stage_text_last_two_images'
+    assert 'compaction' not in result['context_management']
+    assert engine.conversation is None  # Replay does not contaminate the original mode's conversation.
+    second = engine.predict(request('v6-second', guided_history=[], task='Another stage'))
+    assert second['status'] == 'predicted'
+    assert not any(m['role'] == 'assistant' for m in calls[1]['messages'])
+
+
+def test_v6_context_overflow_does_not_drop_fixed_images_or_retry(engine, monkeypatch):
+    calls = []
+    def fail(payload, cancelled):
+        calls.append(payload)
+        raise llama.ContextFull('full')
+    monkeypatch.setattr(engine.llama, 'complete', fail)
+    result = engine.predict(request('v6-overflow', guided_history=[
+        {'raw_output': 'delivered', 'image': request('v6-picture')['image']}]))
+    assert result['status'] == 'error'
+    assert len(calls) == 1
+    assert result['context_management']['removed_images'] == 0
+    assert 'compaction' not in result['context_management']

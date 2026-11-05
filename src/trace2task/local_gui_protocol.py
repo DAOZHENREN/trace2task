@@ -2,7 +2,7 @@
 
 References: X-PLUG/MobileAgent Mobile-Agent-v3.5/cookbook/end2end_usage_computer.ipynb
 and Tongyi-MAI/MAI-UI MAI-UI/src/{prompt,mai_naivigation_agent}.py.
-This is a limited Windows action subset, NOT an official benchmark harness.
+This uses the selected executor's action subset, not an official benchmark harness.
 """
 import json
 import math
@@ -15,6 +15,7 @@ from trace2task.model_registry import profile_for
 # Native model formats, not backend permissions. A backend reports its own
 # routes; the adapter exposes only the intersection to the model.
 MODEL_ACTION_SKILLS = {
+    'gui-decisions-2b': frozenset({'click', 'drag', 'press_key', 'scroll', 'wait'}),
     'qwen3-vl-2b': frozenset({'click', 'double_click', 'hold_mouse', 'type_text',
                               'press_key', 'hold_key', 'hotkey', 'wait', 'scroll',
                               'drag', 'move_cursor', 'switch_window', 'launch_app'}),
@@ -60,6 +61,13 @@ TURN_TEMPLATE = ("Please generate the next move according to the UI screenshot, 
                  "{{experience_block}}{{execution_feedback_block}}{{execution_context_block}}")
 TURN_FIELDS = ('task', 'history', 'experience_block', 'execution_feedback_block')
 CONTEXT_FIELDS = ('execution_context_block', 'cua_context_block')
+
+
+def default_turn_template(model):
+    if model == 'gui-decisions-2b':
+        from trace2task.local_gui_slots import TURN
+        return TURN
+    return TURN_TEMPLATE
 
 
 def validate_prompt_profile(value):
@@ -203,8 +211,11 @@ def prompt(model, cua=False):
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
+    if model == 'gui-decisions-2b':
+        from trace2task.local_gui_slots import SYSTEM
+        return SYSTEM
     if profile_for(model).adapter == 'qwen-normalized-actions':
-        return '''You control a Windows desktop using its current screenshot and actual executed history.
+        return '''You control the selected GUI using its current screenshot and actual executed history.
 Return ONLY JSON {"actions":[{"skill":"click","args":{"x":0.5,"y":0.5,"button":"left"}}]}.
 Coordinates are normalized 0..1. The JSON action format can express click,
 double_click, hold_mouse, drag, move_cursor, scroll, type_text, press_key,
@@ -228,7 +239,7 @@ No independent key_down/key_up or mouse_down/mouse_up is available.'''
     scale = 999 if model == 'mai-ui-2b' else 1000
     click = 'click' if model == 'mai-ui-2b' else 'left_click'
     return f'''You are a GUI agent. You are given a task and your action history, with screenshots.
-Perform the next action to complete the task. This environment is Windows desktop, not Android.
+Perform the next action to complete the task in the environment identified by the task and screenshot.
 Return a short Action line and a single <tool_call> JSON block:
 <tool_call>{{"name":"{tool}","arguments":{{"action":"{click}","coordinate":[500,500]}}}}</tool_call>
 Coordinates are normalized to 0..{scale} on both axes.
@@ -262,6 +273,9 @@ def decode(model, text, cua=False, *, generation_complete=False, normalizations=
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
+    if model == 'gui-decisions-2b':
+        from trace2task.local_gui_slots import decode_slots
+        return decode_slots(json.loads(text, object_pairs_hook=_unique_object))
     if profile_for(model).adapter == 'qwen-normalized-actions':
         cleaned = text.strip()
         if cleaned.startswith('```json') and cleaned.endswith('```'):

@@ -59,17 +59,18 @@ def test_human_preview_and_saved_provenance_include_all_handoff_images(tmp_path)
 
 
 @pytest.mark.parametrize('tamper', [False, True])
-def test_visual_reference_survives_experience_projection_and_is_digest_checked(tmp_path, tamper):
+@pytest.mark.parametrize('multiple', [False, True])
+def test_visual_reference_survives_experience_projection_and_is_digest_checked(tmp_path, tamper, multiple):
     store, run, _ = seed(tmp_path)
     assisted(tmp_path, store, run)
     run['result']['trace_path'] = str(tmp_path / 'runs/source/trace.jsonl')
     command = run['interventions']['commands'][-1]
-    visual = save_visual(upload(), segment=run['interventions']['takeovers'][0],
+    visual = save_visual({**upload(), **({'extras': [{**upload((100, 200)), 'strokes': []}]} if multiple else {})}, segment=run['interventions']['takeovers'][0],
                          directory=Path(run['result']['trace_path']).parent, request_id=command['id'])
     command['visual'] = visual
     store.save(run)
     if tamper:
-        Path(visual['image']['path']).write_bytes(b'tampered')
+        Path((visual['extras'][0] if multiple else visual)['image']['path']).write_bytes(b'tampered')
         with pytest.raises(ValueError, match='标注截图已变化'):
             prepare_run_experience(tmp_path, store, run['job_id'])
         return
@@ -78,6 +79,8 @@ def test_visual_reference_survives_experience_projection_and_is_digest_checked(t
     assert reference['origin'] == 'user_upload' and 'strokes' not in reference
     assert reference['source']['id'] in [i['id'] for i in prepared['images']]
     assert reference['image']['id'] in [i['id'] for i in prepared['images']]
+    if multiple:
+        assert reference['extras'][0]['source']['id'] in [i['id'] for i in prepared['images']]
     assert str(tmp_path) not in prepared['input'] and 'upload_data_url' not in prepared['input']
     session = Session(METHOD)
     child = publish(tmp_path, compile_run_draft(tmp_path, prepared, **OPTIONS,

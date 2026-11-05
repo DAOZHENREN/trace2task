@@ -168,6 +168,46 @@ test('upload paste clear and remove preserve the text-only handoff', async ({pag
   expect(f.requests.at(-1).text).toBe('先只检查文字');
 });
 
+test('live capture replaces the main image while add mode preserves its marks and submits extra images', async ({page}, info) => {
+  const f = await annotatedPause(page);
+  let captures = 0;
+  let failCapture = false;
+  await page.route('**/api/jobs/android-live/interventions', async route => {
+    const body = route.request().postDataJSON();
+    if (body.kind !== 'capture') return route.fallback();
+    expect(body.takeover_id).toBe('takeover-1');
+    if (failCapture) return route.fulfill({status: 409, json: {error: '手机当前画面不可用'}});
+    captures++;
+    return route.fulfill({json: {capture_id: String(captures).padStart(32, '0'),
+      picture: {path: `runs/test/live-${captures}.png`, sha256: String(captures).repeat(64), width: 240, height: 135}}});
+  });
+  await f.editor.getByRole('button', {name: '实时截图', exact: true}).click();
+  await expect(f.editor.getByAltText('待标注截图')).toHaveAttribute('src', /live-1/);
+  await draw(page, [.1, .2], [.4, .6]);
+  await f.editor.getByRole('button', {name: '添加截图', exact: true}).click();
+  await f.editor.getByRole('button', {name: '实时截图', exact: true}).click();
+  await expect(f.editor.getByAltText('附加截图 1', {exact: true})).toHaveAttribute('src', /live-2/);
+  await expect(f.editor.getByAltText('待标注截图')).toHaveAttribute('src', /live-1/);
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(1);
+  await f.editor.getByRole('button', {name: '添加截图', exact: true}).click();
+  await f.editor.getByRole('button', {name: '使用接管截图'}).click();
+  await expect(f.editor.getByAltText('附加截图 2', {exact: true})).toBeVisible();
+  await f.editor.getByRole('button', {name: '移除附图 2', exact: true}).click();
+  failCapture = true;
+  await f.editor.getByRole('button', {name: '实时截图', exact: true}).click();
+  await expect(f.editor.getByRole('alert')).toContainText('原截图已保留');
+  await expect(f.editor.locator('[data-annotation]')).toHaveCount(1);
+  await page.setViewportSize({width: 520, height: 900});
+  expect(await f.editor.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  await f.editor.screenshot({path: info.outputPath('multi-image-reference.png')});
+  await f.panel.getByRole('button', {name: '发送图文并继续'}).click();
+  const request = f.requests.at(-1);
+  expect(request.visual.capture_id).toBe('1'.padStart(32, '0'));
+  expect(request.visual.strokes).toHaveLength(1);
+  expect(request.visual.extras).toEqual([{takeover_id: 'takeover-1', capture_id: '2'.padStart(32, '0'),
+    source_sha256: '2'.repeat(64), strokes: []}]);
+});
+
 test('a rejected return keeps the visual draft and an explicit retry gets a new request ID', async ({page}) => {
   const f = await annotatedPause(page);
   await draw(page, [.1, .2], [.4, .6]);

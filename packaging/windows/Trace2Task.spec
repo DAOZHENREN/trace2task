@@ -17,8 +17,9 @@ datas += [(str(root / 'src/trace2task' / name), 'src/trace2task')
           for name in ['__init__.py', 'local_gui_protocol.py', 'local_gui_owl_prompt.py', 'actions.py',
                        'execution_protocol.py', 'execution_core.py', 'cua_execution.py',
                        'win32_execution.py', 'local_agent_loop.py', 'local_observation.py',
-                       'local_gui_client.py', 'local_gui_prefix_cache.py', 'gui_conversation.py',
-                       'local_gui_memory.py', 'local_gui_llama.py', 'gui_summarization.py',
+                       'local_gui_client.py', 'local_gui_prefix_cache.py', 'gui_conversation.py', 'guided_history.py',
+                       'application_knowledge.py',
+                       'local_gui_memory.py', 'local_gui_llama.py', 'local_gui_slots.py', 'gui_summarization.py',
                        'local_process.py', 'components.py', 'model_registry.py',
                        'trace_evidence.py', 'trace_projection.py', 'model_text.py']]
 datas += [(str(root / 'integrations'), 'integrations'), (str(root / 'LICENSE'), '.')]

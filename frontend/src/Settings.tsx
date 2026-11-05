@@ -32,6 +32,7 @@ function PromptEditor({catalog, busy, visible, onError, onDirty}: {catalog: Cata
   const [guidance, setGuidance] = useState(''); const [system, setSystem] = useState(''); const [template, setTemplate] = useState('');
   const [loaded, setLoaded] = useState(''); const [dirty, setDirty] = useState(false); const [message, setMessage] = useState('');
   const {pending, perform} = useAction(onError); const local = !['codex', 'api'].includes(target);
+  const fixedSlots = target === 'gui-decisions-2b';
   const key = local ? `${target}:${backend}` : target;
   function changeDirty(value: boolean) {setDirty(value); onDirty(key, value);}
   function apply(profile: Prompt) {setGuidance(profile.guidance || ''); setSystem(profile.effective?.system_prompt || ''); setTemplate(profile.effective?.turn_template || ''); changeDirty(false);}
@@ -55,10 +56,11 @@ function PromptEditor({catalog, busy, visible, onError, onDirty}: {catalog: Cata
   }
   return <section className="surface workflow-card"><h2>模型提示词</h2><p className="quiet">本地保存，不要写入密钥。不会修改固定安全约束、动作校验或运行中的任务。</p>
     <div className="two-fields spaced"><Field label="提示词对象"><Choice value={target} disabled={busy || !!pending} onChange={e => select(e.target.value)}><option value="codex">Codex 执行指导</option><option value="api">视觉 API 执行指导</option>
-      {catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field>{local && <Field label="提示词执行后端"><Choice value={backend} disabled={busy || !!pending} onChange={e => select(e.target.value, true)}><option value="cua">Cua</option></Choice></Field>}</div>
+      {catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field>{local && <Field label="提示词执行后端"><Choice value={backend} disabled={busy || !!pending} onChange={e => select(e.target.value, true)}><option value="cua">Cua</option><option value="android">Android · ADB</option></Choice></Field>}</div>
     {target === 'codex' && <p className="notice">这里编辑本程序发送的执行指导，不是 Codex 内置系统提示词。</p>}
-    {local ? <><Field label="系统提示词"><Textarea rows={10} resize="vertical" spellCheck={false} value={system} disabled={busy || !!pending || loaded !== key} onChange={(_, d) => {setSystem(d.value); changeDirty(true);}}/></Field>
-      <Field label="每轮任务模板" hint="必须保留 {{task}}、{{history}}、{{experience_block}}、{{execution_feedback_block}}。执行范围仍由程序校验。"><Textarea rows={7} resize="vertical" spellCheck={false} value={template} disabled={busy || !!pending || loaded !== key} onChange={(_, d) => {setTemplate(d.value); changeDirty(true);}}/></Field></>
+    {fixedSlots && <p className="notice">GUI-Decisions 使用作者训练时的固定槽位提示词，以下内容只读。可在任务中提供指令和文字经验。</p>}
+    {local ? <><Field label="系统提示词"><Textarea rows={10} resize="vertical" spellCheck={false} value={system} disabled={fixedSlots || busy || !!pending || loaded !== key} onChange={(_, d) => {setSystem(d.value); changeDirty(true);}}/></Field>
+      <Field label="每轮任务模板" hint="必须保留 {{task}}、{{history}}、{{experience_block}}、{{execution_feedback_block}}。执行范围仍由程序校验。"><Textarea rows={7} resize="vertical" spellCheck={false} value={template} disabled={fixedSlots || busy || !!pending || loaded !== key} onChange={(_, d) => {setTemplate(d.value); changeDirty(true);}}/></Field></>
       : <Field label="自定义执行指导"><Textarea rows={8} resize="vertical" maxLength={4000} value={guidance} disabled={busy || !!pending || loaded !== key} onChange={(_, d) => {setGuidance(d.value); changeDirty(true);}}/></Field>}
     <div className="action-footer"><span className="quiet" role="status">{dirty ? '有未保存修改；切换工作台页面会保留草稿。' : message}</span><div className="button-row">
       <Button disabled={busy || !!pending || loaded !== key} onClick={() => void save(true)}>恢复默认</Button><Button appearance="primary" disabled={busy || !!pending || loaded !== key || !dirty} onClick={() => void save()}>保存提示词</Button></div></div></section>;
@@ -87,7 +89,8 @@ function Components({catalog, busy, visible, onError}: {catalog: Catalog; busy: 
   return <section className="surface workflow-card"><div className="row-between"><h2>组件与模型文件</h2><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/></div>
     <p className="notice" role="status">{status ? `${status.status} · ${status.message}` : '等待组件状态'}</p>
     <div className="two-fields"><Field label="组件安装目录"><Input value={directory} disabled={disabled} onChange={(_, d) => setDirectory(d.value)}/></Field>
-      <Field label="下载模型"><Choice value={model} disabled={disabled} onChange={e => setModel(e.target.value)}>{catalog.models.map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field></div>
+      <Field label="下载模型"><Choice value={model} disabled={disabled} onChange={e => setModel(e.target.value)}>{catalog.models.filter(p => !p.engines.includes('slotread')).map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field></div>
+    <p className="quiet">GUI-Decisions 复用已有独立部署；在“模型与连接”中选择并启动。</p>
     <div className="button-row"><Button disabled={disabled || !directory} onClick={() => void action('runtime')}>安装 GPU 环境</Button><Button appearance="primary" disabled={disabled || !directory || !model} onClick={() => void action('model')}>下载所选模型</Button>
       <Button disabled={!!pending || status?.status !== 'running'} onClick={() => void action('cancel')}>取消安装 / 下载</Button></div>
     <dl className="facts-list"><dt>Python</dt><dd>{status?.python || '—'}</dd><dt>模型目录</dt><dd>{status?.models || '—'}</dd></dl>

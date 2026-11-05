@@ -1,0 +1,65 @@
+{
+  "source_host": "4090",
+  "source_root": "terra-guided-gimp-20261103-v6",
+  "protocol": "terra-guided-v6-all-subgoals",
+  "retrieved": "2026-11-03",
+  "files": [
+    {
+      "path": "plan.json",
+      "sha256": "e3fbda13ea85afddbc43354e0d1e64c6d39eb497495ad3002f53da9bab687f2d",
+      "source_manifest_verified": false,
+      "original_sha256": "8216241c277733fe759edef7a441b13a67ad2b683a54578498dcd2b927480b0d"
+    },
+    {
+      "path": "source-manifest.json",
+      "sha256": "2da10ac8b3a14e41923a3771cec78fedef6c01f2f9db234f5a22234e29c11037",
+      "source_manifest_verified": false
+    },
+    {
+      "path": "task-00/teacher/000.schema.json",
+      "sha256": "2898916cf1d242eb09202672ebae9e4eded46333699bd62d4b5667a08d38fff9",
+      "source_manifest_verified": false
+    },
+    {
+      "path": "task-00/teacher/000.prompt.txt",
+      "sha256": "0fc96a97fc9be015f0cf90034f7feb5a8d8931e8dba4e3866d045fa376210169",
+      "source_manifest_verified": false
+    },
+    {
+      "path": "code/src/trace2task/guided_gui.py",
+      "sha256": "c3ae7f57b7336929808cec0c56f7cccfe321fae13929944cebbcfac7823afc6f",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/src/trace2task/guided_gui_v2.py",
+      "sha256": "4e985a346eafac276b7f7d5663e4ecc43ff9b358e64e059befeae382568ee9dc",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/src/trace2task/guided_gui_v3.py",
+      "sha256": "e305e6cc36e7f2b7254d23b32d06ff4a112318e99290c6e0c2e4ff69022ea9e5",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/src/trace2task/guided_gui_v4.py",
+      "sha256": "8a83fbe9d4056a7cdafbed758b5736aeed503919faf166e73b582c8f8c64002c",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/src/trace2task/guided_gui_v6.py",
+      "sha256": "d441353e2f3f265d288579df40d6f7f2ce330c30a7a2d8bbab747b34ac68d9e7",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/src/trace2task/guided_gui_adapters.py",
+      "sha256": "2147467ff8463edb885d508ecfc464cd552e564cdcd34d8c36cb839c982e6141",
+      "source_manifest_verified": true
+    },
+    {
+      "path": "code/scripts/research/run_guided_gui_live.py",
+      "sha256": "c6dc90f26310930643840c5a91a69e1a5f09ab33071d8070066e820f115561cf",
+      "source_manifest_verified": true,
+      "original_sha256": "09a8420870181612e180f40caaf3e9e6a38b41cd01e93685d71e853ac33e34a9"
+    }
+  ]
+}

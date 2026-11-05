@@ -19,7 +19,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from trace2task.local_process import stop_started_process
 from trace2task.model_registry import GUI_CONTEXT_TOKENS, profile_for
 
-BACKENDS = {'transformers', 'llama-server'}
+BACKENDS = {'transformers', 'llama-server', 'slotread'}
 SUMMARY_ALIAS = 'trace2task-gui-summary-qwen8b'
 
 

@@ -1,0 +1,47 @@
+{
+  "source_host": "4090",
+  "source_root": "terra-guided-other3-20261104-owl2b",
+  "retrieved": "2026-11-04",
+  "protocol": "terra-guided-v7-actions-and-subgoal",
+  "prompt_revision": "concise-v2",
+  "source_prompt_sha256": "e415ad33fce03c3c610301b4e85eee9f34c4790b3e558c9c4a76a4748bc10805",
+  "local_adaptation": "Normalized 0..1 coordinates and existing backend-specific action schema; original prompt and schema preserved unchanged.",
+  "files": [
+    {
+      "path": "000.prompt.txt",
+      "sha256": "490e4e0022ecdb3cef284fd9fcd45ddaf12a2aae0c9d849bd89cb2731364455a",
+      "source_manifest_key": null
+    },
+    {
+      "path": "000.schema.json",
+      "sha256": "b6841493033f59563bda21464fa75661cfec462580fef16743def570a79fe86c",
+      "source_manifest_key": null
+    },
+    {
+      "path": "001.prompt.txt",
+      "sha256": "203c6af0b4abe2fbfea9f56bba82f4caed4c208002cf033190849f2ac8a1d6d6",
+      "source_manifest_key": null
+    },
+    {
+      "path": "guided_gui_v2.py",
+      "sha256": "7d11669a6aa069d95427fd42856842629a09b2d5cea4aa1fc92da2b1137c562f",
+      "source_manifest_key": "src/trace2task/guided_gui_v2.py"
+    },
+    {
+      "path": "guided_gui_v7.py",
+      "sha256": "2b0d421114d342677542c64cde4202cbf5f0de0f35da31ebf67c797f983e79c9",
+      "source_manifest_key": "src/trace2task/guided_gui_v7.py"
+    },
+    {
+      "path": "plan.json",
+      "sha256": "be52b3e929e4752f9d86c23e4f38bb6654e38b2d83ad68584f6fddcab7e4f441",
+      "source_manifest_key": null,
+      "original_sha256": "c1e7d923b33bc3f0980dfaa9c04a5f03962e9c0120e40e73ed0601e6bfc80073"
+    },
+    {
+      "path": "source-manifest.json",
+      "sha256": "4be91178c56f3d07f4fd63cb521ad73fed5d11569eecae369addaf55ae87d561",
+      "source_manifest_key": null
+    }
+  ]
+}

@@ -5,8 +5,11 @@ public class TestMain {
     public static void main(String[] args) {
         AtomicInteger calls = new AtomicInteger();
         BoundedTouch.run(args, new BoundedTouch.WindowScope() {
-            public String read() {
+            public String read() throws Exception {
                 int index = calls.incrementAndGet();
+                if (index == Integer.getInteger("test.scopeDelayAt", -1)) {
+                    Thread.sleep(Long.getLong("test.scopeDelayMs", 0));
+                }
                 String focus = System.getProperty("test.windowFocus", "com.example.game/.Main");
                 if (index >= Integer.getInteger("test.focusChangesAt", Integer.MAX_VALUE)) {
                     focus = "com.android.systemui/NotificationShade";

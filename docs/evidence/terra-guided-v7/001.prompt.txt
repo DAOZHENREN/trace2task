@@ -1,0 +1,1 @@
+{"handoff_reason": "invalid_action", "current_subgoal": {"goal": "Resize the image and export a separate preview.", "completion_hint": "The exported venue_preview.png is 450×225 and venue.png remains intact.", "constraints": ["Keep venue.png.", "Save venue_preview.png beside the original."], "handoff_conditions": ["The image is scaled to 450×225 and ready to export."]}}

@@ -156,8 +156,12 @@ def control_service(action, model, data_root, backend=None):
                 token = logs / 'service.token'
                 args = [str(python), str(root / 'scripts/local_gui/server.py'), '--output', str(logs), '--token-file', str(token), '--root', str(models)]
                 required = [python, Path(args[1])]
-                required.extend(required_runtime_paths(models, model) if backend == 'llama-server'
-                                else [models / model / 'verified.json'])
+                if backend == 'slotread':
+                    from trace2task.local_gui_slots import required_paths
+                    required.extend(required_paths())
+                else:
+                    required.extend(required_runtime_paths(models, model) if backend == 'llama-server'
+                                    else [models / model / 'verified.json'])
                 port = 8768
             elif model == 'trained_d':
                 args = [str(trained_python), str(root / 'scripts/trained_model/preview.py'),

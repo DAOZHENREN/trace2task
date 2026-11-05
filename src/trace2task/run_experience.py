@@ -122,33 +122,42 @@ def _human_evidence(root, run, files, images):
             continue
         if not re.fullmatch(r'[A-Za-z0-9_-]{8,80}', command['id']):
             raise ValueError('人工截图指令标识无效')
-        reference = {k: visual[k] for k in ('origin', 'strokes', 'coordinate_space', 'meaning') if k in visual}
-        for role in ('source', 'image'):
-            picture = visual[role]
-            path = (root / picture['path']).resolve()
-            name = f'visual-{command["id"]}-' + ('source.png' if role == 'source' else 'annotated.png')
-            expected = (f'{command.get("takeover_id")}-before.png'
-                        if role == 'source' and visual['origin'] == 'takeover_snapshot' else name)
-            trace = (run.get('result') or {}).get('trace_path')
-            if (not path.is_relative_to(root / 'runs') or path.parent.name != 'interventions'
-                    or path.name != expected or not trace
-                    or path.parent.parent != (root / trace).resolve().parent):
-                raise ValueError('人工标注截图不属于源运行，拒绝读取外部文件')
-            if not path.is_file() or path.stat().st_size > 10_000_000:
-                raise ValueError('人工标注截图缺失或超过 10 MB')
-            data = path.read_bytes()
-            if sha(data) != picture.get('sha256'):
-                raise ValueError('人工标注截图已变化，不能据此提炼')
-            total += len(data)
-            filename = f'evidence/human/{name}'
-            files[filename] = data
-            label = f'人工指令 {command["index"]} · ' + ('参考原图' if role == 'source' else '用户标注图')
-            exported = {'id': f'human-{command["id"]}-{role}', 'file': filename, 'sha256': sha(data),
-                        'source': 'human_visual_reference', 'label': label,
-                        'preview_path': path.relative_to(root).as_posix()}
-            images.append(exported)
-            reference[role] = {k: v for k, v in exported.items() if k != 'preview_path'}
-        exported_command['visual'] = reference
+        references = []
+        attachments = [visual, *visual.get('extras', [])]
+        for extra_index, visual in enumerate(attachments):
+            visual_id = command['id'] + (f'-extra-{extra_index}' if extra_index else '')
+            reference = {k: visual[k] for k in ('origin', 'strokes', 'coordinate_space', 'meaning') if k in visual}
+            for role in ('source', 'image'):
+                picture = visual[role]
+                path = (root / picture['path']).resolve()
+                name = f'visual-{visual_id}-' + ('source.png' if role == 'source' else 'annotated.png')
+                expected = (f'{command.get("takeover_id")}-before.png'
+                            if role == 'source' and visual['origin'] == 'takeover_snapshot' else name)
+                trace = (run.get('result') or {}).get('trace_path')
+                if (not path.is_relative_to(root / 'runs') or path.parent.name != 'interventions'
+                        or path.name != expected or not trace
+                        or path.parent.parent != (root / trace).resolve().parent):
+                    raise ValueError('人工标注截图不属于源运行，拒绝读取外部文件')
+                if not path.is_file() or path.stat().st_size > 10_000_000:
+                    raise ValueError('人工标注截图缺失或超过 10 MB')
+                data = path.read_bytes()
+                if sha(data) != picture.get('sha256'):
+                    raise ValueError('人工标注截图已变化，不能据此提炼')
+                total += len(data)
+                filename = f'evidence/human/{name}'
+                files[filename] = data
+                label = f'人工指令 {command["index"]} · ' + ('参考原图' if role == 'source' else '用户标注图')
+                if extra_index:
+                    label += f' · 附图 {extra_index}'
+                exported = {'id': f'human-{visual_id}-{role}', 'file': filename, 'sha256': sha(data),
+                            'source': 'human_visual_reference', 'label': label,
+                            'preview_path': path.relative_to(root).as_posix()}
+                images.append(exported)
+                reference[role] = {k: v for k, v in exported.items() if k != 'preview_path'}
+            references.append(reference)
+        exported_command['visual'] = references[0]
+        if len(references) > 1:
+            exported_command['visual']['extras'] = references[1:]
     return output, total
 
 
@@ -178,6 +187,17 @@ def prepare_run_experience(root, store, run_id):
     scope = facts.get('operation_scope', run.get('execution_scope', 'unknown'))
     if scope == 'android' and len(packages) != 1:
         raise ValueError('缺少一致的 Android 应用范围，不能生成可复用经验')
+    from trace2task.application_knowledge import knowledge_id, read_knowledge
+
+    knowledge_used = facts.get('application_knowledge')
+    knowledge_base = None
+    if scope == 'android':
+        package = next(iter(packages))
+        identifier = knowledge_id('android', package)
+        knowledge_base = read_knowledge(root, identifier) or {
+            'id': identifier, 'scope': 'android', 'application': package, 'content': '', 'sha256': '', 'revision': 0}
+    elif knowledge_used:
+        knowledge_base = read_knowledge(root, knowledge_used['id']) or knowledge_used
     outcome = ('模型视觉复核完成 · 非独立验证' if result.get('stop_reason') == 'visual_completion_reviewed'
                else '运行已结束 · 成功待核对' if run.get('status') == 'completed'
                else '运行未完成 · 仅提炼已发生的过程')
@@ -248,8 +268,13 @@ def prepare_run_experience(root, store, run_id):
     # Audit identity and receipts stay local; the compiler gets task evidence only.
     # Bind preview confirmation to the full source even when audit-only metadata changes.
     evidence['source_snapshot_sha256'] = sha(encoded(source))
+    if knowledge_base:
+        evidence['knowledge_base'] = knowledge_base
+        evidence['run_knowledge_sha256'] = (knowledge_used or {}).get('sha256')
+        if knowledge_used and knowledge_used != knowledge_base:
+            evidence['knowledge_used'] = knowledge_used
     audit_data = encoded(evidence)
-    data = model_json(method_evidence(evidence, images), sort_keys=True).encode('utf-8')
+    data = model_json(_compilation_payload(evidence, images), sort_keys=True).encode('utf-8')
     images, _ = deduplicate_images(images)
     summary = {**summary, 'image_count': len(images)}
     files['evidence/run.json'] = audit_data
@@ -258,7 +283,7 @@ def prepare_run_experience(root, store, run_id):
         if parent['procedure'] is not None:
             files['parent-procedure.md'] = parent['procedure'].encode('utf-8')
     return {'summary': summary, 'input': data.decode('utf-8'), 'files': files, 'images': images,
-            'lineage': lineage,
+            'lineage': lineage, 'knowledge_base': knowledge_base,
             'image_selection': selection,
             'source_sha256': sha(audit_data + data + encoded([p['sha256'] for p in images]))}
 
@@ -292,6 +317,8 @@ def read_draft(root, identifier):
     saved = next((t for t in versions if t.get('source_draft_id') == identifier), None)
     parent_file = 'parent-procedure.md' if 'parent-procedure.md' in meta['artifact_sha256'] else 'parent-experience.txt'
     return {**meta, 'draft_id': identifier, 'content': content,
+            'knowledge_content': ((directory / 'knowledge-draft.md').read_text(encoding='utf-8')
+                                  if 'knowledge-draft.md' in meta['artifact_sha256'] else None),
             'parent_content': ((directory / parent_file).read_bytes().decode('utf-8')
                                if parent_file in meta['artifact_sha256'] else None),
             'revision_diff': ((directory / 'revision.diff').read_bytes().decode('utf-8')
@@ -328,8 +355,7 @@ def _save_options(draft, versions):
                                     'created_at', 'created_at_source', 'version_revision')} for v in candidates]}
 
 
-def preview_run_experience(root, store, run_id):
-    prepared = prepare_run_experience(root, store, run_id)
+def existing_run_drafts(root, run_id):
     drafts = []
     base = draft_directory(root, str(uuid4())).parent
     for path in base.glob('*/draft.json'):
@@ -339,12 +365,32 @@ def preview_run_experience(root, store, run_id):
                 drafts.append({k: draft[k] for k in ('draft_id', 'trace_name', 'created_at', 'saved_trace_id')})
         except (OSError, ValueError, KeyError):
             continue
+    return sorted(drafts, key=lambda d: d['created_at'], reverse=True)
+
+
+def _compilation_payload(evidence, images):
+    payload = method_evidence(evidence, images)
+    for key in ('knowledge_base', 'knowledge_used'):
+        if (value := evidence.get(key)) and value['content']:
+            payload[key] = _knowledge_text(value)
+    if evidence.get('run_knowledge_sha256'):
+        payload['run_loaded_application_knowledge'] = True
+    return payload
+
+
+def _knowledge_text(value):
+    return {key: value[key] for key in ('application', 'revision', 'content')}
+
+
+def preview_run_experience(root, store, run_id):
+    prepared = prepare_run_experience(root, store, run_id)
     return {**prepared['summary'], 'source_sha256': prepared['source_sha256'],
             'lineage': prepared['lineage'],
             'parent_content': (prepared['files'].get('parent-procedure.md') or
                                prepared['files'].get('parent-experience.txt') or b'').decode('utf-8'),
             'images': prepared['images'], 'image_selection': prepared['image_selection'],
-            'drafts': sorted(drafts, key=lambda d: d['created_at'], reverse=True), 'input': prepared['input']}
+            'drafts': existing_run_drafts(root, run_id), 'input': prepared['input'],
+            'knowledge_base': prepared['knowledge_base']}
 
 
 def with_compilation_guidance(prepared, guidance):
@@ -366,13 +412,28 @@ def prepare_draft_revision(root, identifier, *, draft_sha256, guidance):
         raise ValueError('请填写希望怎样修改这份草稿')
     directory = draft_directory(root, identifier)
     payload = json.loads((directory / 'compiler-input.txt').read_bytes())
+    knowledge_base = None
     archive = directory / 'evidence/run.json'
     if archive.is_file():
         previous_guidance = payload.get('compilation_guidance')
-        payload = method_evidence(json.loads(archive.read_bytes()), draft['compiler_images'])
+        evidence = json.loads(archive.read_bytes())
+        knowledge_base = evidence.get('knowledge_base')
+        if draft.get('knowledge_base') and (knowledge_text := payload.get('knowledge_base')):
+            knowledge_base = {**draft['knowledge_base'], 'content': knowledge_text['content']}
+        payload = _compilation_payload(evidence, draft['compiler_images'])
+        if knowledge_base and knowledge_base['content']:
+            payload['knowledge_base'] = _knowledge_text(knowledge_base)
         if previous_guidance:
             payload['compilation_guidance'] = previous_guidance
     payload['draft_revision'] = {'previous_draft': draft['content'], 'guidance': guidance.strip()}
+    if draft.get('knowledge_content'):
+        from trace2task.application_knowledge import read_knowledge
+
+        payload['draft_revision']['previous_knowledge_draft'] = draft['knowledge_content']
+        current = read_knowledge(root, draft['knowledge_base']['id'])
+        if current and current['content'] == draft['knowledge_content']:
+            knowledge_base = current
+            payload['knowledge_base'] = _knowledge_text(current)
     files = {name: (directory / name).read_bytes() for name in draft['artifact_sha256']
              if name.startswith('evidence/') or name in {'parent-procedure.md', 'parent-experience.txt'}}
     files['previous-draft.md'] = draft['content'].encode('utf-8')
@@ -381,6 +442,7 @@ def prepare_draft_revision(root, identifier, *, draft_sha256, guidance):
     return {'summary': draft['summary'], 'source_sha256': draft['source_sha256'],
             'lineage': draft.get('lineage'), 'files': files, 'input': model_json(payload, sort_keys=True),
             'images': deduplicate_images(draft['compiler_images'])[0], 'image_selection': draft['image_selection'],
+            'compile_knowledge': draft.get('compile_knowledge', False), 'knowledge_base': knowledge_base,
             'authoring': {'kind': 'feedback', 'guidance': guidance.strip(), 'base_draft_id': identifier,
                           'base_draft_sha256': draft_sha256,
                           'base_experience_id': draft['saved_trace_id'] or (draft.get('authoring') or {}).get('base_experience_id'),
@@ -427,7 +489,7 @@ def edit_draft(root, identifier, *, draft_sha256, content):
             fromfile='parent-procedure.md', tofile='model-input.txt')).encode('utf-8'))
     meta = {k: v for k, v in draft.items() if k not in {
         'draft_id', 'draft_sha256', 'content', 'parent_content', 'revision_diff', 'saved_trace_id',
-        'saved_versioning', 'save_options'}}
+        'saved_versioning', 'save_options', 'knowledge_content'}}
     meta.update(trace_name=name, description=description,
                 authoring={**prepared['authoring'], 'kind': 'edit', 'guidance': ''},
                 revision_changed=not unchanged if parent_text else None,
@@ -440,6 +502,8 @@ def edit_draft(root, identifier, *, draft_sha256, content):
 
 def compile_run_draft(root, prepared, *, model, reasoning_effort, stop_event=None,
                       publish_lock=None, progress=None, on_round=None, session_factory=None, binary_resolver=None):
+    from trace2task.application_knowledge import COMPILER_RULE, knowledge_header, validate_content
+
     stop_event = stop_event or threading.Event()
     _check_cancel(stop_event)
     CodexModelCatalog(root).validate(model, reasoning_effort)
@@ -448,6 +512,24 @@ def compile_run_draft(root, prepared, *, model, reasoning_effort, stop_event=Non
     prompt = (PROMPT + EVIDENCE_INSTRUCTIONS + (FEEDBACK_INSTRUCTIONS if prepared.get('lineage') else '')
               + (HUMAN_INSTRUCTIONS if prepared['summary'].get('assisted_by_user') else '')
               + (AUTHORING_INSTRUCTIONS if prepared.get('authoring') else ''))
+    knowledge_base = prepared.get('knowledge_base')
+    compile_knowledge = prepared.get('compile_knowledge', False)
+    schema = None
+    if knowledge_base and (knowledge_base['content'] or compile_knowledge):
+        prompt = prompt.replace('使用者只会得到本文和当前任务。', '使用者还可以单独加载同一应用的底层知识。')
+        prompt += ('\n' + COMPILER_RULE + ' knowledge_base 是当前可维护的参考版本。'
+                   'run_loaded_application_knowledge 为真时，运行曾加载知识。'
+                   '若 knowledge_used 存在，它是与当前参考不同的运行快照。')
+    if compile_knowledge:
+        if not knowledge_base:
+            raise ValueError('缺少可维护的应用知识范围')
+        prompt = prompt.replace('只输出 Markdown 方法正文：', '任务经验 Markdown 正文：')
+        prompt += ('\n返回 JSON。experience 按原要求写任务方法 Markdown。application_knowledge 写可独立维护的完整底层知识 Markdown，'
+                   '保留仍成立的已有知识，仅补充或纠正有证据的通用机制，最多 6000 字。无可确认的变化时该字段填空字符串。'
+                   '用户修订要求可能同时涉及两份正文，请按对应范围修改。')
+        schema = {'type': 'object', 'additionalProperties': False,
+                  'properties': {'experience': {'type': 'string'}, 'application_knowledge': {'type': 'string'}},
+                  'required': ['experience', 'application_knowledge']}
     directory = draft_directory(root, identifier)
     directory.mkdir(parents=True, exist_ok=False)
     for filename, data in prepared['files'].items():
@@ -501,16 +583,27 @@ def compile_run_draft(root, prepared, *, model, reasoning_effort, stop_event=Non
                      if prepared.get('lineage') else '正在把已冻结轨迹提炼为方法草稿；不执行任务、不自动入库。')
         _check_cancel(stop_event)
         output = session.run_turn(prompt=prepared['input'], image_path=paths[0] if paths else None,
-                                  additional_image_paths=paths[1:], output_schema=None)
+                                  additional_image_paths=paths[1:], output_schema=schema)
         if not isinstance(output, str):
             raise TypeError('模型未返回方法文本')
         (directory / 'model-output.md').write_bytes(output.encode('utf-8'))
         entry['raw_output'] = output
         _check_cancel(stop_event)
+        knowledge_content = ''
+        if compile_knowledge:
+            parsed = json.loads(output)
+            if (not isinstance(parsed, dict) or set(parsed) != {'experience', 'application_knowledge'}
+                    or any(not isinstance(value, str) for value in parsed.values())):
+                raise ValueError('编译器返回的经验与底层知识格式无效')
+            output = parsed['experience']
+            if parsed['application_knowledge'].strip():
+                knowledge_content = validate_content(parsed['application_knowledge'])
         name, description, parent_text, unchanged = _validate_draft_content(output, prepared)
         if any(digest(directory / filename) != expected for filename, expected in frozen.items()):
             raise ValueError('提炼期间证据发生变化，未发布草稿')
         (directory / 'model-input.txt').write_bytes(output.encode('utf-8'))
+        if knowledge_content and knowledge_content != knowledge_base['content']:
+            (directory / 'knowledge-draft.md').write_bytes(knowledge_content.encode('utf-8'))
         if parent_text:
             (directory / 'revision.diff').write_bytes(''.join(unified_diff(
                 parent_text.splitlines(keepends=True), output.splitlines(keepends=True),
@@ -526,6 +619,8 @@ def compile_run_draft(root, prepared, *, model, reasoning_effort, stop_event=Non
                 'created_at': datetime.now(UTC).isoformat(timespec='microseconds'),
                 'artifact_sha256': {p.relative_to(directory).as_posix(): digest(p)
                                     for p in directory.rglob('*') if p.is_file()}}
+        if compile_knowledge:
+            meta.update(compile_knowledge=True, knowledge_base=knowledge_header(knowledge_base))
         with publish_lock if publish_lock is not None else nullcontext():
             _check_cancel(stop_event)
             (directory / 'draft.json').write_bytes(encoded(meta))

@@ -45,14 +45,27 @@ def java_helper(tmp_path_factory):
 def output_for(java_helper, command, *, keep_open=False, **options):
     process = java_helper(**options)
     try:
-        if keep_open:
-            process.stdin.write(command)
+        prefix = ''
+        if command.startswith('START '):
+            first, _, command = command.partition('\n')
+            process.stdin.write(first + '\n')
             process.stdin.flush()
+            # Real clients wait for activation before issuing another command.
+            # Cancellation during activation is exercised separately below.
+            while True:
+                line = process.stdout.readline()
+                prefix += line
+                if not line or line.startswith(('T2T2 STARTED', 'T2T2 ERROR', 'T2T2 RELEASED')):
+                    break
+        if keep_open:
+            if command:
+                process.stdin.write(command)
+                process.stdin.flush()
             process.wait(timeout=3)
             output = process.stdout.read()
         else:
             output, _ = process.communicate(command, timeout=3)
-        return output
+        return prefix + output
     finally:
         if process.poll() is None:
             process.kill()
@@ -84,6 +97,86 @@ def test_device_watchdog_releases_without_host_up(java_helper):
     assert len({e[5] for e in events}) == 1  # Same downTime through MOVE and UP.
     assert 100 <= int(events[-1][6]) - int(events[0][6]) < 800
     assert 'T2T2 RELEASED deadline' in output
+
+
+def test_first_move_waits_for_a_floating_control_to_activate(java_helper):
+    output = output_for(java_helper, 'START 240 64 192 100 192\n', keep_open=True)
+    events = injections(output)
+    assert [e[1] for e in events] == ['0', '2', '1']
+    # A frame-based control must observe its initial contact before displacement.
+    # Same-frame DOWN/MOVE can initialize a floating joystick at the endpoint.
+    assert int(events[1][6]) - int(events[0][6]) >= 50
+    assert events[0][2:4] == ['64.0', '192.0']
+    assert events[1][2:4] == events[2][2:4] == ['100.0', '192.0']
+    assert len({e[5] for e in events}) == 1
+    assert 220 <= int(events[-1][6]) - int(events[0][6]) < 700
+
+
+def test_short_lease_releases_without_a_late_activation_move(java_helper):
+    output = output_for(java_helper, 'START 20 64 192 100 192\n', keep_open=True)
+    events = injections(output)
+    assert [e[1] for e in events] == ['0', '1']
+    assert events[0][2:4] == events[-1][2:4] == ['64.0', '192.0']
+    assert int(events[-1][6]) - int(events[0][6]) < 250
+    assert 'T2T2 RELEASED deadline' in output
+
+
+def test_focus_change_during_activation_releases_before_first_move(java_helper):
+    output = output_for(java_helper, 'START 1000 64 192 100 192\n',
+                        flags=('-Dtest.focusChangesAt=3',))
+    assert [e[1] for e in injections(output)] == ['0', '1']
+    assert 'T2T2 ERROR' in output
+
+
+@pytest.mark.parametrize('suffix', ['', 'UP\n'])
+def test_cancel_during_activation_never_sends_the_pending_move(java_helper, suffix):
+    process = java_helper()
+    try:
+        output, _ = process.communicate('START 1000 64 192 100 192\n' + suffix, timeout=3)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+    events = injections(output)
+    assert [e[1] for e in events] == ['0', '1']
+    assert events[-1][2:4] == ['64.0', '192.0']
+    assert 'T2T2 STARTED' not in output
+    assert 'T2T2 RELEASED requested' in output
+
+
+def test_activation_scope_check_cannot_block_deadline_release(java_helper):
+    output = output_for(java_helper, 'START 200 64 192 100 192\n', keep_open=True,
+                        flags=('-Dtest.scopeDelayAt=3', '-Dtest.scopeDelayMs=1200'))
+    events = injections(output)
+    assert [e[1] for e in events] == ['0', '1']
+    assert int(events[-1][6]) - int(events[0][6]) < 700
+    assert 'T2T2 RELEASED deadline' in output
+
+
+@pytest.mark.parametrize('suffix', ['', 'UP\n'])
+def test_activation_scope_check_cannot_block_host_release(java_helper, suffix):
+    process = java_helper(flags=('-Dtest.scopeDelayAt=3', '-Dtest.scopeDelayMs=1200'))
+    prefix = ''
+    try:
+        process.stdin.write('START 60000 64 192 100 192\n')
+        process.stdin.flush()
+        while True:
+            line = process.stdout.readline()
+            prefix += line
+            assert line, prefix
+            if line.startswith('INJECT 0 '):
+                break
+        time.sleep(.15)  # Activation is blocked in the fake Android window service.
+        began = time.monotonic()
+        output, _ = process.communicate(suffix, timeout=2)
+        assert time.monotonic() - began < .7
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+    assert [e[1] for e in injections(prefix + output)] == ['0', '1']
+    assert 'T2T2 STARTED' not in output
+    assert 'T2T2 RELEASED requested' in output
 
 
 @pytest.mark.parametrize('duration', [60000, 2**63 - 1])
@@ -143,14 +236,14 @@ def test_device_rejects_reused_transport_after_boot_change(java_helper):
 
 def test_focus_change_before_correction_releases_instead_of_moving(java_helper):
     output = output_for(java_helper, 'START 1000 64 192 64 150\nMOVE 80 160\n',
-                        flags=('-Dtest.focusChangesAt=3',))
+                        flags=('-Dtest.focusChangesAt=4',))
     assert [e[1] for e in injections(output)] == ['0', '2', '1']
     assert 'T2T2 ERROR' in output
 
 
 def test_focus_change_before_heartbeat_releases_without_direction_change(java_helper):
     output = output_for(java_helper, 'START 60000 64 192 64 150\nKEEPALIVE\n',
-                        flags=('-Dtest.focusChangesAt=3',))
+                        flags=('-Dtest.focusChangesAt=4',))
     assert [e[1] for e in injections(output)] == ['0', '2', '1']
     assert 'T2T2 ERROR' in output and 'T2T2 ALIVE' not in output
 
@@ -298,7 +391,7 @@ def test_stop_during_start_ack_wait_remains_immediate(monkeypatch):
 def test_long_hold_failures_surface_even_without_waiting_for_more_commands(client, kind):
     phone, state, stop, launches, _events, _commands = client
     if kind == 'focus':
-        phone.test_flags = ('-Dtest.focusChangesAt=3',)
+        phone.test_flags = ('-Dtest.focusChangesAt=4',)
     session = BoundedTouchSession(phone, state, stop)
     try:
         session.open()

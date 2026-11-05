@@ -71,6 +71,32 @@ test('preview discloses real source and sends nothing until generate; cancellati
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
 });
 
+test('application knowledge and experience are reviewed and saved separately', async ({page}) => {
+  const f = await fixture(page);
+  const profile = {id: 'game-knowledge', scope: 'android', application: 'com.example.game', sha256: '', revision: 0};
+  await page.route('**/api/run-experience/preview', route => route.fulfill({json: {...f.summary, images: f.images,
+    source_sha256: 'source-digest', drafts: [], input: '{}', knowledge_base: {...profile, content: ''}}}));
+  await page.route('**/api/run-experience/draft', route => route.fulfill({json: {
+    draft_id: 'draft-1', draft_sha256: 'draft-digest', content: f.content, summary: f.summary, compiler_images: [],
+    compile_knowledge: true, knowledge_base: profile, knowledge_content: '战斗工具栏包含自动战斗控件。'}}));
+  await page.route('**/api/application-knowledge/save', route => route.fulfill({json: {...profile, revision: 1}}));
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  await page.getByRole('checkbox', {name: '同时提炼应用底层知识 · com.example.game'}).check();
+  await page.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  expect(f.writes.find(write => write.path.endsWith('/generate'))?.body.compile_knowledge).toBe(true);
+  await page.getByRole('button', {name: '审阅经验草稿', exact: true}).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('战斗工具栏包含自动战斗控件。');
+  const refreshed = page.waitForResponse(response => response.url().includes('/api/state?compact=1'));
+  await dialog.getByRole('button', {name: '确认保存底层知识'}).click();
+  await refreshed;
+  await expect(dialog.getByRole('status')).toContainText('底层知识已保存');
+  expect(f.writes.find(write => write.path === '/api/application-knowledge/save')?.body).toEqual({
+    draft_id: 'draft-1', draft_sha256: 'draft-digest',
+  });
+  expect(f.writes.some(write => write.path === '/api/run-experience/save')).toBe(false);
+});
+
 test('draft is digest-bound, saved only after review, never selected or executed automatically', async ({page}, info) => {
   const f = await fixture(page);
   await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
@@ -200,6 +226,27 @@ test('preview opens immediately with a local loading state before the response a
   await expect(page.getByRole('button', {name: '提炼为经验', exact: true})).toBeEnabled();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   expect(f.writes.every(w => w.path === '/api/run-experience/preview')).toBe(true);
+});
+
+test('generation progress and request errors stay visible next to the submit button', async ({page}) => {
+  await fixture(page);
+  let respond!: () => void;
+  const held = new Promise<void>(resolve => {respond = resolve;});
+  await page.route('**/api/run-experience/generate', async route => {
+    await held;
+    return route.fulfill({status: 400, json: {error: '请刷新 Codex 模型目录后重试'}});
+  });
+  await page.getByRole('button', {name: '提炼为经验', exact: true}).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.locator('.studio-content').evaluate(el => {el.scrollTop = el.scrollHeight;});
+  await dialog.getByRole('button', {name: '生成经验草稿', exact: true}).click();
+  try {
+    await expect(dialog.getByRole('status')).toHaveText('正在核对轨迹并提交提炼请求…');
+    await expect(dialog.getByRole('status')).toBeInViewport();
+  } finally {respond();}
+  await expect(dialog.getByRole('alert')).toHaveText('Error: 请刷新 Codex 模型目录后重试');
+  await expect(dialog.getByRole('alert')).toBeInViewport();
+  await expect(dialog.getByRole('button', {name: '生成经验草稿', exact: true})).toBeEnabled();
 });
 
 test('studio fits a narrow window and leaves footer actions reachable', async ({page}, info) => {

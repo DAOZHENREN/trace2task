@@ -86,6 +86,9 @@ class ChatRunAudit:
                          prediction=output.get("prediction"), verification=output.get("verification"))
             if output.get("error"):
                 entry["error"] = output["error"]
+            for key in ('model_role', 'actual_model', 'subtask', 'output_directory'):
+                if key in output:
+                    entry[key] = output[key]
             self.record("model_output", step_index=step, output={
                 key: value for key, value in output.items()
                 if key not in {"prompt", "schema", "input_messages"}},

@@ -89,6 +89,65 @@ def test_request_id_is_strict(service_module, tmp_path):
             engine._request_id(value)
 
 
+def test_guided_conversation_keeps_only_confirmed_actions(service_module, tmp_path, monkeypatch):
+    _install_predict_fakes(monkeypatch)
+    engine = _engine_with_model(service_module, tmp_path, lambda **kwargs: _FakeTensor([1, 2, 3, 99]))
+    start = _request('guided-first')
+    start.update(conversation_id='guided-test-run', conversation_start=True,
+                 guided_history_offset=0, guided_history=[], guided_knowledge='\nCombat toolbar layout')
+    first = engine.predict(start)
+    assert first['status'] == 'predicted'
+    first_archive = json.loads((Path(first['output_directory']) / 'input.json').read_text(encoding='utf-8'))
+    assert 'Combat toolbar layout' in json.dumps(first_archive['messages'][1])
+    conversation = engine.conversation
+    assert conversation.total_turns == 0
+
+    followup = {**start, 'request_id': 'guided-second', 'conversation_start': False,
+                'task': 'A different subgoal',
+                'guided_history': [{'raw_output': 'confirmed click', 'image': start['image']}]}
+    with pytest.raises(ValueError, match='底层知识仅可在混合会话首轮提交'):
+        engine.predict(followup)
+    del followup['guided_knowledge']
+    result = engine.predict(followup)
+    assert result['status'] == 'predicted'
+    assert engine.conversation is conversation
+    assert conversation.total_turns == 1
+    assert conversation.turns[0][1] == 'confirmed click'
+    archive = json.loads((Path(result['output_directory']) / 'input.json').read_text(encoding='utf-8'))
+    assert 'A different subgoal' in json.dumps(archive['messages'][-1])
+    assert 'Combat toolbar layout' in json.dumps(archive['messages'][1])
+    with pytest.raises(ValueError, match='out of sequence'):
+        engine.predict(followup)
+    assert conversation.total_turns == 1
+
+
+def test_guided_slot_reader_uses_stored_knowledge_with_fresh_notices(service_module, tmp_path, monkeypatch):
+    _install_predict_fakes(monkeypatch)
+    engine = service_module.Engine(tmp_path, tmp_path / 'output', backend='slotread')
+    instructions = []
+
+    def slot_predict(_request, _key, _image, _folder, _save, _cancelled, request_id,
+                     _conversation, _history, instruction, _experience, _review):
+        instructions.append(instruction)
+        engine.finish_cancellation(request_id)
+        return {'status': 'predicted'}
+
+    monkeypatch.setattr(engine, '_predict_slots', slot_predict)
+    start = _request('guided-slot-first')
+    start.update(model='gui-decisions-2b', conversation_id='guided-slot-run', conversation_start=True,
+                 guided_history_offset=0, guided_history=[], guided_knowledge='\nCombat toolbar layout',
+                 task='Fight\nNotices: ["Wait while auto battle runs."]')
+    engine.predict(start)
+    followup = {**start, 'request_id': 'guided-slot-next', 'conversation_start': False,
+                'task': 'Check results\nNotices: ["Verify the reward screen."]'}
+    del followup['guided_knowledge']
+    engine.predict(followup)
+    assert all('Combat toolbar layout' in instruction for instruction in instructions)
+    assert 'Wait while auto battle runs.' in instructions[0]
+    assert 'Wait while auto battle runs.' not in instructions[1]
+    assert 'Verify the reward screen.' in instructions[1]
+
+
 def test_generation_stopper_reads_event(service_module):
     event = threading.Event()
     stopper = service_module._CancelGeneration(event)
@@ -810,6 +869,29 @@ def test_backend_capabilities_stay_out_of_native_model_input(service_module, tmp
     assert 'Cua window' not in text
 
 
+@pytest.mark.parametrize('model', ['qwen3-vl-2b', 'gui-owl-2b', 'mai-ui-2b'])
+def test_android_environment_and_native_limits_survive_conversation_turns(
+        service_module, tmp_path, monkeypatch, model):
+    _install_predict_fakes(monkeypatch)
+    monkeypatch.setattr(service_module, 'decode', lambda *args, **kwargs: {
+        'actions': [{'skill': 'wait', 'args': {'duration_ms': 100}}]})
+    engine = _engine_with_model(service_module, tmp_path, lambda **kwargs: _FakeTensor([1, 2, 3, 99]))
+    for index in range(2):
+        request = _request(f'android-round-{index}')
+        request.update(model=model, conversation_id='android-conversation', conversation_start=index == 0,
+            execution_context={'target': {'kind': 'android'}, 'capabilities': {
+                'available_skills': ['click', 'drag', 'press_key', 'wait', 'joystick_move']}})
+        result = engine.predict(request)
+        assert result['status'] == 'predicted', result
+        data = json.loads((Path(result['output_directory']) / 'input.json').read_text(encoding='utf-8'))
+        text = json.dumps(data['messages'], ensure_ascii=False)
+        assert 'selected Android app' in text
+        assert 'tap, swipe, Back, wait' in text
+        assert '1500 ms' in text and 'Android Back' in text
+        assert 'joystick_move' not in text
+        assert 'This environment is Windows desktop' not in text
+
+
 def test_win32_rejection_stays_out_of_model_prompt(
         service_module, tmp_path, monkeypatch):
     _install_predict_fakes(monkeypatch)
@@ -855,3 +937,19 @@ def test_cleanup_metric_failure_does_not_erase_prediction(service_module, tmp_pa
     assert result["status"] == "predicted"
     assert "cleanup unavailable" in result["metrics"]["memory"]["cleanup_error"]
     assert result["peak_reserved_bytes"] == 5
+
+
+
+def test_v6_replay_reaches_transformers_without_unexecuted_old_dialogue(service_module, tmp_path, monkeypatch):
+    _install_predict_fakes(monkeypatch)
+    engine = _engine_with_model(service_module, tmp_path, lambda **kw: _FakeTensor([1, 2, 3, 99]))
+    request = _request('v6-transformers')
+    request['guided_history'] = [{'raw_output': 'first delivered'},
+        {'raw_output': 'second delivered', 'image': request['image']}]
+    result = engine.predict(request)
+    assert result['status'] == 'predicted', result
+    archived = json.loads((Path(result['output_directory']) / 'input.json').read_text(encoding='utf-8'))
+    assert [m['content'] for m in archived['messages'] if m['role'] == 'assistant'] == ['first delivered', 'second delivered']
+    assert archived['configuration']['image_count'] == 2
+    assert archived['context_management']['policy'] == 'guided_v6_all_stage_text_last_two_images'
+    assert engine.conversation is None

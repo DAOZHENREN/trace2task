@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import re
 import threading
+import uuid
 from datetime import UTC, datetime
 
 MAX_COMMANDS = 32
@@ -25,6 +26,7 @@ class RunInterventions:
         self.on_change = on_change or (lambda state: None)
         self.record = None
         self.directory = None
+        self.pending_capture = None
         self.state = {'supported': True, 'visual_supported': True, 'phase': 'starting', 'revision': 0, 'version': 0,
                       'assisted_by_user': False, 'commands': [], 'takeovers': [],
                       'message': '正在准备设备与经验；准备完成后可以干预。'}
@@ -83,6 +85,8 @@ class RunInterventions:
                 raise RuntimeError('已经在交接或接管中，请等待当前交接完成')
             if kind == 'resume' and phase != 'paused':
                 raise RuntimeError('只有确认暂停后才能交还模型')
+            if kind == 'resume' and self.pending_capture is not None:
+                raise RuntimeError('正在截取实时画面，请等待截图完成再交还')
             if kind == 'pause' and len(self.state['takeovers']) >= MAX_TAKEOVERS:
                 raise ValueError(f'本次运行最多接管 {MAX_TAKEOVERS} 次')
             # Reserve a request slot for returning an active takeover.
@@ -127,6 +131,51 @@ class RunInterventions:
         with self.lock:
             return self.state['phase'] == 'running' and self.state['revision'] == revision
 
+    def capture_reference(self, takeover_id, *, timeout=30):
+        """Queue capture on the device thread; HTTP never owns the device."""
+        with self.lock:
+            if (self.state['phase'] != 'paused' or not self.state['takeovers']
+                    or self.state['takeovers'][-1]['id'] != takeover_id):
+                raise RuntimeError('请在当前接管确认暂停后截取实时画面')
+            segment = self.state['takeovers'][-1]
+            if self.pending_capture is not None:
+                raise RuntimeError('正在截图，请稍候')
+            if len(segment.get('captures', {})) >= 64:
+                raise ValueError('本次接管实时截图已达 64 张上限')
+            request = {'id': uuid.uuid4().hex, 'done': threading.Event(), 'segment': segment}
+            self.pending_capture = request
+        if not request['done'].wait(timeout):
+            with self.lock:
+                if self.pending_capture is request:
+                    self.pending_capture = None
+            raise RuntimeError('实时截图超时，请重试；原截图已保留')
+        if request.get('error'):
+            raise RuntimeError(request['error'])
+        return {'capture_id': request['id'], 'picture': request['picture']}
+
+    def _capture_reference(self, capture, stop):
+        with self.lock:
+            request = self.pending_capture
+        if request is None:
+            return
+        try:
+            picture = capture(request['segment']['id'], f'live-{request["id"]}')
+            stop.raise_if_requested()
+            with self.lock:
+                if self.pending_capture is request and self.state['phase'] == 'paused':
+                    request['picture'] = picture
+                    request['segment'].setdefault('captures', {})[request['id']] = picture
+                    self._publish()
+                else:
+                    request['error'] = '截图已取消，请重新截图'
+        except (RuntimeError, ValueError, OSError) as error:
+            request['error'] = str(error)
+        finally:
+            with self.lock:
+                if self.pending_capture is request:
+                    self.pending_capture = None
+                request['done'].set()
+
     def admit_action(self, revision):
         """Linearization point: at most this single admitted action may finish.
 
@@ -150,6 +199,7 @@ class RunInterventions:
                     raise RuntimeError('干预会话已经结束')
                 segment = self.state['takeovers'][-1] if self.state['takeovers'] else None
             if phase == 'paused':
+                self._capture_reference(capture, stop)
                 stop.sleep(.1)
                 continue
             if phase not in {'pausing', 'resuming'} or segment is None:
@@ -223,6 +273,10 @@ class RunInterventions:
         with self.lock:
             if self.state['phase'] == 'closed':
                 return
+            if self.pending_capture is not None:
+                self.pending_capture['error'] = '运行已结束，实时截图已取消'
+                self.pending_capture['done'].set()
+                self.pending_capture = None
             for segment in self.state['takeovers']:
                 if segment['status'] != 'returned':
                     segment.update(status='not_returned', ended_at=now())

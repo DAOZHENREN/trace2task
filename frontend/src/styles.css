@@ -25,6 +25,10 @@
 .annotation-surface img {display:block; width:100%; height:auto; user-select:none;}
 .annotation-surface svg {position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair;}
 .annotation-surface svg>* {pointer-events:none;}
+.annotation-extras {display:flex; flex-wrap:wrap; gap:12px; margin-top:12px;}
+.annotation-extras figure {margin:0; width:180px; max-width:100%;}
+.annotation-extras img {width:100%; height:110px; object-fit:contain; background:#edf3ef; border-radius:6px;}
+.annotation-extras figcaption {font-size:12px; margin:4px 0;}
 @media(max-width:600px) {.run-interventions {padding:14px;} .run-interventions>.row-between {flex-wrap:wrap; gap:8px;} .handoff-pictures {grid-template-columns:1fr;}}
 
 /* Run-to-experience studio: evidence on the left, a readable method on paper. */
@@ -97,7 +101,8 @@
 .studio-save-options .field {margin-top:12px;}
 .studio-review p {display:flex; align-items:flex-start; gap:8px; color:#35664b; font-size:12px;}
 .studio-review p svg {flex-shrink:0; margin-top:2px;}
-.studio-actions {display:flex!important; align-items:center!important; gap:10px!important; padding:17px 26px!important; background:#fff; border-top:1px solid #e3e8de;}
+.studio-actions {display:flex!important; align-items:center!important; flex-wrap:wrap; gap:10px!important; padding:17px 26px!important; background:#fff; border-top:1px solid #e3e8de;}
+.studio-submit-feedback {flex-basis:100%; margin:0; overflow-wrap:anywhere;}
 .studio-actions>.quiet {margin-right:auto; font-size:11px;}
 @media(max-width:800px) {
   .studio-grid {grid-template-columns:210px minmax(0,1fr);}
@@ -217,15 +222,22 @@ main {width:100%; max-width:1280px; margin:0 auto; padding:28px 32px 36px; flex:
 .composer-top .quiet {font-size:10px; letter-spacing:.3px;}
 .task-textarea {width:100%; border:0!important; background:#fff!important; box-shadow:none!important; border-radius:0!important; padding:0!important;}
 .task-textarea:after {display:none!important;}
-.task-textarea textarea {font-size:16px; line-height:1.8; min-height:112px; padding:12px 0 18px; color:var(--ink);}
+.task-textarea textarea {font-size:16px; line-height:1.8; min-height:80px; padding:12px 0 18px; color:var(--ink);}
 .task-textarea textarea::placeholder {color:#9aa69a;}
 .task-textarea:focus-within {outline:2px solid #c1d4c5; outline-offset:6px;}
 .composer-fields {display:grid; grid-template-columns:1fr 1.5fr 1.5fr; gap:16px; margin:16px 0 20px;}
 .composer-fields.codex-fields {grid-template-columns:minmax(0,.85fr) minmax(0,1.4fr) minmax(0,.65fr) minmax(0,1.6fr);}
 .composer-fields.codex-fields .field:last-child {grid-column:auto;}
+.composer-fields.hybrid-limit-fields {grid-template-columns:repeat(4,minmax(0,1fr));}
+.composer-fields.hybrid-limit-fields .field:last-child {grid-column:auto;}
+@media(max-width:1100px) {.composer-fields.hybrid-limit-fields {grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:650px) {.composer-fields.hybrid-limit-fields {grid-template-columns:1fr;}}
 @media(max-width:1100px) {.composer-fields.codex-fields {grid-template-columns:1fr 1fr;}}
 .scope-row {display:grid; grid-template-columns:1.25fr 1fr 1fr; align-items:end; gap:16px; margin-bottom:4px;}
-.execution-setup {margin:0 -24px; padding:18px 24px 22px; background:#fafbfa; border-top:1px solid var(--line);}
+.execution-setup {margin:0 -24px; padding:16px 24px 12px; background:#fafbfa; border-top:1px solid var(--line);}
+.execution-setup .setup-heading {flex-wrap:wrap; gap:12px;}
+.execution-mode .field {display:flex; align-items:center; gap:10px;}
+.execution-mode .field label {white-space:nowrap;}
 .setup-heading {display:flex; align-items:center; justify-content:space-between; gap:12px;}
 .step-marker {font:10px/22px "Cascadia Code",monospace; display:inline-block; width:25px; text-align:center; border:1px solid #dbe5df; border-radius:6px; color:#527568; background:#f0f5f2; margin-right:9px; letter-spacing:0;}
 .scope-note {display:flex; gap:7px; align-items:center; color:var(--muted); font-size:11px; align-self:center; justify-self:end; padding-top:22px;}
@@ -472,3 +484,8 @@ details>summary {color:#657665; font-size:12px; cursor:pointer; padding:9px 0; m
 .studio-editor textarea {min-height:360px; font:13px/1.7 Consolas,monospace;}
 .studio-guidance textarea,.studio-revision textarea {min-height:100px;}
 .studio-edit-actions {display:flex; gap:10px; flex-wrap:wrap; margin:12px 0;}
+.chatgpt-browser .panel-heading {flex-wrap:wrap; gap:12px;}
+@media(max-width:650px) {
+  .chatgpt-browser .row-between {flex-direction:column; align-items:stretch; gap:12px;}
+  .chatgpt-browser .button-row {flex-direction:column; align-items:stretch;}
+}

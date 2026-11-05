@@ -208,8 +208,9 @@ def method_evidence(evidence, images):
                 if type(command.get(key)) is int:
                     command[key] += 1
             if command.get('visual'):
-                command['visual'].pop('strokes', None)
-                command['visual'].pop('coordinate_space', None)
+                for reference in [command['visual'], *command['visual'].get('extras', [])]:
+                    reference.pop('strokes', None)
+                    reference.pop('coordinate_space', None)
         # A resume command and its takeover note often contain exactly the same user text.
         notes = {c.get('text'): c['index'] for c in human['commands'] if c.get('text')}
         for takeover in human['takeovers']:

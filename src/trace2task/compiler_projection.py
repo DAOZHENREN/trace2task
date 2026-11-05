@@ -111,15 +111,20 @@ def compiler_round(entry):
 def _human(value):
     if not value:
         return None
+    def reference(visual):
+        result = {**_fields(visual, ('origin', 'strokes', 'coordinate_space', 'meaning')),
+                  'source': {'id': visual['source']['id']}, 'image': {'id': visual['image']['id']}}
+        if visual.get('extras'):
+            result['extras'] = [reference(extra) for extra in visual['extras']]
+        return result
+
     result = _fields(value, ('condition', 'precise_actions_recorded'))
     result['commands'] = [_fields(command, ('id', 'index', 'kind', 'text', 'status', 'revision',
                            'submitted_round', 'responded_round', 'takeover_id')) for command in value['commands']]
     for command, projected in zip(value['commands'], result['commands'], strict=True):
         if command.get('visual'):
             visual = command['visual']
-            projected['visual'] = {**_fields(visual, ('origin', 'strokes', 'coordinate_space', 'meaning')),
-                                   'source': {'id': visual['source']['id']},
-                                   'image': {'id': visual['image']['id']}}
+            projected['visual'] = reference(visual)
     result['takeovers'] = []
     for segment in value['takeovers']:
         item = _fields(segment, ('id', 'status', 'note', 'before_error', 'return_error'))

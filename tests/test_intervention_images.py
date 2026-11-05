@@ -217,3 +217,135 @@ def test_visual_cannot_bypass_explicit_pause(tmp_path):
     with pytest.raises(ValueError, match='先暂停'):
         control.request(request_id='visual-02', kind='instruction', text='try', visual=upload())
     assert not control.snapshot()['commands'] and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('provider', ['codex', 'api'])
+def test_live_capture_uses_device_thread_and_multiple_references_reach_model(phone, tmp_path, provider, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _, data = phone
+    control = RunInterventions()
+    work = []
+    main_thread = threading.get_ident()
+    from trace2task.android_execution import AndroidObservation
+    original = AndroidObservation.intervention_snapshot
+    def capture(observer, identifier, phase):
+        assert threading.get_ident() == main_thread
+        return original(observer, identifier, phase)
+    monkeypatch.setattr(AndroidObservation, 'intervention_snapshot', capture)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def return_with_capture(segment):
+            assert threading.get_ident() != main_thread
+            data.update(rotation=0, size=(720, 1280))
+            result = control.capture_reference(segment['id'])
+            assert control.snapshot()['phase'] == 'paused'
+            assert not inputs(data)
+            picture = result['picture']
+            assert (picture['width'], picture['height']) == (720, 1280)
+            assert picture['sha256'] != segment['before']['sha256']
+            visual = {**upload(), 'extras': [
+                {'takeover_id': segment['id'], 'capture_id': result['capture_id'],
+                 'source_sha256': picture['sha256'], 'strokes': []},
+                {**upload((100, 200)), 'strokes': []}]}
+            return control.request(request_id='live-resume-01', kind='resume', visual=visual)
+
+        def changed(state):
+            if state['phase'] == 'paused' and not work:
+                work.append(pool.submit(return_with_capture, state['takeovers'][-1]))
+        control.on_change = changed
+        session = HookSession([_reply([action('click', x=.1, y=.1).to_payload()]),
+                               _reply([action('click', x=.8, y=.8).to_payload()])],
+            lambda n: control.request(request_id='pause-001', kind='pause') if n == 1 else None)
+        result = run_phone(tmp_path, control, session, max_actions=1,
+                           **({'api_config': object()} if provider == 'api' else {}))
+        state = work[0].result(timeout=2)
+    assert result['actions'] == 1 and len(session.requests) == 2
+    visual = state['commands'][-1]['visual']
+    assert visual['extras'][0]['origin'] == 'live_snapshot'
+    assert visual['extras'][0]['strokes'] == []
+    assert 'additional 1=image' in session.requests[1]['prompt']
+    assert 'additional 2=image' in session.requests[1]['prompt']
+    assert Path(visual['extras'][1]['source']['path']) in session.requests[1]['additional_image_paths']
+    assert 'upload_data_url' not in json.dumps(state)
+
+
+@pytest.mark.parametrize('extras', [[{**upload(), 'strokes': STROKES}],
+    [{**upload(), 'strokes': [], 'extras': []}], [{**upload(), 'strokes': []}] * 8])
+def test_multiple_images_reject_nested_marks_and_excess_images(extras):
+    with pytest.raises(ValueError):
+        validate_visual({**upload(), 'extras': extras})
+
+
+def test_failed_extra_leaves_no_partial_files(tmp_path):
+    value = {**upload(), 'extras': [{'upload_data_url': 'data:image/png;base64,!!!', 'strokes': []}]}
+    with pytest.raises(ValueError):
+        save_visual(value, segment={'id': 'takeover-1'}, directory=tmp_path, request_id='rollback-001')
+    assert not list(tmp_path.rglob('*.png'))
+
+
+def test_live_reference_must_belong_to_current_takeover(tmp_path):
+    value = {'takeover_id': 'takeover-1', 'capture_id': 'a' * 32, 'source_sha256': 'b' * 64, 'strokes': []}
+    with pytest.raises(ValueError, match='不匹配'):
+        save_visual(value, segment={'id': 'takeover-2'}, directory=tmp_path, request_id='capture-001')
+
+
+def test_capture_phase_timeout_and_close(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    control = RunInterventions()
+    control.activate(lambda *a, **k: None, directory=tmp_path)
+    with pytest.raises(RuntimeError, match='暂停'):
+        control.capture_reference('takeover-1')
+    control.request(request_id='pause-001', kind='pause')
+    control.state['phase'] = 'paused'
+    with pytest.raises(RuntimeError, match='超时'):
+        control.capture_reference('takeover-1', timeout=.01)
+    assert control.pending_capture is None
+    queued = threading.Event()
+    class SignalEvent:
+        def wait(self, timeout):
+            queued.set()
+            return done.wait(timeout)
+        def set(self):
+            done.set()
+    done = threading.Event()
+    from unittest.mock import patch
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        # Only replace the event created by capture_reference, not executor internals.
+        def request():
+            with patch('trace2task.run_interventions.threading.Event', return_value=SignalEvent()):
+                return control.capture_reference('takeover-1')
+        future = pool.submit(request)
+        assert queued.wait(2)
+        with pytest.raises(RuntimeError, match='等待截图'):
+            control.request(request_id='resume-01', kind='resume')
+        control.close('stopped')
+        with pytest.raises(RuntimeError, match='已结束'):
+            future.result(timeout=2)
+
+
+def test_live_capture_failure_retains_takeover_and_does_not_resume(tmp_path):
+    import threading
+
+    from test_chat_agent_bridge import Stop
+
+    from trace2task.android_execution import AndroidAppNotFocused
+
+    control = RunInterventions()
+    control.activate(lambda *a, **k: None, directory=tmp_path)
+    control.request(request_id='pause-001', kind='pause')
+    control.state['phase'] = 'paused'
+    segment = control.state['takeovers'][-1]
+    original = {'path': 'original.png', 'sha256': 'unchanged'}
+    segment['before'] = original
+    request = {'id': 'a' * 32, 'segment': segment, 'done': threading.Event()}
+    control.pending_capture = request
+    def fail(*args):
+        raise AndroidAppNotFocused('test app is not focused')
+    control._capture_reference(fail, Stop())
+    assert request['done'].is_set() and 'not focused' in request['error']
+    assert control.pending_capture is None
+    assert control.state['phase'] == 'paused' and segment['before'] == original
+    assert not segment.get('captures')

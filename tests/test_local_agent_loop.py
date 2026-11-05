@@ -70,6 +70,40 @@ class Core:
         )
 
 
+@pytest.mark.parametrize('phase', ['plan', 'completion_review', 'model_wait', 'final'])
+@pytest.mark.parametrize('cancel', [False, True])
+def test_failed_capture_time_is_retained_without_a_model_request(tmp_path, monkeypatch, phase, cancel):
+    from types import SimpleNamespace
+
+    from trace2task import local_agent_loop, local_run_audit
+    from trace2task.windows_runner import EmergencyStopRequested
+
+    clock = [0.0]
+    timer = SimpleNamespace(perf_counter=lambda: clock[0])
+    monkeypatch.setattr(local_agent_loop, 'time', timer)
+    monkeypatch.setattr(local_run_audit, 'time', timer)
+    failure = EmergencyStopRequested('stopped') if cancel else TimeoutError('capture timeout')
+
+    class SlowObserver:
+        def observe(self, target, index):
+            clock[0] = 183.0
+            raise failure
+
+    events, statuses, result = [], [], {}
+    record = lambda kind, **kw: events.append({'type': kind, **kw})
+    audit = local_run_audit.LocalRunAudit(tmp_path, result, record, statuses.append)
+    with pytest.raises(type(failure)) as raised:
+        local_agent_loop.observe_with_timing(SlowObserver(), None, 0, audit=audit, record=record,
+                                             status_callback=statuses.append, phase=phase)
+    assert raised.value is failure
+    assert result['performance']['capture_ms'] == 183000.0
+    assert result['performance']['model_roundtrip_ms'] == 0
+    assert result['model_io'] == []
+    assert events[0]['type'] == 'capture_failed' and events[0]['phase'] == phase
+    assert events[0]['elapsed_ms'] == 183000.0
+    assert '正在读取当前画面' in statuses[0] and '截图中断' in statuses[-1]
+
+
 def test_unverifiable_action_reobserves_without_replay_then_reviews_completion(tmp_path):
     result = {"actions": 0, "history": [], "model_io": []}
     observer, core = Observer(tmp_path), Core()

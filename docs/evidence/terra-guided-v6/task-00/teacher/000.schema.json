@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": [
+        "stage",
+        "continue",
+        "finish",
+        "blocked"
+      ]
+    },
+    "observation": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "completion_hint": {
+      "type": "string"
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "handoff_conditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "decision",
+    "observation",
+    "goal",
+    "completion_hint",
+    "constraints",
+    "handoff_conditions"
+  ],
+  "additionalProperties": false
+}

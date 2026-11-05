@@ -25,6 +25,19 @@ SCREENSHOT_TIMEOUT_SECONDS = 60
 SCREENSHOT_MAX_ATTEMPTS = 3
 
 
+def capture_status(kind, data):
+    """Shared live screenshot status for both local and chat model runners."""
+    if kind == 'android_capture_wait':
+        return (f'正在读取手机截图，已等待 {data["elapsed_seconds"]:.0f} 秒'
+                f'（本次上限 {data["timeout_seconds"]} 秒）；可停止。')
+    if kind == 'android_capture_retry':
+        return (f'截图读取超过 {data["timeout_seconds"]} 秒，设备与授权应用已核对；'
+                f'正在第 {data["attempt"] - 1}/{data["max_attempts"] - 1} 次重试截图。')
+    if kind == 'android_capture_recovered':
+        return '截图已恢复，继续当前任务。'
+    return None
+
+
 class AndroidAppNotFocused(RuntimeError):
     """A handoff may wait for this app; it must not capture another app."""
 
@@ -75,7 +88,9 @@ class AndroidDriver:
             raise
 
     def _read_screenshot(self, command):
-        deadline = time.monotonic() + SCREENSHOT_TIMEOUT_SECONDS
+        started = time.monotonic()
+        deadline = started + SCREENSHOT_TIMEOUT_SECONDS
+        next_progress = started + 5
         with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)) as process:
@@ -88,6 +103,11 @@ class AndroidDriver:
                     try:
                         output, error = process.communicate(timeout=min(.25, remaining))
                     except subprocess.TimeoutExpired:
+                        now = time.monotonic()
+                        if now >= next_progress:
+                            self.record('android_capture_wait', elapsed_seconds=round(now - started, 2),
+                                        timeout_seconds=SCREENSHOT_TIMEOUT_SECONDS)
+                            next_progress = now + 5
                         continue
                     self.stop.raise_if_requested()
                     if process.returncode:
@@ -255,7 +275,8 @@ class AndroidObservation:
         self.driver = driver
 
     def intervention_snapshot(self, identifier, phase):
-        if not re.fullmatch(r'takeover-[1-8]', identifier) or phase not in {'before', 'after'}:
+        if (not re.fullmatch(r'takeover-[1-8]', identifier)
+                or (phase not in {'before', 'after'} and not re.fullmatch(r'live-[a-f0-9]{32}', phase))):
             raise ValueError('Invalid Android handoff snapshot')
         state, path = self.driver.capture(self.driver.root / 'interventions' / f'{identifier}-{phase}.png')
         return {'path': str(path), 'sha256': state['sha256'], 'package': self.driver.package,
@@ -303,8 +324,8 @@ class AndroidExecutionBackend:
         args = action.args
         if action.skill not in self.skills or args.get('button', 'left') != 'left':
             raise ActionUnavailable('Android supports single-touch only, no keyboard/text/desktop tools')
-        if action.skill != 'joystick_move' and args.get('duration_ms', 0) > 1500:
-            raise ActionUnavailable('Android actions/waits other than joystick_move are bounded to 1500 ms')
+        if action.skill not in {'joystick_move', 'wait'} and args.get('duration_ms', 0) > 1500:
+            raise ActionUnavailable('Android touch actions other than joystick_move are bounded to 1500 ms')
         if action.skill == 'camera_drag':
             from trace2task.android_camera import prepare_camera
             if getattr(self.driver, '_touch_session', None) is not None:
@@ -393,7 +414,7 @@ class AndroidExecutionBackend:
     def capabilities(self, state):
         capabilities = {'available_skills': list(self.skills), 'coordinate_space': 'android_screenshot',
                 'delivery_mode': self.default_delivery_mode, 'allowed_keys': ['escape'],
-                'duration_limits_ms': {'hold_mouse': 1500, 'drag': 1500, 'wait': 1500,
+                'duration_limits_ms': {'hold_mouse': 1500, 'drag': 1500, 'wait': 100000,
                                        'joystick_move': None, 'camera_drag': 1500},
                 'multi_touch': False, 'no_hidden_game_state': True,
                 'camera': {'gesture': 'single continuous swipe, then release',

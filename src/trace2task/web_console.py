@@ -567,6 +567,10 @@ class ConsoleJob:
     android_budget: dict | None = None
     mobileforge: str = ""
     android_model_profile: str = ""
+    execution_mode: str = "original"
+    hybrid: dict | None = None
+    hybrid_api_config: ModelAPIConfig | None = field(default=None, repr=False)
+    application_knowledge: dict | None = field(default=None, repr=False)
     approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
     pending_batch: dict[str, Any] | None = None
     prompt_profile: dict[str, str] | None = field(default=None, repr=False)
@@ -623,6 +627,8 @@ class ConsoleJob:
             "android_budget": self.android_budget,
             "mobileforge": self.mobileforge,
             "android_model_profile": self.android_model_profile,
+            "execution_mode": self.execution_mode,
+            "hybrid": self.hybrid,
             "model_io": list(self.model_io) if details else [],
         }
 
@@ -702,6 +708,8 @@ class WebConsoleController:
         self.project_root = project_root.expanduser().resolve()
         from trace2task.components import ComponentManager
         self.components = ComponentManager(self.project_root)
+        from trace2task.chatgpt_browser import ChatGPTBrowser
+        self.chatgpt_browser = ChatGPTBrowser(self.project_root)
         self.api_settings = api_settings_store or APISettingsStore()
         self.codex_catalog = CodexModelCatalog(self.project_root)
         self.task_root = (self.project_root / "taskpacks").resolve()
@@ -846,15 +854,15 @@ class WebConsoleController:
     def local_prompt_profile(self, model: str, backend: str) -> dict[str, Any]:
         from trace2task.local_gui_protocol import (
             MODELS,
-            TURN_TEMPLATE,
+            default_turn_template,
             prompt,
             validate_prompt_profile,
         )
 
-        if model not in MODELS or backend not in {"win32", "cua"}:
+        if model not in MODELS or backend not in {"win32", "cua", "android"}:
             raise ValueError("仅本地 GUI 模型可编辑执行提示词")
         default = {"system_prompt": prompt(model),
-                   "turn_template": TURN_TEMPLATE}
+                   "turn_template": default_turn_template(model)}
         path = self.project_root / "runs/local-gui/prompt-profiles.json"
         with self._lock:
             saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -869,9 +877,11 @@ class WebConsoleController:
                                   profile: dict[str, str] | None) -> dict[str, Any]:
         from trace2task.local_gui_protocol import validate_prompt_profile
 
-        self.local_prompt_profile(model, backend)  # Validate model/backend before touching disk.
+        current = self.local_prompt_profile(model, backend)  # Validate before touching disk.
         if profile is not None:
             profile = validate_prompt_profile(profile)
+            if model == 'gui-decisions-2b' and profile != current['default']:
+                raise ValueError('GUI-Decisions 使用固定官方槽位提示词，不支持修改')
         path = self.project_root / "runs/local-gui/prompt-profiles.json"
         with self._lock:
             saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -1420,7 +1430,22 @@ class WebConsoleController:
         android_budget: dict | None = None,
         mobileforge: str = "",
         android_model_profile: str = "",
+        execution_mode: str = "original",
+        hybrid: dict | None = None,
+        knowledge_selection: dict | None = None,
     ) -> dict[str, Any]:
+        if execution_mode not in {'original', 'hybrid'}:
+            raise ValueError('执行模式必须是 original / hybrid')
+        hybrid_api_config = None
+        if execution_mode == 'hybrid':
+            from trace2task.hybrid_connections import prepare_executor
+            if (provider not in {'codex', 'api'} or executor_backend not in {'cua', 'android'} or not execute
+                    or orchestration != 'legacy' or resume_from or mobileforge or android_model_profile
+                    or execution_scope not in {'desktop', 'android'}):
+                raise ValueError('混合模式需要 Codex / 视觉 API 指导、Cua / Android 独立任务；不支持 MobileForge 或浏览器')
+            hybrid, hybrid_api_config = prepare_executor(hybrid, self.codex_catalog, self.api_settings)
+        elif hybrid is not None:
+            raise ValueError('原模式不能附带混合模型配置')
         normalized_instruction = " ".join(instruction.split())
         memory_mode = memory_mode if memory_mode is not None else ('manual' if use_experience else 'off')
         if not isinstance(memory_mode, str) or memory_mode not in {'off', 'manual', 'auto'}:
@@ -1437,9 +1462,11 @@ class WebConsoleController:
             raise ValueError("不支持的执行后端")
         if executor_backend == 'android' or execution_scope == 'android':
             if (executor_backend != 'android' or execution_scope != 'android'
-                    or provider not in {'codex', 'api'} or not execute
+                    or provider not in {'codex', 'api', 'trained_d'} or not execute
                     or orchestration != 'legacy' or resume_from or background or cua_target is not None):
-                raise ValueError('Android 需要配对范围、Codex/API 和独立执行；不支持桌面经验或回退')
+                raise ValueError('Android 需要配对范围、Codex/API/本地模型和独立执行；不支持桌面经验或回退')
+            if mobileforge and provider == 'trained_d':
+                raise ValueError('MobileForge 仅支持 Codex / 视觉 API；本地模型请关闭 MobileForge')
             if mobileforge and use_experience:
                 raise ValueError('MobileForge 暂不支持经验；请使用通用视觉代理')
             from trace2task.android_workbench import validate_config
@@ -1518,8 +1545,8 @@ class WebConsoleController:
         if len(normalized_instruction) > 2_000:
             raise ValueError("任务指令不能超过 2000 个字符")
         if provider == "trained_d":
-            if execution_scope != "desktop" or orchestration != "legacy" or resume_from:
-                raise ValueError("本地 GPU 模型仅支持主屏桌面、独立任务")
+            if execution_scope not in {"desktop", "android"} or orchestration != "legacy" or resume_from:
+                raise ValueError("本地 GPU 模型支持桌面或 Android 的独立任务")
             if type(continuous) is not bool:
                 raise ValueError("continuous 必须为布尔值")
             from trace2task.local_gui_protocol import MODELS
@@ -1534,6 +1561,19 @@ class WebConsoleController:
                               if model != "D-5970" else None)
         if provider not in {"codex", "api", "trained_d"}:
             raise ValueError("执行模型来源必须是 codex 或 api")
+        application_knowledge = None
+        if knowledge_selection is not None:
+            from trace2task.application_knowledge import read_knowledge
+            if (not isinstance(knowledge_selection, dict) or not execute or resume_from or mobileforge
+                    or orchestration != 'legacy' or execution_scope not in {'android', 'desktop'}
+                    or (provider == 'trained_d' and model == 'D-5970')):
+                raise ValueError('当前任务类型不支持底层知识')
+            application_knowledge = read_knowledge(self.project_root, knowledge_selection.get('id'))
+            if not application_knowledge or application_knowledge['sha256'] != knowledge_selection.get('sha256'):
+                raise ValueError('底层知识已更新，请刷新后重新确认任务')
+            if (application_knowledge['scope'] != execution_scope
+                    or (execution_scope == 'android' and application_knowledge['application'] != android_config['package'])):
+                raise ValueError('底层知识与当前授权应用范围不匹配')
         prompt_guidance = (self.chat_prompt_profile(provider)["guidance"]
                            if provider in {"codex", "api"} else "")
         if not isinstance(background, bool) or not isinstance(adaptive_reasoning, bool):
@@ -1633,6 +1673,10 @@ class WebConsoleController:
                 android_budget=android_budget,
                 mobileforge=mobileforge,
                 android_model_profile=android_model_profile,
+                execution_mode=execution_mode,
+                hybrid=hybrid,
+                hybrid_api_config=hybrid_api_config,
+                application_knowledge=application_knowledge,
                 prompt_profile=prompt_profile if provider == "trained_d" else None,
                 prompt_guidance=prompt_guidance,
             )
@@ -1640,7 +1684,21 @@ class WebConsoleController:
             job.run_facts = RunSession.for_job(job, self.project_root,
                 api_url=api_config.base_url if api_config else "",
                 requested_backend=inference_backend).public()
-            if executor_backend == 'android' and not mobileforge and execute:
+            job.run_facts.update(execution_mode=execution_mode)
+            if application_knowledge:
+                job.run_facts['application_knowledge'] = application_knowledge
+            if hybrid:
+                from trace2task.hybrid_v7_profile import PROMPT_REVISION, PROMPT_SHA256, PROTOCOL
+                job.run_facts['hybrid'] = {**hybrid, 'protocol': PROTOCOL,
+                    'prompt_revision': PROMPT_REVISION, 'prompt_sha256': PROMPT_SHA256}
+                director_destination = job.run_facts['destination']
+                executor_destination = ('本机模型' if hybrid.get('provider', 'local') == 'local' else
+                    'Codex 订阅' if hybrid['provider'] == 'codex' else hybrid['api_base_url'])
+                job.run_facts['destination'] = f'{director_destination} 指导 + {executor_destination} 执行'
+                if hybrid.get('provider') in {'api', 'codex'}:
+                    job.run_facts['data_flow'] = 'mixed'
+                job.run_facts['context_description'] = '指导模型和执行模型分别保持多轮会话；执行端读取当前子目标与已交付的指导动作。'
+            if executor_backend == 'android' and provider in {'codex', 'api'} and not mobileforge and execute:
                 from trace2task.run_interventions import RunInterventions
                 job.intervention_control = RunInterventions(
                     on_change=lambda state: self._intervention_update(job, state))
@@ -1659,6 +1717,47 @@ class WebConsoleController:
         )
         thread.start()
         return job.snapshot()
+
+    def start_nitrogen(self, process, seconds, task_text=""):
+        from trace2task.nitrogen_runtime import runtime_paths, validate_request, validate_task_text
+
+        validate_request(process, seconds)
+        task_text = validate_task_text(task_text)
+        paths = runtime_paths()
+        instruction = f"NitroGen · {process}"
+        if task_text:
+            instruction += f" · {task_text}"
+        with self._lock:
+            self._require_idle()
+            job = ConsoleJob(job_id=uuid.uuid4().hex, task_path="", task_id="nitrogen",
+                             instruction=instruction, mode="execute", kind="nitrogen",
+                             provider="nitrogen", model="nvidia/NitroGen", use_experience=False,
+                             executor_backend="nitrogen-gamepad")
+            job.run_facts = {"destination": "本机 CUDA", "data_flow": "local",
+                             "inference_backend": "NitroGen PyTorch", "execution_backend": "NitroGen GamepadEnv"}
+            self._register_job(job)
+        threading.Thread(target=self._run_nitrogen, args=(job, paths, process, seconds, task_text),
+                         name=f"nitrogen-{job.job_id[:8]}", daemon=True).start()
+        return job.snapshot()
+
+    def _run_nitrogen(self, job, paths, process, seconds, task_text):
+        from trace2task.nitrogen_runtime import run_game
+
+        stop = ConsoleEmergencyStop(job.stop_event)
+        root = self.project_root / "runs" / "nitrogen" / job.job_id
+        try:
+            stop.start()
+            stop.raise_if_requested()
+            self._update(job, status="running")
+            reason = run_game(paths, process, seconds, root, stop, lambda message: self._update(job, log=message),
+                              on_round=lambda entry: self._model_round_update(job, entry), task_text=task_text)
+            self._update(job, status="stopped", result={"stop_reason": reason, "task_complete": False})
+        except EmergencyStopRequested:
+            self._update(job, status="stopped", result={"stop_reason": "emergency_stop", "task_complete": False})
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            self._update(job, status="failed", error=str(error))
+        finally:
+            stop.close()
 
     def start_recording(
         self,
@@ -2274,14 +2373,16 @@ class WebConsoleController:
                              model: str = DEFAULT_COMPILER_MODEL,
                              reasoning_effort: str = DEFAULT_COMPILER_REASONING_EFFORT,
                              confirm_duplicate: bool = False, guidance: str = '',
-                             draft_id: str = '', draft_sha256: str = '') -> dict[str, Any]:
+                             draft_id: str = '', draft_sha256: str = '', compile_knowledge: bool = False) -> dict[str, Any]:
         from trace2task.run_experience import (
+            existing_run_drafts,
             prepare_draft_revision,
             prepare_run_experience,
-            preview_run_experience,
             with_compilation_guidance,
         )
 
+        if type(compile_knowledge) is not bool:
+            raise ValueError('底层知识提炼选项无效')
         self.codex_catalog.validate(model, reasoning_effort)
         with self._lock:
             self._require_idle()
@@ -2295,7 +2396,11 @@ class WebConsoleController:
                 if prepared['source_sha256'] != source_sha256:
                     raise ValueError('来源轨迹或截图已变化，请重新预览后提炼')
                 prepared = with_compilation_guidance(prepared, guidance)
-                previous = preview_run_experience(self.project_root, self.run_store, run_id)['drafts']
+                if compile_knowledge:
+                    if not prepared.get('knowledge_base'):
+                        raise ValueError('请先为该桌面应用建立并选用底层知识')
+                    prepared['compile_knowledge'] = True
+                previous = existing_run_drafts(self.project_root, run_id)
             if previous and confirm_duplicate is not True:
                 return {'confirmation_required': True, 'representation': 'B', 'existing_versions': previous,
                         'message': '这次运行已有经验草稿。再次提炼会调用模型并保存独立草稿，不覆盖已有内容。'}
@@ -2311,6 +2416,23 @@ class WebConsoleController:
         threading.Thread(target=self._run_experience_compilation, args=(job, prepared),
                          name=f'trace2task-experience-{job.job_id[:8]}', daemon=True).start()
         return job.snapshot()
+
+    def save_application_knowledge(self, payload):
+        from trace2task.application_knowledge import save_knowledge
+        from trace2task.run_experience import read_draft
+
+        with self._lock:
+            self._require_idle()
+            if payload.get('draft_id'):
+                draft = read_draft(self.project_root, payload['draft_id'])
+                if draft['draft_sha256'] != payload.get('draft_sha256') or not draft.get('knowledge_content'):
+                    raise ValueError('底层知识草稿已变化或没有可保存的正文')
+                base = draft['knowledge_base']
+                return save_knowledge(self.project_root, scope=base['scope'], application=base['application'],
+                    content=draft['knowledge_content'], expected_sha256=base['sha256'])
+            return save_knowledge(self.project_root, scope=payload.get('scope'),
+                application=payload.get('application'), content=payload.get('content'),
+                expected_sha256=payload.get('expected_sha256', ''))
 
     def _run_experience_compilation(self, job: ConsoleJob, prepared: dict[str, Any]) -> None:
         from trace2task.run_experience import compile_run_draft
@@ -3358,7 +3480,9 @@ class WebConsoleController:
             self.run_store.save(job.snapshot(details=False))
 
     def intervene_job(self, job_id, payload):
-        if not isinstance(payload, dict) or set(payload) - {'request_id', 'kind', 'text', 'visual'}:
+        capturing = isinstance(payload, dict) and payload.get('kind') == 'capture'
+        allowed = {'kind', 'takeover_id'} if capturing else {'request_id', 'kind', 'text', 'visual'}
+        if not isinstance(payload, dict) or set(payload) - allowed:
             raise ValueError('干预请求只能包含 request_id、kind、text 和 visual')
         with self._lock:
             job = self._jobs.get(job_id)
@@ -3371,6 +3495,8 @@ class WebConsoleController:
                 raise ValueError('运行中干预目前仅支持 Android 通用视觉代理，MobileForge 暂不支持')
         # Never enter the intervention lock under the console lock: its publish
         # callback persists snapshots through _intervention_update.
+        if capturing:
+            return control.capture_reference(payload.get('takeover_id'))
         return control.request(request_id=payload.get('request_id'), kind=payload.get('kind'),
                                text=payload.get('text', ''), visual=payload.get('visual'))
 
@@ -4113,6 +4239,16 @@ class WebConsoleController:
                     if not execute:
                         raise ValueError("D 模型预览请使用预测入口")
 
+                    android_options = {}
+                    if job.application_knowledge:
+                        android_options['application_knowledge'] = job.application_knowledge
+                    if job.executor_backend == 'android':
+                        from trace2task.execution_budget import BudgetStop
+                        from trace2task.execution_budget import android_budget as validate_budget
+                        android_options.update(android_config=job.android_config, **validate_budget(job.android_budget))
+                        # Approval waits use the same budget checks as model/input waits.
+                        kwargs['emergency_stop'] = BudgetStop(kwargs['emergency_stop'], android_options['max_seconds'])
+
                     def approve(batch):
                         token = uuid.uuid4().hex
                         job.approval_event.clear()
@@ -4134,6 +4270,7 @@ class WebConsoleController:
                                              if job.use_experience else None),
                         prompt_profile=job.prompt_profile,
                         on_model_round=lambda entry: self._model_round_update(job, entry),
+                        **android_options,
                     )
                     job.pending_batch = None
                 elif (desktop and execute and job.orchestration == "legacy"
@@ -4143,9 +4280,17 @@ class WebConsoleController:
 
                     runner = run_chat_agent
                     android_options = {}
+                    if job.application_knowledge:
+                        android_options['application_knowledge'] = job.application_knowledge
+                    if job.execution_mode == 'hybrid':
+                        android_options['hybrid'] = dict(job.hybrid)
+                        if job.hybrid.get('provider', 'local') == 'local':
+                            android_options['hybrid']['prompt_profile'] = self.local_prompt_profile(
+                                job.hybrid['local_model'], job.executor_backend)['effective']
+                        android_options['hybrid_executor_api_config'] = job.hybrid_api_config
                     if job.executor_backend == 'android':
                         from trace2task.execution_budget import android_budget as validate_budget
-                        android_options = {'android_config': job.android_config, **validate_budget(job.android_budget)}
+                        android_options.update(android_config=job.android_config, **validate_budget(job.android_budget))
                         if job.intervention_control is not None:
                             android_options['interventions'] = job.intervention_control
                         if job.mobileforge:
@@ -4449,6 +4594,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         parsed = urlparse(self.path)
+        if parsed.path == '/api/chatgpt-browser':
+            self._json(self.controller.chatgpt_browser.snapshot())
+            return
         if parsed.path == "/api/local-model/status":
             from trace2task.local_model_service import service_status
             snapshot = service_status()
@@ -4572,6 +4720,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._json(profile())
             return
         if parsed.path == "/api/state":
+            from trace2task.application_knowledge import list_knowledge
             self._json(
                 {
                     "version": __version__,
@@ -4598,6 +4747,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     "taskpacks": self.controller.list_taskpacks(),
                     "recordings": self.controller.list_recordings(),
                     "trace_representations": list_versions(self.controller.project_root),
+                    "application_knowledge": list_knowledge(self.controller.project_root),
                     "trash": self.controller.trash.list() + self.controller.run_store.trash_list(),
                     "candidates": self.controller.list_candidates(),
                     "active_job": (self.controller._jobs[self.controller._active_job_id].snapshot(details=False)
@@ -4753,6 +4903,17 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/rsi/review":
                 self._json(self.controller.review_rsi_candidate(payload))
                 return
+            if parsed.path == '/api/chatgpt-browser':
+                action = payload.get('action')
+                if action not in {'open', 'close'}:
+                    raise ValueError('未知浏览器操作')
+                active = self.controller.active_job()
+                if action == 'open' and active and active.get('status') not in {
+                        'completed', 'failed', 'cancelled', 'stopped'}:
+                    raise RuntimeError('请先停止当前任务，再打开 ChatGPT 浏览器')
+                browser = self.controller.chatgpt_browser
+                self._json(browser.open() if action == 'open' else browser.close())
+                return
             if parsed.path == "/api/local-model/service":
                 active = self.controller.active_job()
                 if active and active.get("status") not in {"completed", "failed", "cancelled", "stopped"}:
@@ -4870,6 +5031,10 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     self.controller._require_idle()
                     self._json(probe(payload.get('android_config')))
                 return
+            if parsed.path == "/api/nitrogen/start":
+                self._json(self.controller.start_nitrogen(payload.get("process"), payload.get("seconds"),
+                                                         payload.get("task_text", "")))
+                return
             if parsed.path == "/api/jobs":
                 from trace2task.local_model_service import service_busy
                 if service_busy():
@@ -4899,6 +5064,9 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     android_budget=payload.get("android_budget"),
                     mobileforge=payload.get("mobileforge", ""),
                     android_model_profile=payload.get("android_model_profile", ""),
+                    execution_mode=payload.get('execution_mode', 'original'),
+                    hybrid=payload.get('hybrid'),
+                    knowledge_selection=payload.get('knowledge_selection'),
                 )
                 self._json(result, status=HTTPStatus.ACCEPTED)
                 return
@@ -5033,6 +5201,16 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                 self._json(preview_run_experience(self.controller.project_root, self.controller.run_store,
                                                  payload.get('run_id', '')))
                 return
+            if parsed.path == '/api/application-knowledge/read':
+                from trace2task.application_knowledge import read_knowledge
+                value = read_knowledge(self.controller.project_root, payload.get('id'))
+                if value is None:
+                    raise ValueError('找不到底层知识')
+                self._json(value)
+                return
+            if parsed.path == '/api/application-knowledge/save':
+                self._json(self.controller.save_application_knowledge(payload))
+                return
             if parsed.path == '/api/run-experience/generate':
                 result = self.controller.start_run_experience(payload.get('run_id', ''),
                     source_sha256=payload.get('source_sha256', ''),
@@ -5040,7 +5218,8 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     reasoning_effort=payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT),
                     confirm_duplicate=payload.get('confirm_duplicate', False),
                     guidance=payload.get('guidance', ''), draft_id=payload.get('draft_id', ''),
-                    draft_sha256=payload.get('draft_sha256', ''))
+                    draft_sha256=payload.get('draft_sha256', ''),
+                    compile_knowledge=payload.get('compile_knowledge', False))
                 self._json(result, status=HTTPStatus.OK if result.get('confirmation_required') else HTTPStatus.ACCEPTED)
                 return
             if parsed.path == '/api/run-experience/draft':
@@ -5275,7 +5454,14 @@ def create_web_server(
     BoundWebConsoleHandler.asset_root = asset_root
     BoundWebConsoleHandler.csrf_token = secrets.token_urlsafe(32)
 
-    return ThreadingHTTPServer(("127.0.0.1", port), BoundWebConsoleHandler)
+    class ConsoleHTTPServer(ThreadingHTTPServer):
+        def server_close(self):
+            try:
+                active_controller.chatgpt_browser.close()
+            finally:
+                super().server_close()
+
+    return ConsoleHTTPServer(("127.0.0.1", port), BoundWebConsoleHandler)
 
 
 def serve_web_console(

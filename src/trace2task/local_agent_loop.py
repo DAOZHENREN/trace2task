@@ -14,6 +14,25 @@ from pathlib import Path
 from trace2task.execution_protocol import ActionPlan
 
 
+def observe_with_timing(observer, target, index, *, audit, record, status_callback, phase='plan'):
+    """Include failed/cancelled observations in capture time, before any model call."""
+    label = {'plan': '规划', 'completion_review': '完成核验',
+             'model_wait': '等待后复查', 'final': '结束留档'}[phase]
+    status_callback(f'[capture {index + 1}] 正在读取当前画面，用于{label}；可停止。')
+    started = time.perf_counter()
+    try:
+        observation = observer.observe(target, index)
+    except Exception as error:
+        elapsed_ms = audit.elapsed('capture_ms', started)
+        record('capture_failed', step_index=index, phase=phase, elapsed_ms=elapsed_ms,
+               error=f'{type(error).__name__}: {error}')
+        status_callback(f'[capture {index + 1}] 截图中断 · 已等待 {elapsed_ms / 1000:.2f} 秒')
+        raise
+    elapsed_ms = audit.elapsed('capture_ms', started)
+    status_callback(f'[capture {index + 1}] 截图已返回 · {elapsed_ms / 1000:.2f} 秒')
+    return (*observation, elapsed_ms)
+
+
 def _delivered_cursor(history):
     """Last pointer position from delivered actions in the current target only."""
     for entry in reversed(history):
@@ -91,21 +110,22 @@ def _record_delivered_steps(steps, *, result, record, status_callback, batch_ind
         )
 
 
-def _changed_after_model_wait(output, *, observer, target, path, audit, record):
+def _changed_after_model_wait(output, *, observer, target, path, audit, record, status_callback):
     cooldown = output.get('rate_limit_wait_seconds', 0)
     extended = output.get('response_wait_extended', False)
     if not cooldown and not extended:
         return False
     before = Path(path).read_bytes()
-    began = time.perf_counter()
-    current_target, _, current_path = observer.observe(target, len(audit.result['model_io']))
+    current_target, _, current_path, elapsed_ms = observe_with_timing(
+        observer, target, len(audit.result['model_io']), audit=audit, record=record,
+        status_callback=status_callback, phase='model_wait')
     current = Path(current_path).read_bytes()
     saved = audit.root / 'model-wait-checks' / f"{len(audit.result['model_io'])}{Path(current_path).suffix}"
     saved.parent.mkdir(parents=True, exist_ok=True)
     saved.write_bytes(current)
     changed = current_target != target or before != current
     record('model_wait_reobservation', screenshot=str(saved), changed=changed,
-           elapsed_ms=audit.elapsed('capture_ms', began),
+           elapsed_ms=elapsed_ms,
            rate_limit_wait_seconds=cooldown, response_wait_extended=extended)
     return changed
 
@@ -115,9 +135,9 @@ def _completion_review(*, observer, target, model, core, audit, predictor, instr
                        prompt_profile=None, interventions=None, intervention_revision=None):
     """Ask the same model to inspect a fresh screenshot without sending input."""
     review_index = len(audit.result["model_io"])
-    started = time.perf_counter()
-    _, _, review_path = observer.observe(target, review_index)
-    elapsed_ms = audit.elapsed("capture_ms", started)
+    _, _, review_path, elapsed_ms = observe_with_timing(
+        observer, target, review_index, audit=audit, record=record,
+        status_callback=status_callback, phase='completion_review')
     record("completion_review_capture", screenshot=str(review_path), elapsed_ms=elapsed_ms)
     context, callbacks = {'purpose': 'verify_completion'}, {}
     if interventions is not None:
@@ -140,7 +160,8 @@ def _completion_review(*, observer, target, model, core, audit, predictor, instr
     )
     if interventions is not None:
         interventions.responded(handoff, review_index)
-    if _changed_after_model_wait(review, observer=observer, target=target, path=review_path, audit=audit, record=record):
+    if _changed_after_model_wait(review, observer=observer, target=target, path=review_path,
+                                 audit=audit, record=record, status_callback=status_callback):
         review = {'status': 'stale', 'error': '模型等待期间画面已变化，需要重新观察核验。'}
     verification = review.get("verification") if review.get("status") == "reviewed" else None
     from trace2task.local_gui_protocol import decode_completion_review
@@ -218,6 +239,7 @@ def run_local_agent_loop(
     root_name = Path(root).name
 
     iteration = 0
+    handoff_rounds = 0
     while iteration < max_actions:
         step = iteration
         stop.raise_if_requested()
@@ -227,9 +249,9 @@ def run_local_agent_loop(
                     if interventions is not None else None)
 
         observation_index = len(result["model_io"])
-        capture_started = time.perf_counter()
-        target, state, path = observer.observe(target, observation_index)
-        capture_ms = audit.elapsed("capture_ms", capture_started)
+        target, state, path, capture_ms = observe_with_timing(
+            observer, target, observation_index, audit=audit, record=record,
+            status_callback=status_callback)
         record("capture", step_index=step, screenshot=str(path), elapsed_ms=capture_ms)
         if interventions is not None and not interventions.current(revision):
             previous = None
@@ -287,7 +309,8 @@ def run_local_agent_loop(
                 completion_rejections = adapter_rejections = format_rejections = stale_reobservations = 0
                 status_callback('人工干预已使旧回答失效；未执行该回答，从新截图重新规划。')
                 continue
-        if _changed_after_model_wait(output, observer=observer, target=target, path=path, audit=audit, record=record):
+        if _changed_after_model_wait(output, observer=observer, target=target, path=path,
+                                     audit=audit, record=record, status_callback=status_callback):
             audit.execution({'status': 'stale', 'executed': False, 'steps': [],
                              'reason': '模型等待期间画面已变化，旧回答未执行。'})
             core.feedback = {'status': 'stale', 'executed': False,
@@ -298,6 +321,19 @@ def run_local_agent_loop(
                 result['stop_reason'] = 'observation_changed_limit'
                 break
             status_callback('模型等待后已重新截图；画面变化，正在重新规划，旧动作未执行。')
+            continue
+        if output.get('status') == 'hybrid_stop':
+            result['stop_reason'] = output['reason']
+            audit.execution({'status': 'stopped', 'executed': False, 'steps': [], 'reason': output['reason']})
+            break
+        if output.get('status') == 'handoff':
+            handoff_rounds += 1
+            audit.execution({'status': 'handoff', 'executed': False, 'steps': [],
+                             'reason': output.get('reason')})
+            if handoff_rounds >= max(8, max_actions * 2):
+                result['stop_reason'] = 'handoff_limit'
+                break
+            previous = None
             continue
         iteration += 1
         if output.get("status") == "adapter_rejected":

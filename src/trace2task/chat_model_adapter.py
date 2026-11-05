@@ -35,7 +35,7 @@ ANDROID_CAMERA_GUIDANCE = (
 
 ANDROID_BATCH_GUIDANCE = (
     "Movement/camera actions end the batch for a fresh image; camera_drag must be alone. "
-    "All timed actions except joystick_move are limited to 1500 ms."
+    "Touch actions except joystick_move are limited to 1500 ms. wait supports up to 100000 ms; choose 3000-10000 ms for loading or animations, and shorter waits when a quick update is expected."
 )
 
 
@@ -108,7 +108,7 @@ def plan_schema(*, selected_windows: bool, state_ids=(), browser=False, android=
                 del args['button']
                 action['properties']['args']['required'].remove('button')
             if 'duration_ms' in args:
-                args['duration_ms']['maximum'] = 1500
+                args['duration_ms']['maximum'] = (100000 if action['properties']['skill']['enum'][0] == 'wait' else 1500)
         from trace2task.android_camera import camera_schema
         from trace2task.android_navigation import navigation_schemas
         actions.extend(action for action in navigation_schemas()
@@ -176,6 +176,10 @@ def _intervention_input(intervention, *, first_image):
             original = attach(visual['source'], '人工标注截图已变化；未发送给模型或执行后续输入')
             annotated = attach(visual['image'], '人工标注截图已变化；未发送给模型或执行后续输入')
             line += f'\n{label} reference: original={original}, annotated={annotated}'
+            for i, extra in enumerate(visual.get('extras', []), 1):
+                reference = attach(extra['source'], '人工附加截图已变化；未发送给模型或执行后续输入')
+                attach(extra['image'], '人工附加截图已变化；未发送给模型或执行后续输入')
+                line += f', additional {i}={reference}'
         updates.append(line)
     lines = [
         ('User update: later corrections override earlier guidance and apply through completion review. '
@@ -197,13 +201,14 @@ class ChatModelAdapter:
 
     def __init__(self, session, *, selected_windows: bool,
                  provider: str = "codex", prompt_guidance: str = "", evidence_directory=None,
-                 browser=False, android=False):
+                 browser=False, android=False, application_knowledge=None):
         self.session = session
         self.selected_windows = selected_windows
         self.browser = browser
         self.android = android
         self.provider = provider
         self.prompt_guidance = prompt_guidance
+        self.application_knowledge = application_knowledge
         self._started = False
         self._history_count = 0
         self._text_history = []
@@ -254,6 +259,9 @@ class ChatModelAdapter:
         fresh_history = history[self._history_count:]
         prompt = self._prompt(task, fresh_history, context, experience_context,
                               execution_feedback, review)
+        if not self._started and self.application_knowledge:
+            from trace2task.application_knowledge import knowledge_prompt
+            prompt += knowledge_prompt(self.application_knowledge)
         if self._started and not self.android:
             prompt = ("Continue this task. The attached image is the CURRENT screenshot. "
                       "Previous assistant proposals are not evidence of execution.\n"

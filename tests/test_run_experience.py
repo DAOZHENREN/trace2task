@@ -87,6 +87,46 @@ def test_preview_is_local_bounded_and_does_not_leak_wire_requests(tmp_path):
     assert 'PRIVATE_DEVICE_ADDRESS' not in result['input']
 
 
+def test_compile_and_review_knowledge_separately_from_experience(tmp_path):
+    from trace2task.application_knowledge import read_knowledge, save_knowledge
+
+    store, run, _ = seed(tmp_path)
+    original = save_knowledge(tmp_path, scope='android', application='com.example.game',
+        content='旧版自动按钮说明', expected_sha256='')
+    run['run_facts']['application_knowledge'] = original
+    store.save(run)
+    current = save_knowledge(tmp_path, scope='android', application='com.example.game',
+        content='自动按钮位于战斗面板', expected_sha256=original['sha256'])
+    prepared = prepare_run_experience(tmp_path, store, 'source-run')
+    payload = json.loads(prepared['input'])
+    assert payload['knowledge_used'] == {key: original[key] for key in ('application', 'content', 'revision')}
+    assert payload['knowledge_base'] == {key: current[key] for key in ('application', 'content', 'revision')}
+    assert payload['run_loaded_application_knowledge'] is True
+    assert 'sha256' not in prepared['input']
+    session = Session(json.dumps({'experience': METHOD, 'application_knowledge': '对战面板包含自动按钮。'}))
+    result = compile_run_draft(tmp_path, {**prepared, 'compile_knowledge': True}, **OPTIONS,
+        session_factory=session.factory, binary_resolver=lambda _: 'fake-codex')
+    assert '底层知识用于同一应用的多个任务' in session.options['base_instructions']
+    assert session.calls[0]['output_schema']['required'] == ['experience', 'application_knowledge']
+    draft = read_draft(tmp_path, result['experience_draft_id'])
+    assert draft['content'] == METHOD
+    assert draft['knowledge_content'] == '对战面板包含自动按钮。'
+    assert read_knowledge(tmp_path, current['id']) == current
+    revised = prepare_draft_revision(tmp_path, draft['draft_id'], draft_sha256=draft['draft_sha256'],
+                                     guidance='改知识里的按钮说明，并精简任务步骤')
+    assert json.loads(revised['input'])['draft_revision']['previous_knowledge_draft'] == draft['knowledge_content']
+    controller = WebConsoleController(tmp_path)
+    payload = {'draft_id': draft['draft_id'], 'draft_sha256': draft['draft_sha256']}
+    saved = controller.save_application_knowledge(payload)
+    assert saved['revision'] == 3
+    assert not read_draft(tmp_path, draft['draft_id'])['saved_trace_id']
+    assert controller.save_application_knowledge(payload) == saved
+    save_knowledge(tmp_path, scope='android', application='com.example.game',
+        content='后来维护的新知识', expected_sha256=saved['sha256'])
+    with pytest.raises(ValueError, match='已更新'):
+        controller.save_application_knowledge(payload)
+
+
 def test_long_preview_deduplicates_actions_without_dropping_rounds_or_original_text(tmp_path):
     store, _, _ = seed(tmp_path)
     original = store.read_round('source-run', 0)

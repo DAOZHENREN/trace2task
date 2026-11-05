@@ -48,7 +48,8 @@ def phone(tmp_path, monkeypatch):
             value = f"SurfaceWidth: 720px\nSurfaceHeight: 1280px\nSurfaceOrientation: {data['rotation']}".encode()
         elif args == ['exec-out', 'screencap', '-p']:
             image = io.BytesIO()
-            Image.new('RGB', data['size']).save(image, 'PNG')
+            Image.new('RGB', data['size'], (len(data['processes']) % 255, 0, 0)
+                      if data.get('animated') else 0).save(image, 'PNG')
             value = image.getvalue()
         elif args[:2] == ['shell', 'input']:
             if data['fail_input']:
@@ -137,13 +138,34 @@ def test_input_semantics(phone, skill, args, command):
     assert receipt['effect'] == 'unverifiable'
 
 
+@pytest.mark.parametrize('skill,args', [('click', {'x': .963, 'y': .05}),
+    ('press_key', {'key': 'escape'}), ('hold_mouse', {'x': .963, 'y': .05, 'duration_ms': 200})])
+def test_hybrid_director_actions_reach_adb_with_animated_screens(phone, tmp_path, skill, args):
+    from test_hybrid_models import LOCAL, guidance_actions
+    _, data = phone
+    data['animated'] = True
+    proposal = {'skill': skill, 'args': args}
+    result = run_chat_agent(instruction='Synthetic UI task', model='fake', reasoning_effort='low',
+        output_root=tmp_path / 'runs', emergency_stop=Stop(), status_callback=lambda _: None,
+        executor_backend='android', android_config={'adb': 'adb', 'serial': 'phone', 'package': 'com.example.game'},
+        max_actions=1, session=Session([guidance_actions([proposal])]), hybrid=LOCAL)
+    assert result['actions'] == 1 and result['stop_reason'] == 'action_limit', result
+    assert len(result['model_io']) == 1
+    execution = result['model_io'][0]['execution']
+    assert execution['executed'] is True and execution['status'] == 'delivered'
+    assert execution['effect'] == 'unverifiable'  # Delivery is not task success.
+    commands = [command[7:] for command in data['commands'] if command[5:7] == ['shell', 'input']]
+    assert len(commands) == 1
+    assert commands[0][0] == {'click': 'tap', 'press_key': 'keyevent', 'hold_mouse': 'swipe'}[skill]
+
+
 @pytest.mark.parametrize('skill,args', [
     ('click', {'x': 0, 'y': 0, 'button': 'right'}),
     ('hold_mouse', {'x': .5, 'y': .5, 'duration_ms': 100, 'button': 'right'}),
     ('drag', {'start_x': .1, 'start_y': .1, 'end_x': .2, 'end_y': .2,
               'duration_ms': 100, 'button': 'right'}),
     ('press_key', {'key': 'home'}), ('type_text', {'text': 'abc'}),
-    ('wait', {'duration_ms': 1501}), ('double_click', {'x': 0, 'y': 0}),
+    ('hold_mouse', {'x': .5, 'y': .5, 'duration_ms': 1501}), ('double_click', {'x': 0, 'y': 0}),
 ])
 def test_unsupported_actions(phone, skill, args):
     driver, data = phone
@@ -217,7 +239,9 @@ def test_screenshot_timeout_rechecks_identity_and_recovers_without_repeating_inp
         ['-t', '7', 'shell', 'dumpsys', 'window'], ['-t', '7', 'shell', 'dumpsys', 'input']]
     assert data['host_queries'] == [(5038, 'host:version'), (5038, 'host:devices-l')]
     assert sum(command[5:7] == ['shell', 'input'] for command in commands) == 1
-    assert [event['kind'] for event in data['events'][1:]] == [
+    assert [event['elapsed_seconds'] for event in data['events']
+            if event['kind'] == 'android_capture_wait'] == list(range(5, 61, 5))
+    assert [event['kind'] for event in data['events'][1:] if event['kind'] != 'android_capture_wait'] == [
         'android_capture_timeout', 'android_capture_retry', 'android_capture_recovered']
 
 
@@ -325,18 +349,33 @@ def test_screenshot_command_failure_is_not_retried(phone):
     assert len(data['processes']) == 1 and driver.broken
 
 
-def test_agent_continues_after_screenshot_retry_and_reports_recovery(phone, tmp_path):
+@pytest.mark.parametrize('runner', ['chat', 'local'])
+def test_agent_continues_after_screenshot_retry_and_reports_recovery(phone, tmp_path, monkeypatch, runner):
     _, data = phone
     data['capture_timeouts'] = 1
     statuses = []
-    result = run_chat_agent(instruction='synthetic', model='fake', reasoning_effort='low',
-        output_root=tmp_path / 'runs', emergency_stop=Stop(), status_callback=statuses.append,
-        executor_backend='android', android_config={'adb': 'adb', 'serial': 'phone', 'package': 'com.example.game'},
-        session=Session([_reply([action('click', x=.1, y=.1).to_payload()])]), max_actions=1)
+    options = {'instruction': 'synthetic', 'output_root': tmp_path / 'runs',
+        'emergency_stop': Stop(), 'status_callback': statuses.append,
+        'executor_backend': 'android',
+        'android_config': {'adb': 'adb', 'serial': 'phone', 'package': 'com.example.game'},
+        'max_actions': 1}
+    prediction = {'actions': [action('click', x=.1, y=.1).to_payload()]}
+    if runner == 'local':
+        from trace2task import local_gui_client
+        from trace2task.trained_model_runner import run_trained_desktop
+        monkeypatch.setattr(local_gui_client, 'predict_gui',
+                            lambda *args, **kwargs: {'status': 'predicted', 'prediction': prediction})
+        result = run_trained_desktop(**options, model='gui-decisions-2b', approve=None, continuous=True)
+    else:
+        result = run_chat_agent(**options, model='fake', reasoning_effort='low',
+                                session=Session([_reply(prediction['actions'])]))
     assert result['actions'] == 1 and result['stop_reason'] == 'action_limit'
     assert len(result['model_io']) == 1 and result['model_io'][0]['step_index'] == 0
     assert sum(c[5:7] == ['shell', 'input'] for c in data['commands']) == 1
     assert any('第 1/2 次重试截图' in text for text in statuses)
+    assert any('正在读取手机截图，已等待 5 秒' in text for text in statuses)
+    assert any('正在读取当前画面，用于规划' in text for text in statuses)
+    assert any('正在读取当前画面，用于结束留档' in text for text in statuses)
     assert '截图已恢复，继续当前任务。' in statuses
     from pathlib import Path
     events = [json.loads(line)['type'] for line in Path(result['trace_path']).read_text(encoding='utf-8').splitlines()]
@@ -406,16 +445,20 @@ def test_schema_prompt_and_shared_loop(phone, tmp_path):
                  item['properties']['args']['properties'].get('duration_ms') for item in variants}
     assert durations['joystick_move'] == {'type': 'integer', 'minimum': 1}
     assert 'navigate_to' not in durations
+    assert durations['wait']['maximum'] == 100000
+    assert AndroidExecutionBackend(driver).prepare(action('wait', duration_ms=100000), driver.state()) is None
+    with pytest.raises(ValueError):
+        action('wait', duration_ms=100001)
     limits = AndroidExecutionBackend(driver).capabilities(driver.state())['duration_limits_ms']
     assert limits == {'joystick_move': None,
-                      'hold_mouse': 1500, 'drag': 1500, 'wait': 1500, 'camera_drag': 1500}
+                      'hold_mouse': 1500, 'drag': 1500, 'wait': 100000, 'camera_drag': 1500}
     session = Session([_reply([action('wait', duration_ms=1).to_payload()])])
     adapter = ChatModelAdapter(session, selected_windows=False, android=True)
     adapter.predict('observe', screenshot=tmp_path / 'image.png', history=[])
     assert 'selected Android phone display' in session.requests[0]['prompt']
     assert 'primary desktop' not in session.requests[0]['prompt']
     assert 'No fixed duration cap' in session.requests[0]['prompt']
-    assert 'All timed actions except joystick_move are limited to 1500 ms' in session.requests[0]['prompt']
+    assert 'wait supports up to 100000 ms' in session.requests[0]['prompt']
     driver.start = lambda: None
     proposed = [
         {'skill': 'click', 'args': {'x': .1, 'y': .1}},

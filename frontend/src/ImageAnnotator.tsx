@@ -1,20 +1,23 @@
 import {useEffect, useRef, useState, type PointerEvent} from 'react';
 import {Button} from '@fluentui/react-components';
-import type {AnnotationStroke, HandoffPicture, VisualInput} from './types';
+import {api} from './api';
+import type {AnnotationStroke, HandoffPicture, VisualInput, VisualSource} from './types';
 
-type Source = {url: string; width: number; height: number; input: Omit<VisualInput, 'strokes'>; label: string};
+type Source = {url: string; width: number; height: number; input: VisualSource; label: string};
 const maxBytes = 4 * 1024 * 1024;
 const tools = {circle: '画圈', cross: '打叉', pen: '画笔'} as const;
 
 /** The overlay shares the image's exact bounds; coordinates stay normalized after resizing. */
-export function ImageAnnotator({picture, takeoverId, disabled, onChange, onRemove}: {
-  picture: HandoffPicture | null; takeoverId: string; disabled: boolean;
+export function ImageAnnotator({picture, takeoverId, runId, disabled, onChange, onRemove}: {
+  picture: HandoffPicture | null; takeoverId: string; runId: string; disabled: boolean;
   onChange: (value: VisualInput | null) => void; onRemove: () => void;
 }) {
   const captured = (): Source | null => picture ? {url: `/api/local-image?path=${encodeURIComponent(picture.path)}`,
     width: picture.width || 1, height: picture.height || 1,
     input: {takeover_id: takeoverId, source_sha256: picture.sha256}, label: '接管时截图'} : null;
   const [source, setSource] = useState<Source | null>(captured);
+  const [extras, setExtras] = useState<Source[]>([]);
+  const [adding, setAdding] = useState(false);
   const [strokes, setStrokes] = useState<AnnotationStroke[]>([]);
   const [draft, setDraft] = useState<AnnotationStroke | null>(null);
   const [tool, setTool] = useState<AnnotationStroke['tool']>('circle');
@@ -25,13 +28,37 @@ export function ImageAnnotator({picture, takeoverId, disabled, onChange, onRemov
   const fileInput = useRef<HTMLInputElement>(null);
   const loadVersion = useRef(0);
   useEffect(() => () => {loadVersion.current++;}, []);
-  useEffect(() => {onChange(source && ready && !loading ? {...source.input, strokes} as VisualInput : null);},
-    [source, strokes, loading, ready, onChange]);
+  useEffect(() => {onChange(source && ready && !loading ? {...source.input, strokes,
+    ...(extras.length ? {extras: extras.map(extra => ({...extra.input, strokes: [] as []}))} : {})} : null);},
+    [source, strokes, extras, loading, ready, onChange]);
   function replace(next: Source) {
     setReady(next.url === source?.url && ready); setSource(next); setStrokes([]); setDraft(null); active.current = null; setError('');
   }
+  function accept(next: Source) {
+    if (adding && source) {
+      if (extras.length >= 7) {setError('一次最多添加 8 张截图。'); return;}
+      setExtras(old => [...old, next]); setError('');
+    } else replace(next);
+    setAdding(false);
+  }
+  async function capture() {
+    if (disabled || loading) return;
+    const version = ++loadVersion.current;
+    setLoading(true); setError('');
+    try {
+      const result = await api<{capture_id: string; picture: HandoffPicture}>(`/api/jobs/${runId}/interventions`,
+        {kind: 'capture', takeover_id: takeoverId});
+      const p = result.picture;
+      const url = `/api/local-image?path=${encodeURIComponent(p.path)}`;
+      const image = new Image(); image.src = url; await image.decode();
+      if (version !== loadVersion.current) return;
+      accept({url, width: p.width, height: p.height, label: '实时截图',
+        input: {takeover_id: takeoverId, capture_id: result.capture_id, source_sha256: p.sha256}});
+    } catch (e) {if (version === loadVersion.current) setError(`实时截图失败，原截图已保留：${String(e)}`);}
+    finally {if (version === loadVersion.current) setLoading(false);}
+  }
   async function upload(file: File) {
-    if (disabled) return;
+    if (disabled || loading) return;
     if (file.size > maxBytes || !['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
       setError('请选择不超过 4 MB 的 PNG、JPEG 或 WebP 截图。'); return;
     }
@@ -47,7 +74,7 @@ export function ImageAnnotator({picture, takeoverId, disabled, onChange, onRemov
       if (Math.min(image.width, image.height) < 16 || Math.max(image.width, image.height) > 4096 ||
           image.width * image.height > 12_000_000) throw new Error('图片边长需在 16..4096 像素内，最多 1200 万像素');
       if (version !== loadVersion.current) return;
-      replace({url, width: image.width, height: image.height, input: {upload_data_url: url}, label: '上传的参考截图'});
+      accept({url, width: image.width, height: image.height, input: {upload_data_url: url}, label: '上传的参考截图'});
     } catch (e) {if (version === loadVersion.current) setError(`无法读取截图：${String(e)}`);}
     finally {if (version === loadVersion.current) setLoading(false);}
   }
@@ -108,13 +135,17 @@ export function ImageAnnotator({picture, takeoverId, disabled, onChange, onRemov
     }}>
     <div className="annotation-toolbar">
       <strong>截图与标注</strong>
+      <Button size="small" disabled={disabled || loading} onClick={() => void capture()}>实时截图</Button>
       <Button size="small" disabled={disabled || loading} onClick={() => fileInput.current?.click()}>上传截图</Button>
-      {picture && <Button size="small" disabled={disabled || loading} onClick={() => replace(captured()!)}>使用接管截图</Button>}
+      {picture && <Button size="small" disabled={disabled || loading} onClick={() => accept(captured()!)}>使用接管截图</Button>}
+      <Button size="small" disabled={disabled || loading || !ready || extras.length >= 7}
+        aria-pressed={adding} onClick={() => setAdding(value => !value)}>{adding ? '取消添加' : '添加截图'}</Button>
       <Button size="small" disabled={disabled} onClick={onRemove}>移除截图</Button>
       <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" hidden aria-label="选择截图文件"
         onChange={event => {const file = event.target.files?.[0]; if (file) void upload(file); event.target.value = '';}}/>
     </div>
-    <p className="quiet">可上传或在这里粘贴截图。拖动画圈、打叉或画线，再在下方补充说明。</p>
+    <p className="quiet">{adding ? '请选择实时截图、使用接管截图，或上传 / 粘贴图片，作为附加截图。主图和标注会保留。' :
+      '实时截图会立即重新截取手机画面。添加截图可附带多张图片（最多 8 张），仅主图支持标注。上传或粘贴会替换主图。'}</p>
     <div className="annotation-toolbar" role="toolbar" aria-label="标注工具">
       {Object.entries(tools).map(([key, label]) => <Button key={key} size="small" aria-pressed={tool === key}
         appearance={tool === key ? 'primary' : 'secondary'} disabled={disabled || !ready || loading}
@@ -136,6 +167,13 @@ export function ImageAnnotator({picture, takeoverId, disabled, onChange, onRemov
       </div>
       <p className="quiet">{source.label} · 参考画面不会随手机更新；继续时模型会重新观察实际界面。</p>
     </> : <p className="quiet">没有可用的接管截图，可以上传或粘贴参考截图。</p>}
+    {!!extras.length && <div className="annotation-extras" aria-label="附加截图">
+      {extras.map((extra, i) => <figure key={`${i}-${extra.url}`}>
+        <a href={extra.url} target="_blank" rel="noreferrer"><img src={extra.url} alt={`附加截图 ${i + 1}`}/></a>
+        <figcaption>附图 {i + 1} · {extra.label}</figcaption>
+        <Button size="small" disabled={disabled || loading} onClick={() => setExtras(old => old.filter((_, n) => n !== i))}>移除附图 {i + 1}</Button>
+      </figure>)}
+    </div>}
     {loading && <p role="status">正在读取截图…</p>}
     {error && <p role="alert" className="inline-warning">{error}</p>}
   </div>;

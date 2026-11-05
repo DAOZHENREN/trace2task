@@ -1,6 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import {Button, Input, Textarea} from '@fluentui/react-components';
 import {api} from './api';
+import {ApplicationKnowledge} from './ApplicationKnowledge';
 import {useConfirm} from './ConfirmDialog';
 import {Dictation, dictationActive} from './audio';
 import {currentTrace, traceAssetUrl, usableTrace, versionTime} from './experience';
@@ -170,9 +171,14 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
     <PageHeading eyebrow={mode === 'trash' ? 'RECYCLE BIN' : 'EXPERIENCE LIBRARY'} title={mode === 'trash' ? '全局回收站' : mode === 'recordings' ? '已保存的录制示范' : '经验积累下来，下一次更从容。'} copy={mode === 'trash' ? '统一管理录制示范、经验版本、反馈和运行记录；不会自动清空。' : '默认展示当前版本，自动选择也只使用当前版本。旧版本保留在版本历史中，可查看原文并回滚，不自动删除。'}
       action={<div className="button-row"><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/>{mode !== 'trash' && <Button onClick={onRecord}>录制新示范</Button>}</div>}/>
     {!mode && <Sections label="经验分类" value={tab} onChange={value => {setTab(value); setHistoryFamily(''); setSelection(null); setFilter('');}} items={[
-      {id: 'sequences', label: `经验版本 · ${currentTraces.length}`}, {id: 'history', label: `版本历史 · ${historicalTraces.length}`}, {id: 'recordings', label: `原始录制 · ${state.recordings.length}`},
+      {id: 'sequences', label: `经验版本 · ${currentTraces.length}`}, {id: 'history', label: `版本历史 · ${historicalTraces.length}`},
+      {id: 'knowledge', label: `底层知识 · ${state.application_knowledge?.length || 0}`}, {id: 'recordings', label: `原始录制 · ${state.recordings.length}`},
       {id: 'tasks', label: `旧版状态图 · ${state.taskpacks.length}`}, {id: 'candidates', label: `反馈审查 · ${state.candidates.length}`} ]}/>}
     {message && <p className="notice" role="status">{message}</p>}
+    {!mode && <div hidden={tab !== 'knowledge'}>
+      <ApplicationKnowledge profiles={state.application_knowledge || []} busy={busy} refresh={refresh} onError={onError}/>
+    </div>}
+    {tab !== 'knowledge' && <>
     <div className="library-toolbar"><Input aria-label="搜索经验" value={filter} placeholder="搜索名称、指令或说明" contentBefore={<Icon name="library" size={18}/>} onChange={(_, d) => setFilter(d.value)}/>
       <span className="quiet">{pending ? '正在处理…' : '新版本正式保存后成为当前版本；草稿不影响当前版本'}</span></div>
     {tab === 'history' && <div className="notice"><span>{historyFamily ? '这份经验的完整版本历史（含当前版本）' : '历史版本仅供查看；回滚后可用于后续任务。'}</span>
@@ -305,6 +311,7 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
     </div>
     {({sequences: currentTraces.length, history: visibleTraces.length, recordings: state.recordings.length, tasks: state.taskpacks.length, candidates: state.candidates.length, trash: trash.length}[tab] || 0) === 0 &&
       <section className="surface"><Empty icon="library" title={tab === 'trash' ? '回收站是空的' : '这里还没有记录'} text={tab === 'trash' ? '移入回收站的资产会在这里显示，可以恢复或明确确认后永久删除。' : '新录制、编译结果或反馈会出现在对应分类。已有数据不会被自动转换或覆盖。'} action={tab === 'trash' ? undefined : <Button onClick={onRecord}>录制示范</Button>}/></section>}
+    </>}
   </>;
 }
 

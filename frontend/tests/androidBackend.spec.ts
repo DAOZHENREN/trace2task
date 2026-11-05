@@ -4,6 +4,38 @@ test.beforeEach(async ({page}) => {
   await page.route('**/api/android/devices', route => route.fulfill({json: {devices: [], warnings: []}}));
 });
 
+test('local GUI models can confirm an Android task with the selected engine and budget', async ({page}) => {
+  const jobs: any[] = [];
+  await page.route('**/api/local-model/status', route => route.fulfill({json: {
+    checked_at: new Date().toISOString(), services: [{id: 'gui', label: '本地 GUI 服务',
+      endpoint: 'http://127.0.0.1:8768', reachable: true, status: 'running', backend: 'slotread', model: 'gui-decisions-2b'}],
+  }}));
+  await page.route('**/api/jobs', route => {
+    jobs.push(route.request().postDataJSON());
+    return route.fulfill({json: {job_id: 'local-phone-fixture', status: 'completed', kind: 'agent',
+      provider: 'trained_d', model: 'gui-decisions-2b'}});
+  });
+  await page.goto('/');
+  await page.getByLabel('模型来源', {exact: true}).selectOption('local');
+  await page.getByLabel('执行模型', {exact: true}).selectOption('gui-decisions-2b');
+  await page.getByLabel('操作范围', {exact: true}).selectOption('android');
+  await page.getByText('手动连接与高级设置', {exact: true}).click();
+  await page.getByRole('combobox', {name: '设备 serial', exact: true}).fill('127.0.0.1:62273');
+  await page.getByRole('combobox', {name: '授权应用包名', exact: true}).fill('com.android.deskclock');
+  await page.getByLabel('动作预算', {exact: true}).fill('12');
+  await page.getByLabel('时间预算（分钟）', {exact: true}).fill('1');
+  await page.getByRole('textbox', {name: '任务指令'}).fill('暂停秒表');
+  await page.getByRole('button', {name: '开始任务', exact: true}).click();
+  await expect(page.getByRole('dialog')).toContainText('本机 GPU');
+  expect(jobs).toHaveLength(0);
+  await page.getByRole('button', {name: '确认开始', exact: true}).click();
+  await expect.poll(() => jobs.length).toBe(1);
+  expect(jobs[0]).toMatchObject({provider: 'trained_d', model: 'gui-decisions-2b', inference_backend: 'slotread',
+    executor_backend: 'android', execution_scope: 'android', android_budget: {max_actions: 12, max_seconds: 60},
+    android_config: {serial: '127.0.0.1:62273', package: 'com.android.deskclock'}});
+  expect(jobs[0].api).toBeUndefined();
+});
+
 test('scope selects the backend and Android locks ADB; Win32 is retired', async ({page}) => {
   const jobs: unknown[] = [];
   await page.route('**/api/jobs', route => {
