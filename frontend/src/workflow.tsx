@@ -20,15 +20,15 @@ export function Sections({value, onChange, items, label}: {value: string; onChan
   return <TabList className="section-tabs" selectedValue={value} onTabSelect={(_, d) => onChange(String(d.value))} aria-label={label}>
     {items.map(item => <Tab key={item.id} value={item.id}>{item.label}</Tab>)}</TabList>;
 }
-export function CompilerChoice({state, value, onChange, disabled}: {state: AppState; value: ModelChoice;
-  onChange: (choice: ModelChoice) => void; disabled: boolean}) {
+export function CompilerChoice({state, value, onChange, disabled, modelLabel = "编译 / 修订模型", effortLabel = "编译 / 修订思考强度"}: {state: AppState; value: ModelChoice;
+  onChange: (choice: ModelChoice) => void; disabled: boolean; modelLabel?: string; effortLabel?: string}) {
   const options = state.agent_options;
   useEffect(() => {
     if (!value.model && options.defaults.model) onChange(options.compiler_defaults || options.defaults);
   }, [value.model, options.defaults.model]);
-  return <><div className="two-fields"><Field label="编译 / 修订模型"><Choice value={value.model} disabled={disabled}
+  return <><div className="two-fields"><Field label={modelLabel}><Choice value={value.model} disabled={disabled}
     onChange={e => onChange(chooseCodexModel(options, e.target.value, value.reasoning_effort))}><CodexModelOptions options={options} value={value.model}/></Choice></Field>
-    <Field label="编译 / 修订思考强度"><Choice value={value.reasoning_effort} disabled={disabled}
+    <Field label={effortLabel}><Choice value={value.reasoning_effort} disabled={disabled}
       onChange={e => onChange({...value, reasoning_effort: e.target.value})}>
       {!codexEfforts(options, value.model).includes(value.reasoning_effort) && <option value={value.reasoning_effort} disabled>请重新选择</option>}
       {codexEfforts(options, value.model).map(e => <option key={e}>{e}</option>)}</Choice></Field></div>

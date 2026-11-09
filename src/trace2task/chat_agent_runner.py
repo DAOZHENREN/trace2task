@@ -25,7 +25,8 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                    backend=None, capture=None, size=None, cua_driver=None, browser_driver=None,
                    android_config=None, android_driver=None, model_adapter=None,
                    memory_mode=None, memory_root=None, on_memory_selection=None, interventions=None,
-                   hybrid=None, hybrid_executor_api_config=None, application_knowledge=None):
+                   hybrid=None, hybrid_executor_api_config=None, application_knowledge=None, child_desktop=None,
+                   on_desktop_progress=None):
     """Execute a primary-desktop or explicitly selected-window chat task.
 
     This is the shared-loop route. Legacy single-window taskpack semantics and
@@ -146,8 +147,8 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             '总时间预算继续计时，可随时停止。')
     if provider == "api":
         session.system_guidance = '' if hybrid is not None else prompt_guidance
-    from trace2task.cua_desktop import DESKTOP_TARGET
-    cua_desktop = executor_backend == "cua" and cua_target == DESKTOP_TARGET
+    from trace2task.cua_desktop import CHILD_DESKTOP_TARGET, DESKTOP_TARGET
+    cua_desktop = executor_backend == "cua" and cua_target in (DESKTOP_TARGET, CHILD_DESKTOP_TARGET)
     adapter = model_adapter or ChatModelAdapter(session, selected_windows=executor_backend == "cua" and not cua_desktop,
                                provider=provider, prompt_guidance=prompt_guidance,
                                evidence_directory=root / 'experience-images',
@@ -213,16 +214,21 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             execution_backend = BrowserExecutionBackend(driver)
             status_callback('Ancient Beast 独立无头浏览器已启动；不占用系统键鼠，不回退前台。')
         elif cua_desktop:
-            from trace2task.cua_backend import CuaBackend
-            from trace2task.cua_desktop import CuaDesktopExecutionBackend, CuaDesktopObservation
-            driver = cua_driver or CuaBackend(root, record)
+            from trace2task.cua_desktop import (
+                CuaDesktopExecutionBackend,
+                CuaDesktopObservation,
+                desktop_driver,
+            )
+            driver = cua_driver or desktop_driver(cua_target, root, record, emergency_stop, child_desktop,
+                                                  on_desktop_progress or (lambda message, _: status_callback(message)))
             driver.start()
-            target = dict(DESKTOP_TARGET)
+            target = dict(cua_target)
             result["cua_scope"] = target
-            observation = CuaDesktopObservation(driver)
-            execution_backend = CuaDesktopExecutionBackend(driver)
-            status_callback("Cua 全桌面 3 秒后截图；使用系统键鼠，F9 停止。")
-            emergency_stop.sleep(3)
+            observation = CuaDesktopObservation(driver, target)
+            execution_backend = CuaDesktopExecutionBackend(driver, target)
+            if target != CHILD_DESKTOP_TARGET:
+                status_callback("Cua 全桌面 3 秒后截图；使用系统键鼠，F9 停止。")
+                emergency_stop.sleep(3)
         elif executor_backend == "cua":
             from trace2task.cua_backend import CuaBackend
             from trace2task.cua_execution import CuaExecutionBackend
@@ -271,9 +277,9 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                selected_scope=result.get('android_scope', result.get("browser_scope", result.get("cua_scope"))))
         if memory_mode == 'auto':
             from trace2task.agent_memory import MemoryCatalog, select_memory
-
-            scope = ('selected_windows' if executor_backend == 'cua' and not cua_desktop else
-                     executor_backend if executor_backend in {'android', 'browser'} else 'desktop')
+            from trace2task.run_session import operation_scope
+            scope = operation_scope(executor_backend, executor_backend if executor_backend in {'android', 'browser'}
+                                    else 'desktop', cua_target)
             emergency_stop.raise_if_requested()
             catalog = MemoryCatalog(memory_root, scope, (android_config or {}).get('package', ''))
             screenshot, context = None, None

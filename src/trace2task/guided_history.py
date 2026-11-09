@@ -22,7 +22,10 @@ class GuidedTaskConversation(GuiConversation):
     def __init__(self, identity, model, prompt_profile, guided_knowledge=''):
         instruction = ('Execute the current subgoal using the latest screenshot. Previous turns contain confirmed actions. '
                        'Follow the current notices. Honor restrictions and apply conditional tips when relevant. '
-                       'A new subgoal replaces earlier notices.')
+                       'Work through routine navigation, observation, loading and recoverable errors until Completion is visible. '
+                       'Report completion only for that stage outcome. If Fail conditions occur or you cannot '
+                       'make progress within scope, use your native failure/help response and describe the obstacle. '
+                       'A new subgoal replaces the previous completion criteria, notices and failure conditions.')
         super().__init__(identity, model, instruction + guided_knowledge, None, prompt_profile)
 
 

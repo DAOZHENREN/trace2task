@@ -13,21 +13,25 @@ import {RunInterventions} from './RunInterventions';
 function useRun(id: string | null) {
   const [run, setRun] = useState<Run | null>(null);
   const [rounds, setRounds] = useState<Record<number, Round>>({});
-  const [logs, setLogs] = useState<{seq: number; message: string}[]>([]);
+  const [logs, setLogs] = useState<{seq: number; time: string; message: string; screenshot?: string}[]>([]);
+  const [archivedStartup, setArchivedStartup] = useState('');
   const [error, setError] = useState('');
   useEffect(() => {
-    setRun(null); setRounds({}); setLogs([]); setError('');
+    setRun(null); setRounds({}); setLogs([]); setError(''); setArchivedStartup('');
     if (!id) return;
     const abort = new AbortController(); let cursor = 0; let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       let delay = 1000;
       try {
-        const data = await api<{session: Run; events: RunEvent[]; cursor: number; has_more: boolean}>(
+        const data = await api<{session: Run; events: RunEvent[]; cursor: number; has_more: boolean; desktop_startup_note?: string}>(
           `/api/workbench/runs/${id}?after=${cursor}`, undefined, abort.signal);
+        if (data.desktop_startup_note) setArchivedStartup(data.desktop_startup_note);
         cursor = data.cursor; setRun(data.session); setError('');
         const changed = data.events.filter(e => e.name === 'model.round');
         if (changed.length) setRounds(previous => {const next = {...previous}; changed.forEach(e => {next[e.attributes.step_index] = e.attributes;}); return next;});
-        const added = data.events.filter(e => e.name === 'run.log').map(e => ({seq: e.seq, message: e.attributes.message || ''}));
+        const added = data.events.filter(e => e.name === 'run.log').map(e => ({
+          seq: e.seq, time: e.time, message: e.attributes.message || '', screenshot: e.attributes.screenshot,
+        }));
         if (added.length) setLogs(previous => [...previous, ...added]);
         if (data.has_more) delay = 30;
         else if (!active(data.session)) return;
@@ -36,16 +40,16 @@ function useRun(id: string | null) {
     }
     void poll(); return () => {abort.abort(); clearTimeout(timer);};
   }, [id]);
-  return {run, rounds: Object.values(rounds).sort((a, b) => a.step_index - b.step_index), logs, error};
+  return {run, rounds: Object.values(rounds).sort((a, b) => a.step_index - b.step_index), logs, error, archivedStartup};
 }
 
-function RoundObservation({path, step, label = '观察画面'}: {path: string; step: number; label?: string}) {
+function RoundObservation({path, step, label = '观察画面'}: {path: string; step?: number; label?: string}) {
   const [failed, setFailed] = useState(false);
   const url = `/api/local-image?path=${encodeURIComponent(path)}`;
   return <figure className="round-observation">
-    <figcaption><strong>第 {step + 1} 轮 · {label}</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
+    <figcaption><strong>{step !== undefined && `第 ${step + 1} 轮 · `}{label}</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
     {failed ? <p className="quiet" role="status">画面加载失败，原运行记录仍保留；可尝试打开原图。</p>
-      : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={`第 ${step + 1} 轮归档观察截图`} loading="lazy"
+      : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={step === undefined ? label : `第 ${step + 1} 轮归档观察截图`} loading="lazy"
         onError={() => setFailed(true)}/></a>}
   </figure>;
 }
@@ -79,7 +83,12 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
       {round.subtask && <><p><strong>{round.subtask.goal || round.subtask.objective}</strong><br/>完成条件：{round.subtask.completion_hint || round.subtask.completion}</p>
         {!!(round.subtask.notices ?? round.subtask.constraints)?.length && <ul aria-label="执行提示与限制">
           {(round.subtask.notices ?? round.subtask.constraints)?.map((notice, index) => <li key={index}>{notice}</li>)}
-        </ul>}</>}
+        </ul>}
+        {!!(round.subtask.fail_conditions ?? round.subtask.handoff_conditions)?.length && <div>
+          <strong>需要指导的失败条件</strong>
+          <ul>{(round.subtask.fail_conditions ?? round.subtask.handoff_conditions)?.map((condition, index) =>
+            <li key={index}>{condition}</li>)}</ul>
+        </div>}</>}
       {round.execution_status === 'intervened' && <p className="inline-warning">人工干预使本轮剩余计划或核验结论作废；已交付动作以回执为准。</p>}
       {round.verification && <p className="verification"><strong>模型视觉复核：{round.verification.verdict}</strong> · {round.verification.evidence} {round.verification.missing}</p>}
       <div className="round-actions">{round.screenshot && <Button size="small" appearance="subtle" icon={<Icon name="screen" size={16}/>}
@@ -105,7 +114,10 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
 export function RunInspector({id, onLibrary, state, busy = false, onRun, onError, onKnowledgeSaved}: {id: string | null;
   onLibrary?: (traceId: string) => void; state?: AppState; busy?: boolean;
   onRun?: (run: Run) => void; onError?: (text: string) => void; onKnowledgeSaved?: () => Promise<void>}) {
-  const {run, rounds, logs, error} = useRun(id);
+  const {run, rounds, logs, error, archivedStartup} = useRun(id);
+  const child = (run?.operation_scope ?? run?.run_facts?.operation_scope) === 'child_desktop';
+  const startup = child ? logs.filter(entry => /^(正在连接.*后台桌面|已连接后台桌面|Windows 已登录后台桌面|后台桌面 \d|已(?:启动|复用)后台桌面)/.test(entry.message)) : [];
+  const picture = startup.find(entry => entry.screenshot)?.screenshot;
   const latestStatus = logs.at(-1)?.message || '';
   const performance = run?.result?.performance;
   if (!id) return <section className="idle-stage"><Icon name="history" size={20}/><div className="stage-copy">
@@ -130,10 +142,18 @@ export function RunInspector({id, onLibrary, state, busy = false, onRun, onError
       {run?.run_facts && <details className="run-facts"><summary>本次运行事实 · {run.run_facts.model} · {run.run_facts.execution_backend}</summary><dl className="facts-list">
         <dt>模型</dt><dd>{run.run_facts.model}</dd><dt>所选引擎</dt><dd>{run.run_facts.inference_backend}</dd>
         <dt>回包证实</dt><dd>{run.observed_inference?.backend || '尚未取得引擎回执'}</dd>
-        <dt>执行后端</dt><dd>{run.run_facts.execution_backend}</dd><dt>授权范围</dt><dd>{run.run_facts.operation_scope === 'none' ? '不执行操作' : run.run_facts.operation_scope === 'browser' ? 'Ancient Beast · 独立浏览器' : run.run_facts.operation_scope === 'desktop' ? '整个主显示器' : '仅指定窗口 / 应用'}</dd>
+        <dt>执行后端</dt><dd>{run.run_facts.execution_backend}</dd><dt>授权范围</dt><dd>{run.run_facts.operation_scope === 'none' ? '不执行操作' : run.run_facts.operation_scope === 'browser' ? 'Ancient Beast · 独立浏览器' : run.run_facts.operation_scope === 'child_desktop' ? 'Windows 后台桌面' : run.run_facts.operation_scope === 'desktop' ? '整个主显示器' : '仅指定窗口 / 应用'}</dd>
         <dt>数据去向</dt><dd>{run.run_facts.destination}</dd><dt>经验</dt><dd>{run.run_facts.memory_mode === 'auto' ? 'Agent 按需选择 · 实际加载见经验记录' : run.run_facts.experience_path ? '启动时固定的经验版本' : '未使用'}</dd></dl>
         <p className="quiet">{run.run_facts.context_description}</p><div className="run-id mono">RUN {run.job_id.slice(0, 12)}</div></details>}
+      {child && <section aria-label="后台桌面连接记录">
+        <h3>后台桌面连接</h3>
+        {startup.map(entry => <p className="quiet" key={entry.seq}><time dateTime={entry.time}>{new Date(entry.time).toLocaleTimeString()}</time> · {entry.message}</p>)}
+        {archivedStartup && <p>{archivedStartup}</p>}
+        {picture && !rounds.length && <RoundObservation key={picture} path={picture} label="后台桌面首张截图"/>}
+        {picture && !!rounds.length && <details><summary>查看后台桌面首张截图</summary><RoundObservation key={picture} path={picture} label="后台桌面首张截图"/></details>}
+      </section>}
       {rounds.length ? rounds.map(r => <RoundCard key={`${id}:${r.step_index}`} round={r} provider={run?.provider}/>)
+        : child ? <p className="quiet" role="status">{active(run) ? '正在等待第一轮模型输入。' : '本次运行在第一轮模型输入前结束，未产生模型动作回执。'}</p>
         : <Empty title={active(run) ? '正在准备运行记录' : '此运行没有逐轮模型记录'} text={active(run) ? '过程会在这里更新，你可以随时停止后续动作。' : '可展开运行日志；录制、编译和修订结果也可在经验库查看。'}/>}
       <details className="log-disclosure"><summary>运行日志 · {logs.length} 条</summary><div className="log-scroll" tabIndex={0}>
         {logs.map(l => <pre key={l.seq}>{l.message}</pre>)}</div><p className="quiet">增量加载；不会强制滚动或折叠你正在阅读的内容。</p></details>

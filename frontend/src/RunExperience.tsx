@@ -25,7 +25,7 @@ type Draft = {draft_id: string; draft_sha256: string; content: string; trace_nam
   authoring?: {kind: string; guidance: string; revision: number} | null;
   lineage?: ExperienceLineage | null; parent_content?: string; revision_diff?: string; revision_changed?: boolean | null;
   saved_trace_id: string | null; summary: Summary; compiler_images: Picture[]};
-const scopeLabel = (scope: string) => ({android: 'Android · 指定应用', desktop: '桌面', selected_windows: '指定窗口', browser: '独立浏览器'}[scope] || scope);
+const scopeLabel = (scope: string) => ({android: 'Android · 指定应用', desktop: '桌面', child_desktop: 'Windows 后台桌面', selected_windows: '指定窗口', browser: '独立浏览器'}[scope] || scope);
 
 /** Plain-text Markdown subset; no HTML, scripts or model-controlled links. */
 function MethodText({content}: {content: string}) {

@@ -1,7 +1,12 @@
 import pytest
 from PIL import Image
 
-from trace2task.cua_desktop import DESKTOP_TARGET, CuaDesktopExecutionBackend, CuaDesktopObservation
+from trace2task.cua_desktop import (
+    CHILD_DESKTOP_TARGET,
+    DESKTOP_TARGET,
+    CuaDesktopExecutionBackend,
+    CuaDesktopObservation,
+)
 from trace2task.execution_core import ExecutionCore
 from trace2task.execution_protocol import ActionUnavailable, ObservationStale, UnifiedAction
 
@@ -48,12 +53,13 @@ POST_CLICK_ERROR = (
     'after the click (actual foreground HWND 0xa20d80)\n')
 
 
-def test_cross_app_click_reobserves_without_retry_or_remaining_batch(tmp_path):
+@pytest.mark.parametrize("prefix", ["Cua returned a non-JSON error", "Cua process failed (1)"])
+def test_cross_app_click_reobserves_without_retry_or_remaining_batch(tmp_path, prefix):
     class SwitchingDriver(Driver):
         def call(self, tool, payload):
             if tool == 'click':
                 self.calls.append((tool, payload))
-                raise RuntimeError(POST_CLICK_ERROR)
+                raise RuntimeError(POST_CLICK_ERROR.replace("Cua returned a non-JSON error", prefix))
             return super().call(tool, payload)
 
     driver = SwitchingDriver(tmp_path)
@@ -136,7 +142,8 @@ def test_desktop_drag_hover_and_unsupported_action(tmp_path):
 
 @pytest.mark.parametrize('provider', ['api', 'codex'])
 @pytest.mark.parametrize('cross_app_click', [False, True])
-def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider, cross_app_click):
+@pytest.mark.parametrize('target', [DESKTOP_TARGET, CHILD_DESKTOP_TARGET])
+def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider, cross_app_click, target):
     import json
     from types import SimpleNamespace
 
@@ -167,13 +174,65 @@ def test_chat_providers_complete_shared_cua_desktop_loop(tmp_path, provider, cro
             return super().call(tool, payload)
 
     driver = SwitchingDriver(tmp_path) if cross_app_click else Driver(tmp_path)
+    driver.session_id = 23
     result = run_chat_agent(instruction='type hello', model='fake', reasoning_effort='low',
         output_root=tmp_path, emergency_stop=Stop(), status_callback=lambda message: None,
-        executor_backend='cua', cua_target=DESKTOP_TARGET, session=Session(),
+        executor_backend='cua', cua_target=target, session=Session(),
         api_config=SimpleNamespace() if provider == 'api' else None, cua_driver=driver)
     assert result['actions'] == (0 if cross_app_click else 1)
     assert result['stop_reason'] == 'visual_completion_reviewed'
+    assert result['cua_scope'] == target
     if cross_app_click:
         assert [name for name, _ in driver.calls].count('click') == 1
         assert [name for name, _ in driver.calls].count('get_desktop_state') == 3
         assert result['model_io'][0]['execution']['executed'] is None
+
+
+def test_local_runner_uses_child_driver_for_observation_and_input(tmp_path, monkeypatch):
+    from trace2task import cua_runner, local_gui_client
+    from trace2task.trained_model_runner import run_trained_desktop
+
+    driver = Driver(tmp_path)
+    driver.session_id = 23
+
+    def create(target, root, record, stop, workspace, on_progress):
+        assert target == CHILD_DESKTOP_TARGET
+        driver.root = root
+        return driver
+
+    replies = iter([
+        {'status': 'predicted', 'prediction': {'actions': [{'skill': 'type_text', 'args': {'text': 'test'}}]}},
+        {'status': 'model_control', 'control': 'answer', 'text': 'done'},
+    ])
+    monkeypatch.setattr(cua_runner, 'desktop_driver', create)
+    monkeypatch.setattr(local_gui_client, 'predict_gui', lambda *a, **kw: next(replies))
+    result = run_trained_desktop(instruction='type test', output_root=tmp_path,
+        emergency_stop=Stop(), status_callback=lambda message: None, model='qwen3-vl-2b',
+        executor_backend='cua', cua_target=CHILD_DESKTOP_TARGET, approve=lambda _: None, continuous=True)
+    assert result['stop_reason'] == 'model_answered', result.get('error')
+    assert result['actions'] == 1 and result['cua_scope'] == CHILD_DESKTOP_TARGET
+    assert [tool for tool, _ in driver.calls].count('type_text') == 1
+    step = result['model_io'][0]['execution']['steps'][0]
+    assert step['delivery_mode'] == 'child_session'
+    assert step['receipt']['delivery']['windows_session_id'] == 23
+    assert step['receipt']['effect'] == 'unverifiable'
+
+
+def test_child_desktop_rejects_parent_and_changed_session_before_input(tmp_path):
+    from trace2task.run_session import operation_scope
+
+    driver = Driver(tmp_path)
+    obs = CuaDesktopObservation(driver, CHILD_DESKTOP_TARGET)
+    with pytest.raises(ObservationStale):
+        obs.observe(CHILD_DESKTOP_TARGET, 0)
+    assert not driver.calls
+    driver.session_id = 23
+    target, state, _ = obs.observe(CHILD_DESKTOP_TARGET, 0)
+    assert operation_scope('cua', 'desktop', target) == 'child_desktop'
+    backend = CuaDesktopExecutionBackend(driver, target)
+    with pytest.raises(ValueError):
+        backend.authorize(None, DESKTOP_TARGET)
+    driver.session_id = 24
+    with pytest.raises(ObservationStale):
+        backend.check_current(target, state)
+    assert [tool for tool, _ in driver.calls] == ['get_desktop_state']

@@ -94,7 +94,8 @@ def test_guided_conversation_keeps_only_confirmed_actions(service_module, tmp_pa
     engine = _engine_with_model(service_module, tmp_path, lambda **kwargs: _FakeTensor([1, 2, 3, 99]))
     start = _request('guided-first')
     start.update(conversation_id='guided-test-run', conversation_start=True,
-                 guided_history_offset=0, guided_history=[], guided_knowledge='\nCombat toolbar layout')
+                 guided_history_offset=0, guided_history=[],
+                 guided_knowledge='\nCombat toolbar layout' + '\nTask experience: check progress.' * 300)
     first = engine.predict(start)
     assert first['status'] == 'predicted'
     first_archive = json.loads((Path(first['output_directory']) / 'input.json').read_text(encoding='utf-8'))
@@ -105,7 +106,7 @@ def test_guided_conversation_keeps_only_confirmed_actions(service_module, tmp_pa
     followup = {**start, 'request_id': 'guided-second', 'conversation_start': False,
                 'task': 'A different subgoal',
                 'guided_history': [{'raw_output': 'confirmed click', 'image': start['image']}]}
-    with pytest.raises(ValueError, match='底层知识仅可在混合会话首轮提交'):
+    with pytest.raises(ValueError, match='基础知识与经验仅可在混合会话首轮提交'):
         engine.predict(followup)
     del followup['guided_knowledge']
     result = engine.predict(followup)

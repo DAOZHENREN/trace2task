@@ -331,10 +331,10 @@ def read_draft(root, identifier):
 def _save_options(draft, versions):
     summary = draft['summary']
     candidates = [v for v in versions if v['is_current'] and v['representation'] == 'B'
-                  and ((v.get('source_scope') == summary['scope']
+                  and ((_experience_scope(v.get('source_scope')) == _experience_scope(summary['scope'])
                         and v.get('source_package', '') == summary.get('package', ''))
                        if v.get('source_kind') == 'agent_run'
-                       else summary['scope'] in {'desktop', 'selected_windows'})]
+                       else summary['scope'] in {'desktop', 'child_desktop', 'selected_windows'})]
     # Editing a published independent draft continues that experience, even when
     # its provenance still refers to an older, different experience.
     authoring = draft.get('authoring') or {}
@@ -525,7 +525,7 @@ def compile_run_draft(root, prepared, *, model, reasoning_effort, stop_event=Non
             raise ValueError('缺少可维护的应用知识范围')
         prompt = prompt.replace('只输出 Markdown 方法正文：', '任务经验 Markdown 正文：')
         prompt += ('\n返回 JSON。experience 按原要求写任务方法 Markdown。application_knowledge 写可独立维护的完整底层知识 Markdown，'
-                   '保留仍成立的已有知识，仅补充或纠正有证据的通用机制，最多 6000 字。无可确认的变化时该字段填空字符串。'
+                   '保留仍成立的已有知识，仅补充或纠正有证据的通用机制。无可确认的变化时该字段填空字符串。'
                    '用户修订要求可能同时涉及两份正文，请按对应范围修改。')
         schema = {'type': 'object', 'additionalProperties': False,
                   'properties': {'experience': {'type': 'string'}, 'application_knowledge': {'type': 'string'}},
@@ -731,6 +731,10 @@ def _publish_draft(root, identifier, draft, versioning):
     return {'id': identifier, 'already_saved': False, 'versioning': versioning}
 
 
+def _experience_scope(scope):
+    return 'desktop' if scope == 'child_desktop' else scope
+
+
 def validate_experience_scope(root, path, scope, package=''):
     from trace2task.trace_library import read_body
     body = read_body(root, path.parent.name)
@@ -738,5 +742,5 @@ def validate_experience_scope(root, path, scope, package=''):
         if (body.get('representation') != 'B' or body.get('source_kind') != 'agent_run'
                 or body.get('source_scope') != 'android' or body.get('source_package') != package):
             raise ValueError('Android 仅支持从同一授权应用运行提炼的文本方法 B')
-    elif body.get('source_kind') == 'agent_run' and body.get('source_scope') != scope:
+    elif body.get('source_kind') == 'agent_run' and _experience_scope(body.get('source_scope')) != _experience_scope(scope):
         raise ValueError('经验来源范围与本次授权范围不同，请重新选择匹配的经验')

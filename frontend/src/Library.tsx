@@ -176,7 +176,7 @@ export function Library({state, busy, refresh, onRun, onError, onUse, onRecord, 
       {id: 'tasks', label: `旧版状态图 · ${state.taskpacks.length}`}, {id: 'candidates', label: `反馈审查 · ${state.candidates.length}`} ]}/>}
     {message && <p className="notice" role="status">{message}</p>}
     {!mode && <div hidden={tab !== 'knowledge'}>
-      <ApplicationKnowledge profiles={state.application_knowledge || []} busy={busy} refresh={refresh} onError={onError}/>
+      <ApplicationKnowledge state={state} profiles={state.application_knowledge || []} busy={busy} refresh={refresh} onError={onError}/>
     </div>}
     {tab !== 'knowledge' && <>
     <div className="library-toolbar"><Input aria-label="搜索经验" value={filter} placeholder="搜索名称、指令或说明" contentBefore={<Icon name="library" size={18}/>} onChange={(_, d) => setFilter(d.value)}/>

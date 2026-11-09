@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
-KNOWLEDGE_LIMIT = 6000
 COMPILER_RULE = (
     '底层知识用于同一应用的多个任务，例如界面区域、功能和稳定机制。'
     '任务经验记录特定目标的操作流程、分支和完成标准。'
@@ -68,8 +67,8 @@ def list_knowledge(root):
 
 
 def validate_content(content):
-    if not isinstance(content, str) or not 1 <= len(content.strip()) <= KNOWLEDGE_LIMIT:
-        raise ValueError(f'底层知识正文须为 1–{KNOWLEDGE_LIMIT} 字')
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError('底层知识正文不能为空')
     return content.strip()
 
 

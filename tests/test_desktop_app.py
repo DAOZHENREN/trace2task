@@ -32,6 +32,7 @@ def test_close_refuses_running_task_even_when_dialog_confirmed():
 
 def test_idle_close_respects_confirmation():
     controller = SimpleNamespace(active_job=lambda: {"status": "completed"},
+                                 child_desktop=SimpleNamespace(status=lambda: {'status': 'closed'}),
                                  components=SimpleNamespace(status=lambda: {'status': 'idle'}))
     for answer in (False, True):
         window = SimpleNamespace(create_confirmation_dialog=lambda *args, answer=answer: answer)

@@ -31,9 +31,11 @@ def can_close(controller, window) -> bool:
             "现在不会关闭，避免中断记录或留下未确认的操作。",
         )
         return False
+    desktop_notice = ("Windows 后台桌面将同时注销，请先保存其中的文件。\n"
+                      if controller.child_desktop.status()['status'] != 'closed' else '')
     return window.create_confirmation_dialog(
         "退出 Trace2Task",
-        "退出桌面控制台及其网页后台？\n"
+        "退出桌面控制台及其网页后台？\n" + desktop_notice +
         "独立的本地模型服务不会关闭，仍占用显存；其他网页服务不受影响。",
     )
 

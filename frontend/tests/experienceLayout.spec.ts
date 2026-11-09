@@ -26,5 +26,5 @@ test('legacy JSON shows compact runtime text separately from its unchanged archi
   expect(await panel.locator('.experience-preview').nth(1).textContent()).toBe(original);
   await expect(panel).toContainText('归档 SHA256：' + 'a'.repeat(64));
   await expect(panel).toContainText('实际输入 SHA256：' + 'b'.repeat(64));
-  expect(writes.every(path => ['/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+  expect(writes.every(path => ['/api/traces/model-input', '/api/traces/body', '/api/application-knowledge/drafts'].includes(path))).toBe(true);
 });

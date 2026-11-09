@@ -2,14 +2,15 @@ import {useState} from 'react';
 import {Button, Input, Textarea} from '@fluentui/react-components';
 import {api} from './api';
 import {useConfirm} from './ConfirmDialog';
-import type {KnowledgeProfile} from './types';
+import type {AppState, KnowledgeProfile} from './types';
 import {Choice, Empty, Field, Icon} from './ui';
 import {useAction} from './workflow';
+import {KnowledgeGeneration, type KnowledgeDraft} from './KnowledgeGeneration';
 
 type Knowledge = KnowledgeProfile & {content: string};
 
-export function ApplicationKnowledge({profiles, busy, refresh, onError}: {
-  profiles: KnowledgeProfile[]; busy: boolean; refresh: () => Promise<void>; onError: (message: string) => void;
+export function ApplicationKnowledge({state, profiles, busy, refresh, onError}: {
+  state: AppState; profiles: KnowledgeProfile[]; busy: boolean; refresh: () => Promise<void>; onError: (message: string) => void;
 }) {
   const [selected, setSelected] = useState<Knowledge | null>(null);
   const [scope, setScope] = useState<KnowledgeProfile['scope']>('android');
@@ -18,6 +19,7 @@ export function ApplicationKnowledge({profiles, busy, refresh, onError}: {
   const [message, setMessage] = useState('');
   const [filter, setFilter] = useState('');
   const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<KnowledgeDraft | null>(null);
   const {pending, perform} = useAction(onError);
   const confirm = useConfirm();
   const disabled = !!pending || busy;
@@ -27,7 +29,7 @@ export function ApplicationKnowledge({profiles, busy, refresh, onError}: {
   function load(id: string) {
     void perform('read', async () => {
       const item = id ? await api<Knowledge>('/api/application-knowledge/read', {id}) : null;
-      setSelected(item); setScope(item?.scope || 'android'); setApplication(item?.application || '');
+      setDraft(null); setSelected(item); setScope(item?.scope || 'android'); setApplication(item?.application || '');
       setContent(item?.content || ''); setMessage(''); setEditing(true);
     });
   }
@@ -48,6 +50,16 @@ export function ApplicationKnowledge({profiles, busy, refresh, onError}: {
     });
   }
   if (!editing) return <section aria-label="底层知识管理">
+    <KnowledgeGeneration state={state} profiles={profiles} busy={disabled} onError={onError} onDraft={value => {
+      void perform('read', async () => {
+        const existing = profiles.find(p => p.scope === value.request.scope &&
+          (p.scope === 'android' ? p.application === value.request.application :
+            p.application.toLowerCase() === value.request.application.toLowerCase()));
+        const item = existing ? await api<Knowledge>('/api/application-knowledge/read', {id: existing.id}) : null;
+        setSelected(item); setScope(value.request.scope); setApplication(value.request.application);
+        setContent(value.content); setDraft(value); setMessage('请核对资料与适用版本，再确认保存。'); setEditing(true);
+      });
+    }}/>
     <p className="quiet">按应用维护可跨任务复用的界面布局、功能与机制。</p>
     <div className="library-toolbar">
       <Input aria-label="搜索底层知识" placeholder="搜索应用名称、包名或平台" value={filter}
@@ -78,9 +90,15 @@ export function ApplicationKnowledge({profiles, busy, refresh, onError}: {
         <Input value={application} maxLength={120} disabled={disabled || !!selected} onChange={(_, data) => setApplication(data.value)}/>
       </Field>
     </div>
-    <Field label="底层知识正文"><Textarea rows={12} resize="vertical" value={content} maxLength={6000}
+    <Field label="底层知识正文"><Textarea rows={12} resize="vertical" value={content}
       disabled={disabled} onChange={(_, data) => {setContent(data.value); setMessage('');}}/></Field>
+    {draft && <details open><summary>资料来源与待验证问题</summary>
+      {draft.sources.map((source, i) => <p key={i}>[{i + 1}] {source.title} · {source.version}<br/>
+        {source.supports}<br/>{source.url}</p>)}
+      {draft.open_questions.map((question, i) => <p key={i}>待验证 · {question}</p>)}
+      {selected && <details><summary>对照当前已保存版本</summary><pre>{selected.content}</pre></details>}
+    </details>}
     <div className="button-row"><Button disabled={disabled || !application.trim() || !content.trim() || content === selected?.content}
-      onClick={save}>保存底层知识</Button>{message && <p role="status">{message}</p>}</div>
+      onClick={save}>{draft ? '确认保存基础知识' : '保存底层知识'}</Button>{message && <p role="status">{message}</p>}</div>
   </section>;
 }

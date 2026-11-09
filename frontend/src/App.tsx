@@ -119,10 +119,19 @@ export function App() {
     const abort = new AbortController(); let timer: ReturnType<typeof setTimeout>;
     async function poll() {
       try {
-        const result = await api<{runs: Run[]}>('/api/workbench/runs', undefined, abort.signal); setRuns(result.runs);
+        const result = await api<{runs: Run[]; child_desktop?: AppState['child_desktop']}>('/api/workbench/runs', undefined, abort.signal); setRuns(result.runs);
         const finished = result.runs.some(run => {const old = runStatuses.current.get(run.job_id); return old && active({...run, status: old}) && !active(run);});
         runStatuses.current = new Map(result.runs.map(run => [run.job_id, run.status]));
         if (finished) setState(await api<AppState>('/api/state?compact=1', undefined, abort.signal));
+        else if (result.child_desktop) {
+          const desktop = result.child_desktop;
+          setState(current => {
+            const old = current?.child_desktop;
+            if (!current || (old?.status === desktop.status && old.session_id === desktop.session_id
+              && old.generation === desktop.generation && old.manual_control === desktop.manual_control)) return current;
+            return {...current, child_desktop: desktop};
+          });
+        }
       }
       catch (e) {if (!abort.signal.aborted) setError(`运行状态暂不可用：${String(e)}`);}
       if (!abort.signal.aborted) timer = setTimeout(poll, 1500);
@@ -130,12 +139,18 @@ export function App() {
     timer = setTimeout(poll, 1500); return () => {abort.abort(); clearTimeout(timer);};
   }, [!!state]);
   const liveRun = runs.find(active);
+  const latest = runs.find(run => !isRecording(run));
+  const shownRun = selectedRun ?? (liveRun && !isRecording(liveRun) ? liveRun.job_id
+    : latest?.operation_scope === 'child_desktop' ? latest.job_id : null);
   const busy = !!liveRun;
   const recording = liveRun && isRecording(liveRun) ? liveRun : runs.find(run => run.job_id === recordId) || runs.find(isRecording);
   const go = (next: Page) => {setPage(next); setError(''); setVisited(old => new Set([...old, next]));
     if (['library', 'history', 'trash'].includes(next)) void refresh().catch(e => setError(String(e)));};
   function viewRun(run: Run) {
-    if (isRecording(run)) {setRecordId(run.job_id); go('record');} else {setSelectedRun(run.job_id); go('tasks');}
+    if (isRecording(run)) {setRecordId(run.job_id); go('record');} else {
+      setSelectedRun(run.job_id); go('tasks');
+      requestAnimationFrame(() => document.getElementById('task-run-timeline')?.scrollIntoView({block: 'start'}));
+    }
   }
   const onRun = (run: Run) => {runStatuses.current.set(run.job_id, run.status); setRuns(old => [run, ...old.filter(r => r.job_id !== run.job_id)]); viewRun(run);};
   async function stop() {
@@ -173,6 +188,7 @@ export function App() {
     <div className="main-shell"><header className="app-header"><div className="breadcrumb">{navigation.find(n => n.id === page)?.group} <span>/</span> <strong>{navigation.find(n => n.id === page)?.label}</strong></div>
       <div className="header-actions"><button className={`local-runtime-pill ${loaded.length ? 'running' : ''}`} onClick={() => go('models')}
         title={localStatus} aria-label={localStatus}>{localStatus}</button><span className={`flow-pill ${local ? 'local' : 'remote'}`}><span/>{busy ? '本次运行' : '待执行'} · {destination}</span>
+        {liveRun && !isRecording(liveRun) && <Button appearance="subtle" onClick={() => viewRun(liveRun)}>查看运行轨迹</Button>}
         {busy ? <Button className="global-stop" appearance="primary" icon={<Icon name="stop" size={16}/>} disabled={stopping || liveRun.stop_requested} onClick={() => void stop()}>
           {stopping || liveRun.stop_requested ? '等待安全停止…' : '停止任务'} <kbd>F9</kbd></Button> : <span className="ready-label"><span/>待命</span>}</div></header>
       <main id="main" tabIndex={-1}>
@@ -181,9 +197,10 @@ export function App() {
           action={<Button onClick={() => void initialize()}>重新连接</Button>}/> : <>
           <div hidden={page !== 'tasks'}><PageHeading eyebrow="WORKSPACE" title="任务工作台" copy="描述目标，确认执行范围，查看每一步结果。"
             action={selectedRun && !busy ? <Button icon={<Icon name="plus" size={17}/>} onClick={() => setSelectedRun(null)}>新任务</Button> : undefined}/>
-            <TaskComposer config={config} setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey] || config.executionMode === 'hybrid' && (!config.hybridExecutor || config.hybridExecutor.provider === 'local') && !!promptDrafts[`${config.localModel}:${config.executor}`]} onRun={onRun} onModels={() => go('models')} onRefreshCodex={refreshCodex} onError={setError}/>
-            <RunInspector id={selectedRun} state={state} busy={busy} onRun={onRun} onError={setError} onKnowledgeSaved={refresh}
-              onLibrary={id => {void refresh().then(() => {setRequestedTraceId(id); go('library');}).catch(e => setError(String(e)));}}/></div>
+            <TaskComposer config={liveRun?.operation_scope === 'child_desktop' ? {...config, scope: 'child_desktop', executor: 'cua'} : config}
+              setConfig={setConfig} state={state} catalog={liveCatalog!} busy={busy} promptDirty={!!promptDrafts[promptKey] || config.executionMode === 'hybrid' && (!config.hybridExecutor || config.hybridExecutor.provider === 'local') && !!promptDrafts[`${config.localModel}:${config.executor}`]} onRun={onRun} onModels={() => go('models')} onRefreshCodex={refreshCodex} onDesktopRefresh={refresh} onError={setError}/>
+            <div id="task-run-timeline"><RunInspector id={shownRun} state={state} busy={busy} onRun={onRun} onError={setError} onKnowledgeSaved={refresh}
+              onLibrary={id => {void refresh().then(() => {setRequestedTraceId(id); go('library');}).catch(e => setError(String(e)));}}/></div></div>
           <div hidden={page !== 'models'}>{visited.has('models') && <Models catalog={catalog} config={config} setConfig={setConfig} busy={busy} refresh={refreshCatalog}
             services={services} serviceError={serviceError}
             onError={setError} onRun={onRun} onChatGPT={() => go('chatgpt')} onComponents={() => {setSettingsSection('components'); go('settings');}}/>}</div>

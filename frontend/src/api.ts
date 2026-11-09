@@ -34,8 +34,8 @@ export function requestFor(config: Config, instruction: string, knowledge?: Know
     reasoning_effort: config.provider === 'codex' ? config.effort : 'default',
     ...(localGUI && config.localModel !== 'trained_d' ? {inference_backend: config.inference} : {}),
     executor_backend: config.executor,
-    cua_target: config.executor !== 'cua' ? null : config.scope === 'desktop'
-      ? {kind: 'desktop', display_id: 'primary'}
+    cua_target: config.executor !== 'cua' ? null : config.scope === 'desktop' || config.scope === 'child_desktop'
+      ? {kind: 'desktop', display_id: config.scope === 'child_desktop' ? 'child_session' : 'primary'}
       : {targets: config.targets.map(t => t.value), initial_index: config.initialTarget},
     memory_mode: config.experience === AUTO_MEMORY ? 'auto' : config.experience ? 'manual' : 'off',
     use_experience: !!config.experience && config.experience !== AUTO_MEMORY,

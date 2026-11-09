@@ -158,6 +158,14 @@ class ExecutionCore:
                 receipt, next_target = dispatch_backend_once(
                     self.backend, action, prepared, target, self.stop,
                 )
+            except ObservationStale as error:
+                # A user can take over after preflight but before the input lock.
+                self.attempts -= 1
+                request['status'] = 'reobserve'
+                self.feedback = {'status': 'reobserve', 'executed': False, 'reason': str(error)}
+                self.record('execution_result', observation_id=observation_id, action=payload,
+                            batch_action_index=index, **self.feedback)
+                return ExecutionResult('reobserve', target, payload, reason=str(error), steps=tuple(self.last_steps))
             except DriverRefusal as error:
                 request['status'] = 'refused'
                 background_refusal = error.receipt

@@ -32,6 +32,7 @@ export type InterventionState = {supported: boolean; visual_supported?: boolean;
   takeovers: {id: string; status: string; note: string; before: HandoffPicture | null; after: HandoffPicture | null;
     before_error?: string; return_error?: string; started_at?: string; ended_at?: string}[]};
 export type Run = {job_id: string; task_id: string; instruction: string; status: string; created_at: string;
+  operation_scope?: string;
   updated_at: string; model: string; provider: string; kind: string; error?: string; stop_requested: boolean;
   narrated?: boolean; defer_compilation?: boolean;
   run_facts?: Facts; observed_inference?: {backend: string; context_policy?: string};
@@ -44,7 +45,7 @@ export type Run = {job_id: string; task_id: string; instruction: string; status:
 export type Round = {step_index: number; status: string; purpose: string; duration_ms?: number;
   model_role?: 'director' | 'executor'; actual_model?: string;
   subtask?: {objective?: string; completion?: string; goal?: string; completion_hint?: string;
-    notices?: string[]; constraints?: string[]};
+    notices?: string[]; constraints?: string[]; fail_conditions?: string[]; handoff_conditions?: string[]};
   tokens: Record<string, number>; screenshot?: string; executed?: boolean; execution_status?: string;
   submitted_steps?: number; after_screenshot?: string;
   verification?: {verdict: string; evidence: string; missing: string}; error?: string; artifact_ref: string};
@@ -91,7 +92,10 @@ export type TaskPack = {path: string; local_path: string; task_id: string; instr
   human_guidance?: {summary: string; revision: number; rules: unknown[]; history: unknown[]}; [key: string]: unknown};
 export type ModelChoice = {model: string; reasoning_effort: string};
 export type KnowledgeProfile = {id: string; scope: 'android' | 'desktop'; application: string; sha256: string; revision: number};
+export type ChildDesktopState = {status: 'closed' | 'connecting' | 'waiting_picture' | 'in_use' | 'idle' | 'closing' | 'logoff_pending' | 'logoff_unknown' | 'disconnected';
+  session_id: number | null; generation: number; manual_control?: boolean};
 export type AppState = {version: string; active_job: Run | null; trace_representations: Trace[];
+  child_desktop?: ChildDesktopState;
   application_knowledge?: KnowledgeProfile[];
   trash?: TrashItem[];
   recordings: Recording[]; candidates: Candidate[]; taskpacks: TaskPack[];
@@ -116,7 +120,7 @@ export type Config = {provider: 'codex' | 'api' | 'local'; model: string; localM
   desktopKnowledgeId?: string;
   hybridExecutor?: {provider: 'local' | 'codex' | 'api'; model: string; effort: string;
     apiUrl: string; apiKey: string; apiFormat?: string};
-  inference: string; executor: 'cua' | 'browser' | 'android'; scope: 'desktop' | 'selected_windows' | 'browser' | 'android';
+  inference: string; executor: 'cua' | 'browser' | 'android'; scope: 'desktop' | 'child_desktop' | 'selected_windows' | 'browser' | 'android';
   android?: {adb: string; serial: string; package: string; server_port: number; launch_app?: boolean};
   androidBudget?: {max_actions: number; max_seconds: number};
   mobileforge?: string;

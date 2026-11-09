@@ -114,7 +114,7 @@ def _keys(root, entry):
     scope = metadata.get('source_scope', 'desktop')
     if not isinstance(scope, str):
         scope = 'unknown'
-    if scope in {'desktop', 'selected_windows', 'desktop_recording'}:
+    if scope in {'desktop', 'child_desktop', 'selected_windows', 'desktop_recording'}:
         scope = 'desktop'
     prefix = json.dumps([entry['representation'], scope, metadata.get('source_package', '')])
     keys = ['id:' + entry['id']]

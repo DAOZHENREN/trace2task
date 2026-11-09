@@ -1,5 +1,17 @@
 # Cua experimental backend
 
+## Windows 后台桌面
+
+在工作台的「执行配置 → 操作范围」选择「Windows 后台桌面」。首次任务启动时在 Windows 登录窗口验证当前账户。工作台会保持这个桌面，任务完成、报错或按停止后，已打开的应用和文件窗口可供下一个任务继续使用。下个任务先取新截图，模型对话、预算和运行记录仍按任务建立。
+
+此模式通过本机 RDP 子会话提供独立的桌面和键鼠焦点；分辨率跟随主显示器（最大 8192×8192），缩放比例读取当前系统 DPI，查看窗口按比例显示画面，使用当前账户的文件权限。主桌面已有的窗口需要在子会话内重新打开。同一时刻仅一个任务可操作后台桌面；如果其他程序占用 Windows 子会话，工作台会报错。在操作范围旁可查看会话编号和状态。手动选择「关闭后台桌面」或退出工作台时才注销会话，请先保存需要保留的内容。网页控制台以其本地服务的生命周期为准。
+
+运行需要 Windows 的 Child Sessions 功能已启用、本机 RDP 登录可用、64 位 .NET Framework 4.x 和 Cua Driver。驱动路径沿用 `TRACE2TASK_CUA_DRIVER`。宿主检查连接模式、账户、会话编号与专用管道的服务进程，连接中断即停止。系统配置说明见 [Microsoft 的子会话文档](https://learn.microsoft.com/windows/win32/termserv/child-sessions)。
+
+如果首次连接提示「Interception 键盘过滤驱动」，工作台已核对本次开机的远程虚拟键盘启动失败记录和键盘编号占用情况。保存主桌面的工作并重新启动 Windows，登录后启动一次后台桌面，任务间保持工作台打开即可。可在两个任务的 `child_desktop_ready` 记录中核对相同的 `session_id`、`driver_pid` 和第二项的 `reused: true`。详见 [Interception 作者对 RDP 虚拟输入设备的说明](https://github.com/oblitum/Interception/issues/21)。
+
+源码版可用 `python scripts/probe_child_desktop.py` 验证跨任务复用。第一项任务在临时编辑器输入随机中文并交还桌面，第二项核对会话和窗口身份，续写中文并通过「另存为」保存。`artifacts/child-desktop-*/` 下两个任务的 `session.json` 记录子会话和驱动进程编号，`probe.txt` 用于核对最终内容。实测只使用本机 GUI。
+
 ## 2026-10-19 official 0.36.0 update and Wesnoth retest
 
 The official Windows x86_64 binary is installed separately at

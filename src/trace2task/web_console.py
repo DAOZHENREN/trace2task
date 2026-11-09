@@ -607,6 +607,7 @@ class ConsoleJob:
             "narrated": self.narrated,
             "defer_compilation": self.defer_compilation,
             "input_mode": ("remote_android" if self.executor_backend == "android" else "isolated_browser" if self.executor_backend == "browser" else
+                           "child_session" if scope == "child_desktop" else
                            "background_preferred" if self.executor_backend == "cua" and scope == "selected_windows"
                            else "background" if self.background else "foreground"),
             "adaptive_reasoning": self.adaptive_reasoning,
@@ -710,6 +711,8 @@ class WebConsoleController:
         self.components = ComponentManager(self.project_root)
         from trace2task.chatgpt_browser import ChatGPTBrowser
         self.chatgpt_browser = ChatGPTBrowser(self.project_root)
+        from trace2task.child_desktop import ChildDesktopWorkspace
+        self.child_desktop = ChildDesktopWorkspace()
         self.api_settings = api_settings_store or APISettingsStore()
         self.codex_catalog = CodexModelCatalog(self.project_root)
         self.task_root = (self.project_root / "taskpacks").resolve()
@@ -1510,14 +1513,16 @@ class WebConsoleController:
                      or not execute or resume_from)):
             raise ValueError("Codex/API 的 Cua 只支持独立任务执行；检查点恢复仍走原有路径")
         if executor_backend == "cua":
-            from trace2task.cua_desktop import DESKTOP_TARGET
+            from trace2task.cua_desktop import CHILD_DESKTOP_TARGET, DESKTOP_TARGET
             from trace2task.cua_scope import normalize_scope
             if cua_target is None and execution_scope == "desktop":
                 cua_target = dict(DESKTOP_TARGET)
-            if cua_target != DESKTOP_TARGET:
+            if cua_target not in (DESKTOP_TARGET, CHILD_DESKTOP_TARGET):
                 cua_target = normalize_scope(cua_target)
             elif execution_scope != "desktop":
                 raise ValueError("Cua 桌面目标需要全桌面范围")
+            elif cua_target == CHILD_DESKTOP_TARGET and (not execute or orchestration != "legacy" or resume_from):
+                raise ValueError("Windows 后台桌面仅支持独立任务执行")
         if orchestration not in {"legacy", "langgraph"}:
             raise ValueError("不支持的任务管理模式")
         if execution_scope != "desktop" and (orchestration != "legacy" or resume_from):
@@ -2416,6 +2421,38 @@ class WebConsoleController:
         threading.Thread(target=self._run_experience_compilation, args=(job, prepared),
                          name=f'trace2task-experience-{job.job_id[:8]}', daemon=True).start()
         return job.snapshot()
+
+    def start_knowledge_generation(self, payload):
+        from trace2task.knowledge_generation import prepare_request
+        request = prepare_request(payload)
+        model = payload.get('model', DEFAULT_COMPILER_MODEL)
+        effort = payload.get('reasoning_effort', DEFAULT_COMPILER_REASONING_EFFORT)
+        self.codex_catalog.validate(model, effort)
+        with self._lock:
+            self._require_idle()
+            job = ConsoleJob(job_id=uuid.uuid4().hex, task_path='', task_id=request['application'],
+                instruction='基础知识生成：' + request['application'], mode='compile',
+                kind='knowledge_generation', model=model, reasoning_effort=effort)
+            self._register_job(job)
+        threading.Thread(target=self._run_knowledge_generation, args=(job, request),
+                         name='knowledge-' + job.job_id[:8], daemon=True).start()
+        return job.snapshot()
+
+    def _run_knowledge_generation(self, job, request):
+        from trace2task.knowledge_generation import generate
+        from trace2task.trace_procedure import ProcedureCompileCancelled
+        self._update(job, status='running', log='正在检索应用资料并整理基础知识草稿。')
+        try:
+            draft = generate(self.project_root, job.job_id, request, model=job.model,
+                effort=job.reasoning_effort, stop_event=job.stop_event, publish_lock=self._lock,
+                on_round=lambda entry: self._model_round_update(job, entry))
+            self._update(job, status='completed', result={'knowledge_draft': draft},
+                         log='基础知识草稿已生成，请在基础知识管理中核对并保存。')
+        except Exception as error:  # noqa: BLE001 - surface background job failure without publishing
+            if job.stop_event.is_set() or isinstance(error, ProcedureCompileCancelled):
+                self._update(job, status='stopped', log='基础知识生成已停止。')
+            else:
+                self._update(job, status='failed', error=str(error), log='基础知识生成失败。')
 
     def save_application_knowledge(self, payload):
         from trace2task.application_knowledge import save_knowledge
@@ -3471,7 +3508,45 @@ class WebConsoleController:
 
     def workbench_runs(self):
         with self._lock:
-            return {"runs": self.run_store.list(), "active_job_id": self._active_job_id}
+            return {"runs": self.run_store.list(), "active_job_id": self._active_job_id,
+                    "child_desktop": self.child_desktop.status()}
+
+    def workbench_run(self, run_id, after):
+        detail = self.run_store.get(run_id, after)
+        run = detail['session']
+        trace = (run.get('result') or {}).get('trace_path')
+        # Early releases only wrote the native connection milestones to the run
+        # directory. Surface those existing facts when opening historical runs.
+        if after or run.get('operation_scope') != 'child_desktop' or not trace:
+            return detail
+        log = Path(trace).with_name('child-desktop.log').resolve()
+        if not log.is_relative_to((self.project_root / 'runs').resolve()):
+            return detail
+        if any(e['name'] == 'run.log' and e['attributes'].get('message', '').startswith('正在连接 Windows 后台桌面；')
+               for e in detail['events']):
+            return detail
+        try:
+            with log.open('rb') as stream:
+                lines = stream.read(16384).decode('utf-8-sig', errors='replace').splitlines()
+        except OSError:
+            return detail
+        if any(line.startswith('READY ') for line in lines):
+            note = '宿主记录显示，后台桌面和 Cua 驱动已连接。'
+        elif 'LOGGED_IN' in lines:
+            note = '宿主记录显示，Windows 已登录后台桌面，运行结束前未收到 Cua 驱动就绪回执。'
+        elif any(line.startswith(('ERROR Timed out waiting for child-session logon', 'ERROR RDP_LOGIN_TIMEOUT')) for line in lines):
+            note = '宿主记录显示，等待 Windows 登录超时，尚未取得后台桌面画面。'
+        elif 'CONNECTED' in lines:
+            note = '宿主记录显示，已连接到 Windows，运行结束前未收到登录完成回执。'
+        else:
+            return detail
+        detail['desktop_startup_note'] = note
+        return detail
+
+    def close_child_desktop(self, generation):
+        with self._lock:
+            self._require_idle()
+            return self.child_desktop.close_idle(generation)
 
     def _intervention_update(self, job, state):
         with self._lock:
@@ -4210,7 +4285,7 @@ class WebConsoleController:
         if job.executor_backend == 'android':
             self._update(job, log=f"Android · {(job.android_config or {}).get('serial')} · {(job.android_config or {}).get('package')} · {'MobileForge' if job.mobileforge else '通用视觉代理'}")
         self._update(job, status="running", log=(
-            f"任务已启动 · {'Android 远程手机' if job.executor_backend == 'android' else 'Ancient Beast 独立浏览器' if job.executor_backend == 'browser' else '指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
+            f"任务已启动 · {'Android 远程手机' if job.executor_backend == 'android' else 'Ancient Beast 独立浏览器' if job.executor_backend == 'browser' else 'Windows 后台桌面' if (job.cua_target or {}).get('display_id') == 'child_session' else '指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
             f"{'Agent 自动选择经验' if job.memory_mode == 'auto' else '使用经验' if job.use_experience else '无经验 Baseline'}。"
         ))
         try:
@@ -4230,6 +4305,11 @@ class WebConsoleController:
                 kwargs["api_config"] = api_config
             if desktop or self.runner is run_windows_agent:
                 kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
+            from trace2task.cua_desktop import CHILD_DESKTOP_TARGET
+            child_options = {
+                'child_desktop': self.child_desktop,
+                'on_desktop_progress': lambda message, screenshot: self._update(job, log=message, screenshot=screenshot),
+            } if job.cua_target == CHILD_DESKTOP_TARGET else {}
             run_failure: Exception | None = None
             try:
                 if job.provider == "trained_d":
@@ -4270,7 +4350,7 @@ class WebConsoleController:
                                              if job.use_experience else None),
                         prompt_profile=job.prompt_profile,
                         on_model_round=lambda entry: self._model_round_update(job, entry),
-                        **android_options,
+                        **android_options, **child_options,
                     )
                     job.pending_batch = None
                 elif (desktop and execute and job.orchestration == "legacy"
@@ -4317,7 +4397,7 @@ class WebConsoleController:
                         task_path=task_path, use_experience=job.use_experience,
                         prompt_guidance=job.prompt_guidance,
                         on_model_round=lambda entry: self._model_round_update(job, entry),
-                        **android_options,
+                        **android_options, **child_options,
                     )
                 elif desktop:
                     from trace2task.desktop_runner import run_desktop_baseline
@@ -4544,6 +4624,7 @@ class WebConsoleController:
         *,
         status: str | None = None,
         log: str | None = None,
+        screenshot: str | None = None,
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
@@ -4559,7 +4640,7 @@ class WebConsoleController:
                 job.error = error
             job.updated_at = _now()
 
-            self.run_store.save(job.snapshot(details=False), log=log)
+            self.run_store.save(job.snapshot(details=False), log=log, screenshot=screenshot)
 
     def _model_round_update(self, job: ConsoleJob, entry: dict[str, Any]) -> None:
         with self._lock:
@@ -4620,7 +4701,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     self._json(self.controller.run_store.read_round(parts[0], int(parts[2])))
                 elif len(parts) == 1:
                     after = int((parse_qs(parsed.query).get("after") or ["0"])[0])
-                    self._json(self.controller.run_store.get(parts[0], after))
+                    self._json(self.controller.workbench_run(parts[0], after))
                 else:
                     raise KeyError("Unknown run resource")
             except KeyError as error:
@@ -4724,6 +4805,7 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._json(
                 {
                     "version": __version__,
+                    "child_desktop": self.controller.child_desktop.status(),
                     "capabilities": {
                         "incremental_guidance": True,
                         "guidance_history": True,
@@ -4876,6 +4958,12 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             )
             if parsed.path == "/api/trash/restore":
                 self._json(self.controller.restore_trashed_asset(payload.get("path", "")))
+                return
+            if parsed.path == "/api/child-desktop/close":
+                self._json(self.controller.close_child_desktop(payload.get('generation')))
+                return
+            if parsed.path == "/api/child-desktop/viewer":
+                self._json(self.controller.child_desktop.present(payload.get('mode'), payload.get('generation')))
                 return
             if parsed.path == "/api/workbench/runs/delete":
                 self._json(self.controller.delete_run_record(payload.get("id", "")))
@@ -5211,6 +5299,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == '/api/application-knowledge/save':
                 self._json(self.controller.save_application_knowledge(payload))
                 return
+            if parsed.path == '/api/application-knowledge/generate':
+                self._json(self.controller.start_knowledge_generation(payload))
+                return
+            if parsed.path == '/api/application-knowledge/drafts':
+                from trace2task.knowledge_generation import list_drafts
+                self._json(list_drafts(self.controller.project_root))
+                return
             if parsed.path == '/api/run-experience/generate':
                 result = self.controller.start_run_experience(payload.get('run_id', ''),
                     source_sha256=payload.get('source_sha256', ''),
@@ -5457,7 +5552,10 @@ def create_web_server(
     class ConsoleHTTPServer(ThreadingHTTPServer):
         def server_close(self):
             try:
-                active_controller.chatgpt_browser.close()
+                try:
+                    active_controller.child_desktop.shutdown()
+                finally:
+                    active_controller.chatgpt_browser.close()
             finally:
                 super().server_close()
 

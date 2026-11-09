@@ -81,7 +81,8 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
                         approve, continuous=False, max_actions=40, backend=None,
                         capture=None, size=None, predictor=predict_local, model="D-5970", executor_backend="win32", cua_target=None,
                         experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None,
-                        android_config=None, android_driver=None, max_seconds=None, application_knowledge=None):
+                        android_config=None, android_driver=None, max_seconds=None, application_knowledge=None,
+                        child_desktop=None, on_desktop_progress=None):
     if model == "D-5970" and experience_context is not None:
         raise ValueError("D-5970 冻结输入结构不支持经验指导")
     if executor_backend == 'android':
@@ -99,7 +100,8 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
                              emergency_stop=emergency_stop, status_callback=status_callback, model=model,
                              cua_target=cua_target, experience_context=experience_context,
                              prompt_profile=prompt_profile, on_model_round=on_model_round, inference_backend=inference_backend,
-                             application_knowledge=application_knowledge)
+                             application_knowledge=application_knowledge, child_desktop=child_desktop,
+                             on_desktop_progress=on_desktop_progress)
     if executor_backend not in {"win32", "android"}:
         raise ValueError("Unknown executor backend")
     if model != "D-5970":

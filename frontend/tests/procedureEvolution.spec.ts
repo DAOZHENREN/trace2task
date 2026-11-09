@@ -63,7 +63,7 @@ test('run-linked generation needs confirmation and never starts a desktop task',
   await page.getByRole('button', {name: '到经验库审查改进候选'}).click();
   await expect(page.getByText('R · 运行后改进候选 · 效果尚未评测', {exact: true})).toBeVisible();
   await expect(page.locator('.detail-workspace').getByRole('button', {name: '用于新任务', exact: true})).toBeDisabled();
-  expect(f.writes.every(path => ['/api/traces/evolve', '/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+  expect(f.writes.every(path => ['/api/traces/evolve', '/api/traces/model-input', '/api/traces/body', '/api/application-knowledge/drafts'].includes(path))).toBe(true);
 });
 
 test('review binds candidate hash, leaves selection unchanged, and exposes the parent', async ({page}, info) => {
@@ -87,7 +87,7 @@ test('review binds candidate hash, leaves selection unchanged, and exposes the p
   await page.screenshot({path: info.outputPath('procedure-candidate-review.png'), animations: 'disabled'});
   await panel.getByRole('button', {name: '用于新任务', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue(`trace-library/${f.candidate.id}/model-input.txt`);
-  expect(f.writes.every(path => ['/api/traces/model-input', '/api/traces/body', '/api/traces/evolution/review'].includes(path))).toBe(true);
+  expect(f.writes.every(path => ['/api/traces/model-input', '/api/traces/body', '/api/traces/evolution/review', '/api/application-knowledge/drafts'].includes(path))).toBe(true);
 });
 
 test('rejected candidate remains inspectable but cannot be selected', async ({page}) => {

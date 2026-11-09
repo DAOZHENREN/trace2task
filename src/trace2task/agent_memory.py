@@ -78,7 +78,7 @@ class MemoryCatalog:
                 or header['manifest_sha256'] != _sha(manifest_bytes)):
             raise ValueError('Not an intact published Procedure B')
         validate_experience_scope(self.root, directory / 'model-input.txt', self.scope, self.package)
-        if body.get('source_kind') != 'agent_run' and self.scope not in {'desktop', 'selected_windows'}:
+        if body.get('source_kind') != 'agent_run' and self.scope not in {'desktop', 'child_desktop', 'selected_windows'}:
             raise ValueError('Legacy recording has no compatible application scope')
         expected = manifest['artifact_sha256']['model-input.txt']
         if not re.fullmatch('[0-9a-f]{64}', expected):

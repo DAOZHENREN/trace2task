@@ -135,7 +135,7 @@ def test_independent_provider_connections_reach_worker_without_leaking_keys(
 def directive(*, decision='stage', goal='Open menu', notices=None):
     return json.dumps({'decision': decision, 'observation': 'visible screen evidence',
         'goal': goal, 'completion_hint': 'Menu is visible', 'notices': ['Stay in this app'] if notices is None else notices,
-        'handoff_conditions': [], 'actions': []})
+        'fail_conditions': [], 'actions': []})
 
 
 def prediction(actions=None):
@@ -220,10 +220,37 @@ def test_local_executor_receives_knowledge_once_and_current_notices(tmp_path):
     assert 'constraints' not in session.requests[0]['output_schema']['properties']
     assert 'Full historical method' in session.requests[0]['prompt']
     assert 'Full historical method' not in calls[0][0]
-    assert calls[0][0] == 'Open menu\nNotices: ["If auto is active, wait."]'
+    assert calls[0][0] == 'Open menu\nCompletion: Menu is visible\nNotices: ["If auto is active, wait."]\nFail conditions: []'
     assert 'Combat toolbar layout' in calls[0][1]['guided_knowledge']
-    assert calls[1][0] == 'Next\nNotices: ["Stay inside the combat panel."]'
+    assert 'Task experience' in calls[0][1]['guided_knowledge']
+    assert 'Full historical method' in calls[0][1]['guided_knowledge']
+    assert calls[1][0] == 'Next\nCompletion: Menu is visible\nNotices: ["Stay inside the combat panel."]\nFail conditions: []'
     assert 'guided_knowledge' not in calls[1][1]
+
+
+@pytest.mark.parametrize('provider', ['codex', 'api'])
+@pytest.mark.parametrize('with_knowledge', [False, True])
+def test_chat_executor_receives_full_experience_once_with_or_without_knowledge(tmp_path, provider, with_knowledge):
+    from trace2task.hybrid_chat_executor import HybridChatExecutor
+    answer = json.dumps({'stage_status': 'working', 'reason': 'Next', 'actions': [CLICK]})
+    motor_session = Session([answer, answer])
+    motor = HybridChatExecutor(provider=provider, model='motor', reasoning_effort='low',
+        root=tmp_path / 'motor', stop=Stop(), android=False, selected_windows=False, session=motor_session)
+    worker, _, args = adapter(tmp_path, [directive()])
+    worker.chat_executor, worker.predictor = motor, motor.predict
+    if with_knowledge:
+        worker.application_knowledge = {'application': 'Game', 'content': 'Shared battle mechanics'}
+    experience = '完整经验：先检查进度。\n分支：按钮禁用时检查提示。\n完成标准：出现结算。'
+    worker.predict('Goal', **args, experience_context={'model_input': experience})
+    # Executor rounds can omit experience_context: use the selected director snapshot.
+    deliver(worker, args)
+    deliver(worker, args)
+    first, second = [request['prompt'] for request in motor_session.requests]
+    assert experience in first
+    assert ('Shared battle mechanics' in first) == with_knowledge
+    assert 'Task experience' in first
+    assert second == 'Use the attached current screenshot.'
+    assert motor.session is motor_session
 
 
 def test_v7_source_hashes_and_local_prompt_provenance():
@@ -259,7 +286,77 @@ def test_director_keeps_one_conversation_and_sends_incremental_handoffs(tmp_path
     worker.needs_guide, worker.reason = True, 'executor_stage_report'
     worker.predict('Goal', **args)
     assert resets == [True]
-    assert json.loads(session.requests[1]['prompt']) == {'handoff_reason': 'executor_stage_report'}
+    handoff = json.loads(session.requests[1]['prompt'])
+    assert handoff['handoff_reason'] == 'executor_stage_report'
+    assert handoff['stage_feedback']['delivered_actions'] == 0
+    assert set(handoff) == {'handoff_reason', 'stage_feedback'}
+
+
+def test_failure_conditions_reach_executor_and_report_reaches_director(tmp_path):
+    calls = []
+    first = json.loads(directive())
+    first['fail_conditions'] = ['Automatic battle is disabled']
+    def predict(task, **kwargs):
+        calls.append(task)
+        return {**prediction([{'done': True}]),
+                'stage_report': {'status': 'failed', 'reason': 'Automatic battle disabled message is visible'}}
+    worker, session, args = adapter(tmp_path, [json.dumps(first), directive(goal='Recover')], predict)
+    worker.predict('Goal', **args)
+    assert worker.predict('Goal', **args)['reason'] == 'executor_stage_failed'
+    assert 'Completion: Menu is visible' in calls[0]
+    assert 'Fail conditions: ["Automatic battle is disabled"]' in calls[0]
+    worker.predict('Goal', **args)
+    feedback = json.loads(session.requests[-1]['prompt'])['stage_feedback']
+    assert feedback['executor_report']['status'] == 'failed'
+    assert 'disabled message' in feedback['executor_report']['reason']
+    assert feedback['delivered_actions'] == 0
+    assert feedback['decisions'] == 1
+    assert 'fail_conditions' in worker.director_schema['required']
+    assert 'handoff_conditions' not in worker.director_schema['properties']
+
+
+def test_stage_feedback_counts_delivered_actions_across_periodic_reviews(tmp_path):
+    worker, session, args = adapter(tmp_path, [directive(), directive(decision='continue'), directive(goal='Next')],
+                                    controller_config={'review_interval': 2})
+    worker.predict('Goal', **args)
+    for _ in range(2):
+        deliver(worker, args)
+    worker.predict('Goal', **args)
+    first = json.loads(session.requests[-1]['prompt'])['stage_feedback']
+    assert first['executor_actions'] == first['actions_with_visual_change'] == 2
+    for _ in range(2):
+        deliver(worker, args)
+    worker.predict('Goal', **args)
+    second = json.loads(session.requests[-1]['prompt'])['stage_feedback']
+    assert second['delivered_actions'] == second['decisions'] == 4
+    assert worker.stage_start_decisions == 4
+    assert worker.stage_start_pairs == 4
+
+
+@pytest.mark.parametrize('status', ['working', 'completed', 'failed'])
+def test_chat_executor_explicit_stage_outcomes(tmp_path, status):
+    import base64
+
+    from trace2task.hybrid_chat_executor import HybridChatExecutor
+    response = {'stage_status': status, 'reason': 'Visible evidence', 'actions': [CLICK] if status == 'working' else []}
+    session = Session([json.dumps(response)])
+    motor = HybridChatExecutor(provider='codex', model='motor', reasoning_effort='low',
+        root=tmp_path, stop=Stop(), android=False, selected_windows=False, session=session)
+    result = motor.predict('Stage', image=base64.b64encode(b'image').decode(), request_id='one',
+        guided_history=[], execution_context={})
+    assert result['stage_report'] == {'status': status, 'reason': 'Visible evidence'}
+    assert result['status'] == 'predicted'
+    assert 'stage_status' in session.requests[0]['output_schema']['required']
+    assert 'task_complete' not in session.requests[0]['output_schema']['properties']
+
+
+def test_previous_director_contract_is_readable(tmp_path):
+    reply = json.loads(directive())
+    reply['handoff_conditions'] = reply.pop('fail_conditions')
+    worker, _, args = adapter(tmp_path, [json.dumps(reply)])
+    worker.predict('Goal', **args)
+    assert worker.current['fail_conditions'] == []
+    assert 'handoff_conditions' not in worker.current
 
 
 def test_teacher_actions_execute_before_student_and_only_receipts_enter_history(tmp_path):
@@ -274,7 +371,7 @@ def test_teacher_actions_execute_before_student_and_only_receipts_enter_history(
     worker.predict('SECRET', **args)
     assert len(calls[0][1]['guided_history']) == 2
     assert all('Executed guidance action' in item['raw_output'] for item in calls[0][1]['guided_history'])
-    assert calls[0][0] == 'Open menu\nNotices: ["Stay in this app"]'
+    assert calls[0][0] == 'Open menu\nCompletion: Menu is visible\nNotices: ["Stay in this app"]\nFail conditions: []'
     assert all('image' not in item for item in calls[0][1]['guided_history'])
     assert 'SECRET' not in calls[0][0]
     assert worker.decisions == 3
@@ -335,7 +432,8 @@ def test_invalid_teacher_action_plans_never_reach_execution(tmp_path, reply):
 
 def test_stage_keeps_executor_conversation_with_only_current_goal(tmp_path):
     calls = []
-    outputs = iter([prediction(), prediction(), prediction(), prediction([{'done': True}]), prediction()])
+    outputs = iter([*(prediction([{'skill': 'click', 'args': {'x': x, 'y': .5, 'button': 'left'}}])
+                     for x in (.2, .4, .6)), prediction([{'done': True}]), prediction()])
     def predict(task, **kwargs):
         calls.append((task, kwargs))
         return next(outputs)
@@ -347,7 +445,7 @@ def test_stage_keeps_executor_conversation_with_only_current_goal(tmp_path):
     assert worker.predict('SECRET OVERALL GOAL', **args)['status'] == 'handoff'
     worker.predict('SECRET OVERALL GOAL', **args)
     assert 'SECRET OVERALL GOAL' not in calls[-1][0]
-    assert calls[-1][0] == 'Correct menu\nNotices: ["Stay in this app"]'
+    assert calls[-1][0] == 'Correct menu\nCompletion: Menu is visible\nNotices: ["Stay in this app"]\nFail conditions: []'
     assert [call['guided_history_offset'] for _, call in calls] == [0, 0, 1, 2, 3]
     assert calls[-1][1]['guided_history'] == []
     assert all(call['conversation_id'] == calls[0][1]['conversation_id'] for _, call in calls)
@@ -363,7 +461,7 @@ def test_new_stage_without_delivered_actions_only_sends_current_goal(tmp_path):
     for _ in range(3):
         worker.predict('SECRET', **args)
         worker.predict('SECRET', **args)
-    assert calls[-1] == 'Next\nNotices: ["Stay in this app"]'
+    assert calls[-1] == 'Next\nCompletion: Menu is visible\nNotices: ["Stay in this app"]\nFail conditions: []'
     assert worker.executed_pairs == []
 
 
@@ -372,7 +470,7 @@ def test_periodic_continue_preserves_goal_and_stage_history(tmp_path, interval):
     calls = []
     def predict(task, **kwargs):
         calls.append(kwargs)
-        return prediction()
+        return prediction([{'skill': 'click', 'args': {'x': len(calls) / 100, 'y': .5, 'button': 'left'}}])
     config = {'review_interval': interval} if interval else None
     worker, session, args = adapter(tmp_path, [directive(), directive(decision='continue')], predict,
                                     controller_config=config)
@@ -424,6 +522,47 @@ def test_unchanged_picture_alone_does_not_trigger_repetition_detector(tmp_path):
     for _ in range(4):
         deliver(worker, args, change=False)
     assert worker.guide_calls == 1
+
+
+@pytest.mark.parametrize('limit', [2, 3])
+def test_repeated_corner_clicks_review_even_with_animated_frames(tmp_path, limit):
+    corner = {'skill': 'click', 'args': {'x': 1, 'y': 1, 'button': 'left'}}
+    worker, session, args = adapter(tmp_path, [directive(), directive(goal='Correct target')],
+        lambda *a, **kw: prediction([corner]), controller_config={'repeated_no_change_limit': limit})
+    worker.predict('Goal', **args)
+    for _ in range(limit):
+        deliver(worker, args, change=True)
+    assert worker.predict('Goal', **args)['model_role'] == 'director'
+    handoff = json.loads(session.requests[-1]['prompt'])
+    assert handoff['handoff_reason'] == 'repeated_action_requires_review'
+    feedback = handoff['stage_feedback']
+    assert feedback['consecutive_identical_executor_actions'] == limit
+    assert feedback['last_delivered_action'] == corner
+    assert feedback['repeated_no_change'] == 0
+    assert worker.same_action_count == 0
+
+
+def test_repeated_wait_with_changing_frames_does_not_trigger_action_watchdog(tmp_path):
+    worker, _, args = adapter(tmp_path, [directive()],
+        lambda *a, **kw: prediction([{'skill': 'wait', 'args': {'duration_ms': 1000}}]))
+    worker.predict('Goal', **args)
+    for _ in range(5):
+        deliver(worker, args)
+    assert worker.guide_calls == 1
+    assert worker.same_action_count == 0
+
+
+def test_chat_executor_defines_normalized_coordinates_in_first_turn(tmp_path):
+    from trace2task.hybrid_chat_executor import HybridChatExecutor
+    session = Session([json.dumps({'stage_status': 'working', 'reason': 'Attack', 'actions': [CLICK]})])
+    motor = HybridChatExecutor(provider='codex', model='motor', reasoning_effort='low',
+        root=tmp_path, stop=Stop(), android=True, selected_windows=False, session=session)
+    result = motor.predict('Stage', image='eA==', request_id='one', guided_history=[], execution_context={})
+    assert result['status'] == 'predicted'
+    prompt = session.requests[0]['prompt']
+    assert 'normalized to 0..1' in prompt
+    assert 'x=pixel_x/image_width, y=pixel_y/image_height' in prompt
+    assert '(1,1) is bottom-right' in prompt
 
 
 def test_rejected_action_not_retained_and_teacher_can_correct(tmp_path):

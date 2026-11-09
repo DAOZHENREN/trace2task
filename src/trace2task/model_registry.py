@@ -108,5 +108,5 @@ def public_catalog():
             "inference_backends": [asdict(b) for b in INFERENCE_BACKENDS.values()],
             "execution_backends": [
                 {"id": "win32", "label": "Win32", "scopes": ["desktop"], "input_mode": "foreground"},
-                {"id": "cua", "label": "Cua", "scopes": ["desktop", "selected_windows"],
+                {"id": "cua", "label": "Cua", "scopes": ["desktop", "child_desktop", "selected_windows"],
                  "input_mode": "scope_dependent"}]}

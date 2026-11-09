@@ -498,12 +498,9 @@ class Engine:
         conversation = None
         guided_offset = request.get('guided_history_offset')
         guided_knowledge = request.get('guided_knowledge')
-        if guided_knowledge is not None:
-            from trace2task.application_knowledge import KNOWLEDGE_LIMIT
-
-            if (guided_offset is None or request.get('conversation_start') is not True
-                    or not isinstance(guided_knowledge, str) or len(guided_knowledge) > KNOWLEDGE_LIMIT + 512):
-                raise ValueError('底层知识仅可在混合会话首轮提交')
+        if guided_knowledge is not None and (guided_offset is None
+                or request.get('conversation_start') is not True or not isinstance(guided_knowledge, str)):
+            raise ValueError('基础知识与经验仅可在混合会话首轮提交')
         if guided_offset is not None:
             from trace2task.guided_history import GuidedTaskConversation
 

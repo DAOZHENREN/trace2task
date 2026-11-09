@@ -43,7 +43,11 @@ class HybridModelAdapter:
         self.executor_started = False
         self.director_experience = None
         self.guide_calls = self.decisions = self.stage_decisions = 0
+        self.stage_start_decisions = self.stage_start_pairs = 0
+        self.stage_visual_changes = 0
+        self.executor_report = None
         self.repetitions, self.last_key = 0, None
+        self.same_action_count, self.last_action_key = 0, None
         self.pending = None
         self.revision = None
         self.last_feedback = None
@@ -74,14 +78,26 @@ class HybridModelAdapter:
             self.reason, self.needs_guide = 'execution_rejected', True
             return
         self.executed_pairs.append(pending)
+        if image_hash != pending['image_sha256']:
+            self.stage_visual_changes += 1
         key = (pending['image_sha256'], json.dumps(pending['action'], sort_keys=True))
         if image_hash == pending['image_sha256']:
             self.repetitions = self.repetitions + 1 if key == self.last_key else 1
         else:
             self.repetitions = 0
         self.last_key = key
+        # Animated screenshots are not evidence that an input made progress.
+        # Ask for review of repeated executor input even when image bytes change.
+        if pending['model_role'] == 'executor' and pending['action']['skill'] != 'wait':
+            action_key = key[1]
+            self.same_action_count = self.same_action_count + 1 if action_key == self.last_action_key else 1
+            self.last_action_key = action_key
+        else:
+            self.same_action_count, self.last_action_key = 0, None
         if self.repetitions >= self.controller_config['repeated_no_change_limit']:
             self.reason, self.needs_guide = 'repeated_action_without_visual_change', True
+        elif self.same_action_count >= self.controller_config['repeated_no_change_limit']:
+            self.reason, self.needs_guide = 'repeated_action_requires_review', True
 
     def predict(self, task, *, screenshot, history, context=None, experience_context=None,
                 execution_feedback=None, previous_screenshot=None, on_request=None):
@@ -120,8 +136,10 @@ class HybridModelAdapter:
         from trace2task.trained_model_runner import interruptible_prediction
 
         instruction = self.current['goal']
+        instruction += '\nCompletion: ' + self.current['completion_hint']
         if self.current['notices']:
             instruction += '\nNotices: ' + json.dumps(self.current['notices'], ensure_ascii=False)
+        instruction += '\nFail conditions: ' + json.dumps(self.current['fail_conditions'], ensure_ascii=False)
         pairs = self.executed_pairs[self.executor_history_count:]
         replay = []
         for index, pair in enumerate(pairs):
@@ -140,8 +158,17 @@ class HybridModelAdapter:
             conversation = {'conversation_id': self.executor_conversation_id,
                             'conversation_start': not self.executor_started,
                             'guided_history_offset': self.executor_history_count}
-        if not self.executor_started and self.application_knowledge:
-            conversation['guided_knowledge'] = knowledge_prompt(self.application_knowledge)
+        if not self.executor_started:
+            reference = knowledge_prompt(self.application_knowledge)
+            experience = experience_context or self.director_experience
+            if experience and experience.get('model_input'):
+                reference += ('\n\nTask experience (historical methods, branches and completion checks; '
+                              'apply only where relevant to the current subgoal and screenshot; '
+                              'do not replay historical coordinates):\n' + experience['model_input'])
+            if reference:
+                # Reuse the first-turn reference channel supported by both local
+                # GUI conversations and Codex/API executors, preserving caching.
+                conversation['guided_knowledge'] = reference
         request_id = uuid.uuid4().hex
         if on_request:
             on_request()
@@ -172,8 +199,12 @@ class HybridModelAdapter:
             raise RuntimeError(output.get('error') or 'Local inference failed; no automatic retry')
         self.executor_started = True
         self.executor_history_count += len(pairs)
+        self.executor_report = output.get('stage_report')
         if output.get('status') == 'model_control':
-            return self._handoff('executor_stage_report', **output)
+            failed = output.get('control') in {'terminate_failure', 'call_user'}
+            self.executor_report = {'status': 'failed' if failed else 'needs_guidance',
+                                    'reason': str(output.get('text') or output.get('raw_output', ''))[:3000]}
+            return self._handoff('executor_stage_failed' if failed else 'executor_stage_report', **output)
         if output.get('status') != 'predicted':
             return self._handoff('invalid_action', **output)
         try:
@@ -181,7 +212,11 @@ class HybridModelAdapter:
         except (ValueError, TypeError, KeyError):
             return self._handoff('invalid_action', **output)
         if plan.done and not plan.actions:
-            return self._handoff('executor_stage_report', **output)
+            if not self.executor_report:
+                self.executor_report = {'status': 'completion_reported',
+                                        'reason': str(output.get('raw_output', ''))[:3000]}
+            reason = 'executor_stage_failed' if self.executor_report['status'] == 'failed' else 'executor_stage_completed'
+            return self._handoff(reason, **output)
         # The frozen protocol executes one decision/action at a time. Refuse a
         # batch rather than pairing its unexecuted suffix with a history image.
         if len(plan.actions) != 1 or plan.done or not output.get('raw_output'):
@@ -212,6 +247,20 @@ class HybridModelAdapter:
             self.session.reset_thread()
         removed_images = trim_api_history_images(self.session)
         handoff = {'handoff_reason': self.reason}
+        if self.current:
+            pairs = self.executed_pairs[self.stage_start_pairs:]
+            handoff['stage_feedback'] = {
+                'decisions': self.decisions - self.stage_start_decisions,
+                'delivered_actions': len(pairs),
+                'director_actions': sum(p['model_role'] == 'director' for p in pairs),
+                'executor_actions': sum(p['model_role'] == 'executor' for p in pairs),
+                'actions_with_visual_change': self.stage_visual_changes,
+                'visual_change_note': 'Screenshot bytes changed; animation alone can cause this. It is not proof of progress.',
+                'repeated_no_change': self.repetitions,
+                'consecutive_identical_executor_actions': self.same_action_count,
+                'last_delivered_action': pairs[-1]['action'] if pairs else None,
+                'executor_report': self.executor_report,
+            }
         if self.guide_calls == 0:
             handoff.update(current_subgoal=self.current, prior_subgoals=[])
             prompt = SUPERVISOR_PROMPT + MULTITURN_NOTE + '\n'
@@ -252,6 +301,9 @@ class HybridModelAdapter:
         self.stop.raise_if_requested()
         self.director_experience = experience
         value = json.loads(raw)
+        # Accept previous protocol replies while exposing only the new contract.
+        if isinstance(value, dict) and 'handoff_conditions' in value and 'fail_conditions' not in value:
+            value['fail_conditions'] = value.pop('handoff_conditions')
         if not isinstance(value, dict) or set(value) != {'decision', 'observation', 'actions', *CONTRACT_FIELDS}:
             raise ValueError('Invalid v7 guidance fields; teacher budgets are forbidden')
         actions = value['actions']
@@ -273,8 +325,8 @@ class HybridModelAdapter:
                for k in ('observation', 'goal', 'completion_hint')):
             raise ValueError('Nonempty v7 textual fields required')
         if any(not isinstance(value[k], list) or any(not isinstance(x, str) or not x.strip() for x in value[k])
-               for k in ('notices', 'handoff_conditions')):
-            raise ValueError('Invalid guidance notices or handoff conditions')
+               for k in ('notices', 'fail_conditions')):
+            raise ValueError('Invalid guidance notices or fail conditions')
         contract = {k: value[k] for k in CONTRACT_FIELDS}
         decision = value['decision']
         if decision == 'continue':
@@ -282,6 +334,9 @@ class HybridModelAdapter:
                 raise ValueError('continue requires an unchanged contract at periodic_review')
         elif decision == 'stage':
             self.current = contract
+            self.stage_start_decisions = self.decisions
+            self.stage_start_pairs = len(self.executed_pairs)
+            self.stage_visual_changes = 0
             self.stage_goals.append(contract['goal'])
             self.record('hybrid_history_carryover', protocol=PROTOCOL,
                         retained_actions=len(self.executed_pairs),
@@ -299,7 +354,9 @@ class HybridModelAdapter:
         if decision == 'blocked':
             return {**output, **self._stop('guide_blocked')}
         self.teacher_actions = normalized
+        self.executor_report = None
         self.stage_decisions, self.repetitions, self.last_key = 0, 0, None
+        self.same_action_count, self.last_action_key = 0, None
         self.needs_guide = False
         if self.teacher_actions:
             # Dispatch through the same core and observation as a normal model

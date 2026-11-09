@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 root = Path(SPECPATH).parents[1]
 datas = collect_data_files('trace2task', includes=[
     'web/*', 'web/workbench/**/*', 'android_touch/*.jar', 'android_touch/*.java',
-    'android_touch/build.json'])
+    'android_touch/build.json', 'native/ChildDesktopHost.cs'])
 vendor = root / 'build/desktop-vendor'
 if not (vendor / 'uv.exe').is_file():
     raise RuntimeError('Run scripts/build-desktop.ps1 to prepare bundled runtime tools')

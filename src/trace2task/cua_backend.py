@@ -136,7 +136,7 @@ class CuaBackend:
     def call(self, tool, payload):
         start = time.perf_counter()
         try:
-            result = subprocess.run([str(self.driver), 'call', tool, '--socket', self.pipe],
+            result = subprocess.run(self.call_command(tool),
                 input=json.dumps(payload, ensure_ascii=False), capture_output=True, encoding='utf-8',
                 timeout=20, env=self.env, check=False,
                 creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
@@ -147,6 +147,9 @@ class CuaBackend:
                     stderr=result.stderr, returncode=result.returncode,
                     elapsed_ms=round((time.perf_counter()-start)*1000, 2))
         return response_value(result.stdout or result.stderr, result.returncode)
+
+    def call_command(self, tool):
+        return [str(self.driver), 'call', tool, '--socket', self.pipe]
 
     def observe(self, target, step):
         path = (self.root / f'{step:04d}.png').resolve()

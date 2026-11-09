@@ -19,6 +19,8 @@ ACTIVE_STATES = {"queued", "running", "stopping", "awaiting_recording_start", "a
 
 
 def operation_scope(executor, scope, target):
+    if executor == "cua" and target == {"kind": "desktop", "display_id": "child_session"}:
+        return "child_desktop"
     if executor == "cua" and (target or {}).get("kind") != "desktop":
         return "selected_windows"
     return scope
@@ -85,6 +87,7 @@ class RunSession:
             "local" if local else "remote", destination,
             context_policy, context_description, job.task_path,
             "remote_android" if job.executor_backend == "android" else "isolated_browser" if job.executor_backend == "browser" else
+            "child_session" if scope == "child_desktop" else
             "background_preferred" if job.executor_backend == "cua" and scope == "selected_windows"
             else "background" if job.background else "foreground",
             identity, representation, experience_sha, getattr(job, 'memory_mode', 'manual' if identity else 'off'),
@@ -200,7 +203,7 @@ class RunStore:
                  "time": datetime.now(UTC).isoformat(), "attributes": attributes}
         self.db.execute("INSERT INTO events(run_id,value) VALUES (?,?)", (run_id, json.dumps(value, ensure_ascii=False)))
 
-    def save(self, snapshot, *, log=None):
+    def save(self, snapshot, *, log=None, screenshot=None):
         snapshot = compact_snapshot(snapshot)
         key = self._id(snapshot["job_id"])
         with self.lock, self.db:
@@ -210,7 +213,10 @@ class RunStore:
             if old is None or old[0] != snapshot["status"]:
                 self.event(key, "run.status", {"status": snapshot["status"]})
             if log:
-                self.event(key, "run.log", {"message": str(log)})
+                attributes = {"message": str(log)}
+                if screenshot:
+                    attributes["screenshot"] = screenshot
+                self.event(key, "run.log", attributes)
 
     def round(self, run_id, entry):
         self._id(run_id)

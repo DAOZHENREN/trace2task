@@ -15,6 +15,107 @@ test.beforeEach(async ({page}) => {page.on('dialog', async dialog => {
 
 test.afterEach(async ({page}) => {await page.unrouteAll({behavior: 'wait'});});
 
+test('background desktop shows login and its first image in the regular timeline before a model reply', async ({page}) => {
+  const run = {job_id: 'child-timeline', task_id: 'child', instruction: '续写文档', status: 'running',
+    operation_scope: 'child_desktop', kind: 'agent', provider: 'codex', stop_requested: false};
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [run]}}));
+  await page.route('**/api/workbench/runs/child-timeline?after=*', route => {
+    const first = route.request().url().endsWith('after=0');
+    return route.fulfill({json: {session: run, cursor: 2, has_more: false, events: first ? [
+      {seq: 1, name: 'run.log', time: '2026-11-06T08:30:00Z', attributes: {message: 'Windows 已登录后台桌面，正在连接 Cua 驱动。'}},
+      {seq: 2, name: 'run.log', time: '2026-11-06T08:30:03Z', attributes: {message: '已启动后台桌面 4，已取得本任务的首张截图。', screenshot: 'runs/test/child-ready.png'}},
+    ] : []}});
+  });
+  await page.route('**/api/local-image?path=*', route => route.fulfill({contentType: 'image/png',
+    body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')}));
+  await page.goto('/');
+  await page.getByRole('button', {name: '查看运行轨迹'}).click();
+  const setup = page.getByRole('region', {name: '后台桌面连接记录'});
+  await expect(setup).toContainText('Windows 已登录后台桌面');
+  await expect(setup.getByRole('img', {name: '后台桌面首张截图'})).toBeVisible();
+  await expect(page.getByText('正在等待第一轮模型输入。')).toBeVisible();
+});
+
+for (const mode of ['original', 'hybrid']) test(`background desktop confirmation binds the ${mode} job to the Windows child session`, async ({page}) => {
+  const jobs: unknown[] = [];
+  await page.route('**/api/jobs', route => {
+    jobs.push(route.request().postDataJSON());
+    return route.fulfill({json: {job_id: 'child-ui', status: 'completed', kind: 'agent'}});
+  });
+  await page.goto('/');
+  await page.getByLabel('执行模式', {exact: true}).selectOption(mode);
+  if (mode === 'hybrid') {
+    await page.getByLabel('主要执行模型来源', {exact: true}).selectOption('codex');
+    await page.getByLabel('主要执行模型', {exact: true}).selectOption('gpt-6-luna');
+  }
+  await page.getByLabel('操作范围', {exact: true}).selectOption('child_desktop');
+  await expect(page.getByLabel('执行后端', {exact: true})).toBeDisabled();
+  await page.getByRole('textbox', {name: '任务指令'}).fill('在后台桌面保存中文文档');
+  await page.getByRole('button', {name: '开始任务', exact: true}).click();
+  await expect(page.getByRole('dialog')).toContainText('仅截取和操作本次子会话');
+  expect(jobs).toHaveLength(0);
+  await page.getByRole('button', {name: '确认开始', exact: true}).click();
+  await expect.poll(() => jobs.length).toBe(1);
+  expect(jobs[0]).toMatchObject({execution_mode: mode, execution_scope: 'desktop', executor_backend: 'cua',
+    cua_target: {kind: 'desktop', display_id: 'child_session'}});
+});
+
+test('an idle background desktop stays available until the user confirms closing that session', async ({page}) => {
+  let desktop = {status: 'idle', session_id: 4 as number | null, generation: 7, manual_control: false};
+  const views: string[] = [];
+  const closes: unknown[] = [];
+  await page.route('**/api/state?compact=1', async route => {
+    const state = await (await route.fetch()).json();
+    return route.fulfill({json: {...state, child_desktop: desktop}});
+  });
+  await page.route('**/api/workbench/runs', route => route.fulfill({json: {runs: [], child_desktop: desktop}}));
+  await page.route('**/api/child-desktop/viewer', route => {
+    const {mode, generation} = route.request().postDataJSON();
+    expect(generation).toBe(7);
+    views.push(mode);
+    if (['control', 'return'].includes(mode)) desktop.manual_control = mode === 'control';
+    return route.fulfill({json: desktop});
+  });
+  await page.route('**/api/child-desktop/close', route => {
+    closes.push(route.request().postDataJSON());
+    desktop = {...desktop, status: 'logoff_pending'};
+    return route.fulfill({json: desktop});
+  });
+  await page.goto('/');
+  const management = page.getByRole('region', {name: '后台桌面管理'});
+  await expect(management).toHaveCount(0);
+  await page.getByLabel('操作范围', {exact: true}).selectOption('child_desktop');
+  await expect(management).toBeVisible();
+  await management.getByRole('button', {name: '查看实时桌面'}).click();
+  await management.getByRole('button', {name: '手动操作', exact: true}).click();
+  await expect(management).toContainText('你正在手动操作');
+  await management.getByRole('button', {name: '隐藏窗口'}).click();
+  await management.getByRole('button', {name: '结束手动操作'}).click();
+  await management.getByRole('button', {name: '刷新状态'}).click();
+  expect(views).toEqual(['view', 'control', 'hide', 'return']);
+  await page.getByLabel('操作范围', {exact: true}).selectOption('desktop');
+  await expect(management).toHaveCount(0);
+  expect(closes).toEqual([]);
+  await page.getByLabel('操作范围', {exact: true}).selectOption('child_desktop');
+  await expect(page.getByText(/后台桌面已就绪（会话 4）/)).toBeVisible();
+  const close = page.getByRole('button', {name: '关闭后台桌面', exact: true});
+  await close.click();
+  await acceptConfirmation(page, '取消');
+  expect(closes).toEqual([]);
+  await close.click();
+  await acceptConfirmation(page, '确认关闭');
+  await expect(close).toHaveCount(0);
+  await expect(management).toContainText('正在等待注销确认');
+  await expect(management.getByRole('button', {name: '打开后台桌面'})).toHaveCount(0);
+  desktop = {...desktop, status: 'logoff_unknown'};
+  await management.getByRole('button', {name: '刷新状态'}).click();
+  await expect(management).toContainText('暂时无法从 Windows 核实后台会话 4');
+  desktop = {...desktop, status: 'closed', session_id: null};
+  await management.getByRole('button', {name: '刷新状态'}).click();
+  expect(closes).toEqual([{generation: 7}]);
+  await expect(page.getByText('后台桌面已关闭。')).toBeVisible();
+});
+
 test('application knowledge has its own searchable library tab and editor', async ({page}) => {
   let game = {id: 'game', scope: 'android', application: 'com.example.game', sha256: 'original', revision: 1,
     content: '战斗工具栏包含自动战斗控件。'};
@@ -93,7 +194,7 @@ test('C combines the explicitly selected B, previews evidence and requires expli
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('@auto');
   await combined.getByRole('button', {name: '用于新任务', exact: true}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue('trace-library/c-combined/model-input.txt');
-  expect(writes.every(path => ['/api/traces/generate-c', '/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+  expect(writes.every(path => ['/api/traces/generate-c', '/api/traces/model-input', '/api/traces/body', '/api/application-knowledge/drafts'].includes(path))).toBe(true);
 });
 
 test('bulk recycle scopes selection, cancels safely, reports partial failure and restores run history', async ({page}, info) => {
@@ -218,7 +319,7 @@ test('Agent compiles B as a separate Markdown version, with disclosure, duplicat
   await page.locator('article').filter({hasText: '可执行参考 · Agent 方法 B'}).getByRole('button', {name: '用于新任务'}).click();
   await expect(page.getByLabel('参考经验', {exact: true})).toHaveValue(`trace-library/${trace.id}/model-input.txt`);
   await expect(page.getByLabel('参考经验', {exact: true}).locator('option:checked')).toContainText(' · B · ');
-  expect(writes.every(path => ['/api/traces/generate-b', '/api/traces/model-input', '/api/traces/body'].includes(path))).toBe(true);
+  expect(writes.every(path => ['/api/traces/generate-b', '/api/traces/model-input', '/api/traces/body', '/api/application-knowledge/drafts'].includes(path))).toBe(true);
 });
 
 test('service card hides D and refreshes only on opening or explicit request', async ({page}, info) => {

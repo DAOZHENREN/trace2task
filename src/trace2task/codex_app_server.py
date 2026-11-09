@@ -354,6 +354,7 @@ class CodexAppServerSession:
         self.wait_while_active = wait_while_active
         self.active_wait_callback = active_wait_callback
         self.last_turn_wait_extended = False
+        self.last_web_searches = []
         self._rate_limit_started: float | None = None
         self._rate_limit_until = 0.0
         self.last_rate_limit_wait_seconds = 0.0
@@ -460,6 +461,7 @@ class CodexAppServerSession:
     def run_turn(self, **kwargs: Any) -> str:
         self.last_rate_limit_wait_seconds = 0.0
         self.last_turn_wait_extended = False
+        self.last_web_searches = []
         try:
             return self._run_turn(**kwargs)
         finally:
@@ -692,6 +694,9 @@ class CodexAppServerSession:
             params = params if isinstance(params, dict) else {}
             item = params.get("item")
             item_type = item.get("type") if isinstance(item, dict) else None
+            if (method == "item/completed" and item_type == "webSearch"
+                    and params.get("threadId") == thread_id and params.get("turnId") == turn_id):
+                self.last_web_searches.append(item)
             last_event = {"method": method, "item_type": item_type,
                           "at_seconds": round(time.monotonic() - turn_started_at, 3)}
             if method == "trace2task/codexRetry" and params.get("turnId") == turn_id:

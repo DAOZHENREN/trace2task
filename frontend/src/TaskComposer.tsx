@@ -9,19 +9,21 @@ import {chooseCodexModel, codexChoiceError, codexEfforts, CodexModelOptions} fro
 import {Choice, Field, Icon} from './ui';
 import {CloudPhoneConnection, cloudPhoneDestination, cloudPhoneSelected} from './CloudPhoneConnection';
 import {AndroidDevices} from './AndroidDevices';
+import {ChildDesktopConnection} from './ChildDesktopConnection';
 import {NitrogenTask} from './NitrogenTask';
 
 type Props = {config: Config; setConfig: (next: Config) => void; state: AppState; catalog: Catalog;
-  busy: boolean; promptDirty: boolean; onRun: (run: Run) => void; onModels: () => void; onRefreshCodex: () => Promise<void>; onError: (message: string) => void};
+  busy: boolean; promptDirty: boolean; onRun: (run: Run) => void; onModels: () => void; onRefreshCodex: () => Promise<void>;
+  onDesktopRefresh: () => Promise<void>; onError: (message: string) => void};
 
 const HYBRID_LIMIT_FIELDS = [
   ['max_decisions', '最多执行决策', '包含指导模型直接执行的动作'],
   ['max_guide_calls', '最多指导次数', '包含首次指导'],
   ['review_interval', '复查间隔（决策次数）', '每个阶段达到此次数后复查'],
-  ['repeated_no_change_limit', '重复动作交回阈值', '同一动作连续达到此次数且画面未变时交回'],
+  ['repeated_no_change_limit', '重复动作交回阈值', '执行模型连续重复同一非等待动作时交回复查；动画变化不代表操作有效'],
 ] as const;
 
-export function TaskComposer({config, setConfig: saveConfig, state, catalog, busy, promptDirty, onRun, onModels, onRefreshCodex, onError}: Props) {
+export function TaskComposer({config, setConfig: saveConfig, state, catalog, busy, promptDirty, onRun, onModels, onRefreshCodex, onDesktopRefresh, onError}: Props) {
   const hybrid = config.executionMode === 'hybrid';
   const c: Config = hybrid ? {...config, provider: config.hybridDirectorProvider || 'codex', mobileforge: '', androidModelProfile: ''} : config;
   const setConfig = (next: Config) => saveConfig(hybrid ? {...next, provider: config.provider,
@@ -231,23 +233,25 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
       </>}
       {hybrid && <p className="quiet">指导端也可使用本地兼容 API 的视觉模型。两端使用独立会话。
         {executorChoice.provider === 'local' && c.inference === 'slotread' && ' GUI-Decisions 原生接口只读当前截图，保留动作文字历史，不支持历史图片。'}
-        {c.experience && ' 参考经验是本地扩展，会额外提供给指导模型。'}</p>}
+        {c.experience && ' 参考经验正文会提供给指导模型和执行模型，执行模型在首轮加载并在后续对话中保留。'}</p>}
       {c.provider === 'codex' && state.agent_options.catalog_error && <p role="status" className="quiet">{state.agent_options.catalog_error}</p>}
       {c.experience === AUTO_MEMORY ? <p className="quiet">Agent 先检索方法摘要，再决定加载一份 B 或不使用经验；操作前重新截图。检索和加载过程记入运行记录。</p>
         : (c.provider === 'local' || c.mobileforge) && <p className="quiet">当前策略不支持自动经验，自动模式已关闭；本地 GUI 模型仍可按现有协议手动选择经验。</p>}
       <div className="scope-row">
         <Field label="操作范围"><Choice value={c.scope} disabled={busy} onChange={e => update('scope', e.target.value)}>
-          <option value="desktop">全桌面 · 可跨应用</option><option value="selected_windows">仅指定窗口 / 应用</option>
+          <option value="desktop">全桌面 · 可跨应用</option><option value="child_desktop">Windows 后台桌面</option>
+          <option value="selected_windows">仅指定窗口 / 应用</option>
           <option value="browser">Ancient Beast · 独立浏览器</option>
           <option value="android">Android · 指定手机与应用</option>
         </Choice></Field>
-        <Field label="执行后端"><Choice value={c.executor} disabled={busy || c.scope === 'android'} onChange={e => update('executor', e.target.value)}>
+        <Field label="执行后端"><Choice value={c.executor} disabled={busy || c.scope === 'android' || c.scope === 'child_desktop'} onChange={e => update('executor', e.target.value)}>
           <option value="cua">Cua · 按范围执行</option>
           <option value="browser">Browser · 隔离后台（实验）</option>
           <option value="android">ADB · 远程手机（实验）</option>
         </Choice></Field>
         <span className="scope-note"><Icon name="shield" size={16}/>仅在确认的范围内执行</span>
       </div>
+      {c.scope === 'child_desktop' && <ChildDesktopConnection desktop={state.child_desktop} busy={busy} refresh={onDesktopRefresh}/>}
       {(c.scope === 'android' || c.executor === 'android') && <div className="target-picker">
         <div className="setup-heading"><strong>手机连接</strong><span className="tag">{c.mobileforge ? 'MobileForge' : '通用视觉代理'} · ADB</span></div>
         {c.provider === 'local' && <p className="quiet">本地模型读取手机截图，通过 ADB 执行各模型可表达的点击、长按、滑动、返回和等待；暂不支持文字输入、滚轮或多指操作。</p>}
@@ -329,7 +333,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
     {!nitrogen && <details className="context-strip"><summary>当前推理连接 · {engine?.label || '推理引擎'}</summary><p>{engine?.context_description}</p></details>}
     <Dialog open={confirm} onOpenChange={(_, d) => {if (!submitting) setConfirm(d.open);}}>
       <DialogSurface className="confirmation-surface"><DialogBody className="confirmation-body"><DialogTitle className="confirmation-title">开始这一次任务？</DialogTitle><DialogContent className="confirmation-content">
-        <p>{instruction}</p><dl className="facts-list"><dt>模型</dt><dd>{selectedModel}</dd><dt>操作范围</dt><dd>{c.scope === 'android' ? `仅 Android · ${android.serial} · ${android.package} · ${c.mobileforge ? 'MobileForge' : '通用视觉代理'} · 最多 ${budget.max_actions} 个动作 / ${budget.max_seconds / 60} 分钟` : c.scope === 'browser' ? '仅 Ancient Beast · 独立无头浏览器 · 不占用系统键鼠' : c.scope === 'desktop' ? '整个主显示器 · 占用键鼠' : c.targets.map(t => t.label).join('；')}</dd>
+        <p>{instruction}</p><dl className="facts-list"><dt>模型</dt><dd>{selectedModel}</dd><dt>操作范围</dt><dd>{c.scope === 'android' ? `仅 Android · ${android.serial} · ${android.package} · ${c.mobileforge ? 'MobileForge' : '通用视觉代理'} · 最多 ${budget.max_actions} 个动作 / ${budget.max_seconds / 60} 分钟` : c.scope === 'browser' ? '仅 Ancient Beast · 独立无头浏览器 · 不占用系统键鼠' : c.scope === 'child_desktop' ? 'Windows 后台桌面 · 仅截取和操作本次子会话' : c.scope === 'desktop' ? '整个主显示器 · 占用键鼠' : c.targets.map(t => t.label).join('；')}</dd>
           <dt>经验方式</dt><dd>{c.experience === AUTO_MEMORY ? 'Agent 自动检索摘要，按需加载一份方法 B；也可不加载' : c.experience ? '手动固定版本' : '不使用经验'}</dd>
           {knowledge && <><dt>应用底层知识</dt><dd>{knowledge.application} · v{knowledge.revision} · 随任务提供给{hybrid ? '指导模型和执行模型' : '执行模型'}</dd></>}
           <dt>数据去向</dt><dd>{destination} {remote ? (c.experience === AUTO_MEMORY ? '· 发送截图、检索到的经验摘要和选中的方法全文' : '· 发送截图与相关经验') : '· 本机处理'}</dd></dl>
