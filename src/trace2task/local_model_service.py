@@ -30,7 +30,7 @@ def _probe_service(spec):
             health = json.loads(response.read(65537))
         if not isinstance(health, dict):
             raise TypeError('服务状态格式无效')
-        if service_id == 'gui':
+        if service_id in {'gui', 'gui_swift'}:
             if health.get('service') != 'trace2task-local-gui' or health.get('protocol') != 1:
                 raise ValueError('服务身份不匹配')
             if any(health.get(key) is not None and not isinstance(health[key], str) for key in ('model', 'backend', 'status')):
@@ -58,6 +58,8 @@ def _probe_service(spec):
 def service_status():
     """Rediscover known services; no process ownership, cached selection or startup required."""
     specs = [('gui', '本地 GUI 服务', 8768), ('trained_d', 'D-5970 预览服务', 8767)]
+    if os.environ.get('TRACE2TASK_SWIFT_RELEASE'):
+        specs.append(('gui_swift', 'GUI-Swift Native131 服务', 8769))
     with ThreadPoolExecutor(max_workers=len(specs)) as pool:
         services = list(pool.map(_probe_service, specs))
     return {'services': services, 'checked_at': datetime.now(UTC).isoformat()}
@@ -131,6 +133,8 @@ def service_busy():
 def control_service(action, model, data_root, backend=None):
     if action not in {'start', 'stop'} or model not in {*MODELS, 'trained_d'}:
         raise ValueError('未知本地模型或服务操作')
+    if os.environ.get('TRACE2TASK_GUI_EXTERNALLY_MANAGED') == '1':
+        raise RuntimeError('此部署的模型服务由服务器容器管理；网页仅选择和调用，不启动或终止其他服务。')
     if not _lock.acquire(blocking=False):
         raise RuntimeError('本地服务正在启动或关闭，请稍候')
     try:

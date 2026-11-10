@@ -15,6 +15,7 @@ from trace2task.model_registry import profile_for
 # Native model formats, not backend permissions. A backend reports its own
 # routes; the adapter exposes only the intersection to the model.
 MODEL_ACTION_SKILLS = {
+    'mai-swift-2b': frozenset({'click', 'hold_mouse', 'drag', 'type_text', 'press_key', 'wait'}),
     'gui-decisions-2b': frozenset({'click', 'drag', 'press_key', 'scroll', 'wait'}),
     'qwen3-vl-2b': frozenset({'click', 'double_click', 'hold_mouse', 'type_text',
                               'press_key', 'hold_key', 'hotkey', 'wait', 'scroll',
@@ -24,6 +25,7 @@ MODEL_ACTION_SKILLS = {
     'mai-ui-2b': frozenset({'click', 'double_click', 'type_text', 'press_key',
                             'hotkey', 'wait', 'scroll', 'drag'}),
 }
+MODEL_ACTION_SKILLS['gui-swift-4b'] = MODEL_ACTION_SKILLS['gui-owl-2b']
 MODEL_ACTION_SKILLS['qwen3-vl-8b-instruct'] = MODEL_ACTION_SKILLS['qwen3-vl-2b']
 
 
@@ -211,6 +213,12 @@ def prompt(model, cua=False):
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
+    if model == 'gui-swift-4b':
+        from trace2task.local_gui_swift import SYSTEM
+        return SYSTEM
+    if model == 'mai-swift-2b':
+        from trace2task.local_gui_mai_swift import SYSTEM
+        return SYSTEM
     if model == 'gui-decisions-2b':
         from trace2task.local_gui_slots import SYSTEM
         return SYSTEM
@@ -273,6 +281,12 @@ def decode(model, text, cua=False, *, generation_complete=False, normalizations=
     """
     if model not in MODELS:
         raise ValueError('Unknown local GUI model')
+    if model == 'gui-swift-4b':
+        return decode('gui-owl-2b', text, cua, generation_complete=generation_complete,
+                      normalizations=normalizations, cursor_position=cursor_position)
+    if model == 'mai-swift-2b':
+        from trace2task.local_gui_mai_swift import decode_native
+        return decode_native(json.loads(text, object_pairs_hook=_unique_object))
     if model == 'gui-decisions-2b':
         from trace2task.local_gui_slots import decode_slots
         return decode_slots(json.loads(text, object_pairs_hook=_unique_object))

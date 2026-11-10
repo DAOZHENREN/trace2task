@@ -1,3 +1,5 @@
+import {AndroidWorldTask} from './AndroidWorldTask';
+import {OSWorldTask} from './OSWorldTask';
 import {useState} from 'react';
 import {Button, Checkbox, Combobox, Dialog, DialogActions, DialogBody, DialogContent, DialogSurface, DialogTitle, Input, Option, Textarea} from '@fluentui/react-components';
 import {api, requestFor} from './api';
@@ -47,7 +49,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
   const [probing, setProbing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const android = c.android || {adb: 'D:/Tools/trace2task-android/sdk/platform-tools/adb.exe', serial: '', package: '', server_port: 5037};
-  const knowledgeSupported = !nitrogen && !c.mobileforge && c.scope !== 'browser' &&
+  const knowledgeSupported = !nitrogen && !c.mobileforge && c.scope !== 'browser' && c.scope !== 'osworld' && c.scope !== 'androidworld' &&
     (c.provider !== 'local' || c.localModel !== 'trained_d');
   const profiles = state.application_knowledge || [];
   const matchedKnowledge = profiles.find(item => item.scope === 'android' && item.application === android.package.trim());
@@ -77,7 +79,15 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
     const next = {...c, [key]: value};
     if (key === 'provider' && hybrid) next.hybridDirectorProvider = value as 'codex' | 'api';
     if (key === 'model') next.effort = chooseCodexModel(state.agent_options, String(value), c.effort).reasoning_effort;
-    if (key === 'scope') next.executor = value === 'android' ? 'android' : value === 'browser' ? 'browser' : 'cua';
+    if (key === 'scope') next.executor = value === 'androidworld' ? 'androidworld' : value === 'osworld' ? 'osworld' : value === 'android' ? 'android' : value === 'browser' ? 'browser' : 'cua';
+    if (key === 'scope' && value === 'androidworld') {
+      next.experience = ''; next.mobileforge = ''; next.androidModelProfile = '';
+      next.executionMode = 'hybrid'; next.provider = 'codex'; next.hybridDirectorProvider = 'codex';
+      next.localModel = 'mai-swift-2b'; next.inference = 'mai-swift-native105';
+      next.hybridExecutor = {provider: 'local', model: '', effort: 'low', apiUrl: '', apiKey: ''};
+      setInstruction('');
+    }
+    if (key === 'scope' && value === 'osworld') {next.experience = ''; next.mobileforge = ''; next.androidModelProfile = ''; setInstruction('');}
     if (key === 'localModel') {
       const p = catalog.models.find(p => p.id === value);
       if (p && !p.engines.includes(c.inference)) next.inference = p.engines[0];
@@ -106,17 +116,20 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
     } catch (e) { onError(String(e)); } finally { setLoadingTargets(false); }
   }
   function validate() {
+    const modelService = catalog.services?.[c.localModel] || catalog.service;
     if (hybrid && c.executor === 'browser') return '混合模式首版支持 Android 手机和 Cua 桌面；请选择对应操作范围。';
     if (hybrid && Object.values(hybridLimits).some(value => !Number.isInteger(value) || value < 1 || value > 500))
       return '混合模式的四项运行限制均须填写 1–500 的整数。';
     if (hybrid && executorChoice.provider === 'local' && (!profile || !profile.engines.includes(c.inference))) return '请选择已接入的本地执行模型与兼容推理引擎。';
-    if (hybrid && executorChoice.provider === 'local' && (!catalog.service.reachable || catalog.service.backend !== c.inference))
+    if (c.scope !== 'androidworld' && hybrid && executorChoice.provider === 'local' && (!modelService.reachable || modelService.backend !== c.inference))
       return '请先在「模型与连接」启动混合模式选择的本地推理引擎。';
     if (hybrid && executorChoice.provider === 'codex') {const error = codexChoiceError(state.agent_options, executorChoice.model, executorChoice.effort); if (error) return error;}
     if (hybrid && executorChoice.provider === 'api' && (!executorChoice.model.trim() || !executorChoice.apiUrl.trim())) return '请填写主要执行模型的 API 地址和模型 ID。';
     if (c.provider === 'codex') {const error = codexChoiceError(state.agent_options, c.model, c.effort); if (error) return error;}
     if (dictationActive()) return '请先结束语音输入并等待转写完成。';
     if (promptDirty) return '当前模型的提示词有未保存修改，请在「设置与工具 → 模型提示词」保存或恢复默认后再开始任务。';
+    if (c.scope === 'androidworld' && (!c.androidworld?.task_id || c.executor !== 'androidworld' || !hybrid || c.localModel !== 'mai-swift-2b' || executorChoice.provider !== 'local')) return '请选择 AndroidWorld 任务，并使用 MAI-Swift 混合模式。';
+    if (c.scope === 'osworld' && (!c.osworld?.task_id || c.executor !== 'osworld')) return '请选择 OSWorld 任务。';
     if (!instruction.trim()) return '请先写下任务目标。';
     if (c.experience === AUTO_MEMORY && (c.provider === 'local' || c.mobileforge))
       return '自动经验暂不支持本地 GUI 专用模型或 MobileForge；请关闭自动经验或选择通用代理。';
@@ -140,7 +153,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
     if (c.executor === 'browser' && c.provider === 'local') return '浏览器首版仅支持 Codex 或视觉模型 API；本地 GUI 模型尚未验证。';
     if (c.scope === 'selected_windows' && (c.executor !== 'cua' || !c.targets.length || c.targets.length > 12)) return '指定窗口需要 Cua，并明确选择 1–12 个目标。';
     if (c.localModel === 'trained_d' && c.provider === 'local' && c.experience) return 'D-5970 冻结协议不能使用 A/B/C/D 经验。';
-    if (c.provider === 'local' && profile && (!catalog.service.reachable || catalog.service.backend !== c.inference))
+    if (c.provider === 'local' && profile && (!modelService.reachable || modelService.backend !== c.inference))
       return '请先在「模型与连接」启动所选推理引擎；不会静默切换到其他引擎。';
     return '';
   }
@@ -155,7 +168,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
       {!nitrogen && <>
       <div className="composer-top"><span className="section-label"><span className="step-marker">01</span>任务目标</span><div className="button-row"><Dictation disabled={busy} onError={onError} onAppend={text => setInstruction(value => `${value} ${text}`.trim().slice(0, 2000))}/></div></div>
       <Textarea className="task-textarea" aria-label="任务指令" placeholder={cloudPhone ? '描述手机任务，例如：继续当前暂停的秒表，不要重置。' : '描述你想完成的事，例如：把今天的待办整理到记事本，按优先级排序。'}
-        value={instruction} onChange={(_, d) => setInstruction(d.value)} maxLength={2000} resize="vertical" disabled={busy}/>
+        value={instruction} onChange={(_, d) => setInstruction(d.value)} maxLength={2000} resize="vertical" disabled={busy || c.scope === 'osworld' || c.scope === 'androidworld'}/>
       </>}
       <div className="execution-setup">
       <div className="setup-heading"><span className="section-label"><span className="step-marker">02</span>执行配置</span>
@@ -189,7 +202,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
           {!codexEfforts(state.agent_options, c.model).includes(c.effort) && <option value={c.effort} disabled>请重新选择</option>}
           {codexEfforts(state.agent_options, c.model).map(e => <option key={e}>{e}</option>)}
         </Choice></Field>}
-        {!nitrogen && <Field label="参考经验"><Choice value={c.experience} disabled={busy} onChange={e => update('experience', e.target.value)}>
+        {!nitrogen && <Field label="参考经验"><Choice value={c.experience} disabled={busy || c.scope === 'osworld' || c.scope === 'androidworld'} onChange={e => update('experience', e.target.value)}>
           <option value={AUTO_MEMORY} disabled={c.provider === 'local' || !!c.mobileforge}>自动选择 · Agent 检索并加载方法 B</option>
           <option value="">不使用经验</option>{state.trace_representations.filter(usableTrace).map(t =>
             <option key={t.id} value={`trace-library/${t.id}/model-input.txt`}>{versionLabel(t)}</option>)}
@@ -237,17 +250,23 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
       {c.provider === 'codex' && state.agent_options.catalog_error && <p role="status" className="quiet">{state.agent_options.catalog_error}</p>}
       {c.experience === AUTO_MEMORY ? <p className="quiet">Agent 先检索方法摘要，再决定加载一份 B 或不使用经验；操作前重新截图。检索和加载过程记入运行记录。</p>
         : (c.provider === 'local' || c.mobileforge) && <p className="quiet">当前策略不支持自动经验，自动模式已关闭；本地 GUI 模型仍可按现有协议手动选择经验。</p>}
+      {c.scope === 'androidworld' && <AndroidWorldTask config={c} setConfig={setConfig} onInstruction={setInstruction} busy={busy}/> }
+      {c.scope === 'osworld' && <OSWorldTask config={c} setConfig={setConfig} onInstruction={setInstruction} busy={busy}/> }
       <div className="scope-row">
         <Field label="操作范围"><Choice value={c.scope} disabled={busy} onChange={e => update('scope', e.target.value)}>
           <option value="desktop">全桌面 · 可跨应用</option><option value="child_desktop">Windows 后台桌面</option>
           <option value="selected_windows">仅指定窗口 / 应用</option>
           <option value="browser">Ancient Beast · 独立浏览器</option>
           <option value="android">Android · 指定手机与应用</option>
+          <option value="osworld">OSWorld · 隔离开发测试</option>
+          <option value="androidworld">AndroidWorld · 手机环境测试</option>
         </Choice></Field>
-        <Field label="执行后端"><Choice value={c.executor} disabled={busy || c.scope === 'android' || c.scope === 'child_desktop'} onChange={e => update('executor', e.target.value)}>
+        <Field label="执行后端"><Choice value={c.executor} disabled={busy || c.scope === 'android' || c.scope === 'child_desktop' || c.scope === 'osworld' || c.scope === 'androidworld'} onChange={e => update('executor', e.target.value)}>
           <option value="cua">Cua · 按范围执行</option>
           <option value="browser">Browser · 隔离后台（实验）</option>
           <option value="android">ADB · 远程手机（实验）</option>
+          <option value="osworld">OSWorld · 已有环境</option>
+          <option value="androidworld">AndroidWorld · 专用模拟器</option>
         </Choice></Field>
         <span className="scope-note"><Icon name="shield" size={16}/>仅在确认的范围内执行</span>
       </div>
@@ -333,7 +352,7 @@ export function TaskComposer({config, setConfig: saveConfig, state, catalog, bus
     {!nitrogen && <details className="context-strip"><summary>当前推理连接 · {engine?.label || '推理引擎'}</summary><p>{engine?.context_description}</p></details>}
     <Dialog open={confirm} onOpenChange={(_, d) => {if (!submitting) setConfirm(d.open);}}>
       <DialogSurface className="confirmation-surface"><DialogBody className="confirmation-body"><DialogTitle className="confirmation-title">开始这一次任务？</DialogTitle><DialogContent className="confirmation-content">
-        <p>{instruction}</p><dl className="facts-list"><dt>模型</dt><dd>{selectedModel}</dd><dt>操作范围</dt><dd>{c.scope === 'android' ? `仅 Android · ${android.serial} · ${android.package} · ${c.mobileforge ? 'MobileForge' : '通用视觉代理'} · 最多 ${budget.max_actions} 个动作 / ${budget.max_seconds / 60} 分钟` : c.scope === 'browser' ? '仅 Ancient Beast · 独立无头浏览器 · 不占用系统键鼠' : c.scope === 'child_desktop' ? 'Windows 后台桌面 · 仅截取和操作本次子会话' : c.scope === 'desktop' ? '整个主显示器 · 占用键鼠' : c.targets.map(t => t.label).join('；')}</dd>
+        <p>{instruction}</p><dl className="facts-list"><dt>模型</dt><dd>{selectedModel}</dd><dt>操作范围</dt><dd>{c.scope === 'androidworld' ? `AndroidWorld 专用模拟器 · ${c.androidworld?.task_id} · 最多 ${c.androidworld?.max_actions} 个动作` : c.scope === 'osworld' ? `OSWorld 独立访客 · ${c.osworld?.task_id} · 最多 ${c.osworld?.max_actions} 个动作` : c.scope === 'android' ? `仅 Android · ${android.serial} · ${android.package} · ${c.mobileforge ? 'MobileForge' : '通用视觉代理'} · 最多 ${budget.max_actions} 个动作 / ${budget.max_seconds / 60} 分钟` : c.scope === 'browser' ? '仅 Ancient Beast · 独立无头浏览器 · 不占用系统键鼠' : c.scope === 'child_desktop' ? 'Windows 后台桌面 · 仅截取和操作本次子会话' : c.scope === 'desktop' ? '整个主显示器 · 占用键鼠' : c.targets.map(t => t.label).join('；')}</dd>
           <dt>经验方式</dt><dd>{c.experience === AUTO_MEMORY ? 'Agent 自动检索摘要，按需加载一份方法 B；也可不加载' : c.experience ? '手动固定版本' : '不使用经验'}</dd>
           {knowledge && <><dt>应用底层知识</dt><dd>{knowledge.application} · v{knowledge.revision} · 随任务提供给{hybrid ? '指导模型和执行模型' : '执行模型'}</dd></>}
           <dt>数据去向</dt><dd>{destination} {remote ? (c.experience === AUTO_MEMORY ? '· 发送截图、检索到的经验摘要和选中的方法全文' : '· 发送截图与相关经验') : '· 本机处理'}</dd></dl>

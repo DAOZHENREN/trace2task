@@ -239,3 +239,21 @@ Android 通用视觉代理的运行详情新增「运行中干预」：发送补
 ## 设计参考
 
 采用 [React 官方渐进迁移方式](https://react.dev/learn/add-react-to-an-existing-project)、[Fluent 2 语义设计令牌](https://fluent2.microsoft.design/design-tokens)，参考 [UI-TARS 的模型与操作器边界](https://github.com/bytedance/UI-TARS-desktop/blob/main/packages/ui-tars/sdk/README.md)；推理参数以 [llama.cpp b11026 服务文档](https://github.com/ggml-org/llama.cpp/blob/b11026/tools/server/README.md) 对应版本为准。没有整体替换为这些项目的运行时。
+
+## Remember execution settings
+
+The workbench automatically saves execution preferences in the current browser under
+`trace2task.workbench.config.v1`. Reload restores execution mode, director/executor
+models, reasoning effort, inference backend, limits, scope, device configuration,
+and selected OSWorld/AndroidWorld task. Server initialization supplies defaults only
+for fields without saved preferences. Clearing browser site data removes these
+preferences. API keys and transient desktop window handles are excluded; restoring
+preferences never starts a task. Unavailable storage or malformed saved JSON falls
+back to defaults. Build and live Firefox selection/reload checks passed on2026-11-09;
+no task was launched by the check.
+
+## Optional benchmark targets and native models
+
+See [benchmark/model integrations](benchmark-model-integrations.md) for OSWorld,
+AndroidWorld, GUI-Swift-4B and MAI-Swift-2B prerequisites. Unconfigured integrations
+remain unavailable; weights, guest images and deployment secrets are not bundled.

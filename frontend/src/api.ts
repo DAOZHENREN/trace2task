@@ -22,9 +22,11 @@ export function requestFor(config: Config, instruction: string, knowledge?: Know
       ...(executor.provider === 'api' ? {api: {base_url: executor.apiUrl, api_key: executor.apiKey,
         response_format: executor.apiFormat || 'json_schema', timeout_seconds: 120, context_window_tokens: 32768}} : {})};
   const localGUI = config.provider === 'local';
-  return {instruction, mode: 'execute', execution_scope: config.scope === 'android' ? 'android' : config.scope === 'browser' ? 'browser' : 'desktop', orchestration: 'legacy', continuous: true,
+  return {instruction, mode: 'execute', execution_scope: config.scope === 'androidworld' ? 'androidworld' : config.scope === 'osworld' ? 'osworld' : config.scope === 'android' ? 'android' : config.scope === 'browser' ? 'browser' : 'desktop', orchestration: 'legacy', continuous: true,
     ...(config.executor === 'android' ? {android_config: config.android, android_budget: config.androidBudget || DEFAULT_ANDROID_BUDGET, mobileforge: config.mobileforge || '',
       android_model_profile: config.androidModelProfile || ''} : {}),
+    ...(config.scope === 'osworld' ? {osworld_config: config.osworld} : {}),
+    ...(config.scope === 'androidworld' ? {androidworld_config: config.androidworld} : {}),
     execution_mode: hybrid ? 'hybrid' : 'original',
     ...(knowledge ? {knowledge_selection: {id: knowledge.id, sha256: knowledge.sha256}} : {}),
     ...(hybrid ? {hybrid: {...executorSelection, controller_config: config.hybridLimits || DEFAULT_HYBRID_LIMITS}} : {}),

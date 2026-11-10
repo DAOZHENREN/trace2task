@@ -8,11 +8,15 @@ import base64
 import hashlib
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from trace2task.model_text import model_json
 from trace2task.trace_projection import jsonl, project_actions
+
+# The resident GPU reader uses Python 3.10; timezone.utc is the same UTC singleton.
+UTC = timezone.utc
+
 
 MAX_MODEL_IMAGES = 8
 SELECTION_RULE = "按原示范时间顺序，在可用截图中等距选择最多 8 张，包含首尾；不足 8 张全部选取。缺图不补造。"

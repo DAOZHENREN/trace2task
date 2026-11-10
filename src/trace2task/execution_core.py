@@ -217,6 +217,19 @@ class ExecutionCore:
                                 executed=None, background_refusal=background_refusal,
                                 delivery_mode_requested='foreground', error=str(retry_error))
                     raise
+            except ActionUnavailable as error:
+                # Explicit no-input rejection from the backend, not an unknown
+                # transport failure. Abandon the remaining batch and reobserve.
+                request['status'] = 'rejected'
+                self.rejections += 1
+                self.feedback = {'status': 'rejected', 'executed': False,
+                                 'reason': str(error), 'action': payload,
+                                 'instruction': 'This action was blocked without input delivery. Replan from a fresh screenshot.'}
+                self.record('execution_result', observation_id=observation_id,
+                            batch_action_index=index, **self.feedback)
+                status = 'capability_rejection_limit' if self.rejections >= 3 else 'rejected'
+                return ExecutionResult(status, target, payload, reason=str(error),
+                                       steps=tuple(self.last_steps))
             except PostActionReobserve as error:
                 request['status'] = 'unknown'
                 self.feedback = {'status': 'reobserve', 'executed': None,

@@ -1,9 +1,11 @@
-import {memo, useEffect, useState} from 'react';
+import {memo, useEffect, useRef, useState} from 'react';
 import {Button, Spinner} from '@fluentui/react-components';
 import {api} from './api';
 import {active, labels} from './types';
 import type {AppState, Round, Run, RunEvent} from './types';
 import {Empty, Icon} from './ui';
+import {actionMarkers} from './actionMarkers';
+import type {ActionMarker} from './actionMarkers';
 import {ModelInput} from './ModelInput';
 import type {RawRound} from './modelInputData';
 import {ProcedureImprovement} from './ProcedureImprovement';
@@ -43,34 +45,45 @@ function useRun(id: string | null) {
   return {run, rounds: Object.values(rounds).sort((a, b) => a.step_index - b.step_index), logs, error, archivedStartup};
 }
 
-function RoundObservation({path, step, label = '观察画面'}: {path: string; step?: number; label?: string}) {
+function RoundObservation({path, step, label = '观察画面', markers = []}: {path: string; step?: number; label?: string; markers?: ActionMarker[]}) {
   const [failed, setFailed] = useState(false);
   const url = `/api/local-image?path=${encodeURIComponent(path)}`;
   return <figure className="round-observation">
     <figcaption><strong>{step !== undefined && `第 ${step + 1} 轮 · `}{label}</strong><a href={url} target="_blank" rel="noreferrer">打开原图</a></figcaption>
     {failed ? <p className="quiet" role="status">画面加载失败，原运行记录仍保留；可尝试打开原图。</p>
-      : <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={step === undefined ? label : `第 ${step + 1} 轮归档观察截图`} loading="lazy"
-        onError={() => setFailed(true)}/></a>}
+      : <a className="round-marked-image" href={url} target="_blank" rel="noreferrer"><img src={url} alt={step === undefined ? label : `第 ${step + 1} 轮归档观察截图`} loading="lazy"
+        onError={() => setFailed(true)}/>{markers.map((marker, index) => <span key={index} className="round-action-marker"
+          style={{left: `${marker.x * 100}%`, top: `${marker.y * 100}%`}} title={marker.label} aria-label={marker.label}/>)}</a>}
+    {!!markers.length && <figcaption>模型提出的动作位置（不代表已执行）：{markers.map((m, i) => `${i + 1}: ${m.label} (${m.x}, ${m.y})`).join('；')}</figcaption>}
   </figure>;
 }
 
-const RoundCard = memo(function RoundCard({round, provider}: {round: Round; provider?: string}) {
-  const [open, setOpen] = useState(false);
+const RoundCard = memo(function RoundCard({round, provider, goalChanged = true}: {round: Round; provider?: string; goalChanged?: boolean}) {
+  const [open, setOpen] = useState(true);
+  const card = useRef<HTMLElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {setVisible(true); observer.disconnect();}
+    }, {rootMargin: '600px'});
+    if (card.current) observer.observe(card.current);
+    return () => observer.disconnect();
+  }, []);
   const [imageOpen, setImageOpen] = useState(true);
   const [raw, setRaw] = useState<RawRound | null>(null);
   const [error, setError] = useState('');
   useEffect(() => {
-    if (!open) return;
+    if (!visible) return;
     const abort = new AbortController();
     setError('');
     api<RawRound>(round.artifact_ref, undefined, abort.signal).then(setRaw).catch(e => {if (!abort.signal.aborted) setError(String(e));});
     return () => abort.abort();
-  }, [open, round]);
+  }, [visible, round.artifact_ref, round.status, round.execution_status]);
   const status = round.status === 'pending' ? round.purpose === 'memory' ? 'Agent 选择经验中' : round.purpose === 'compile' ? 'Agent 编译中' : '观察与规划中'
     : round.status === 'memory_requested' ? '经验工具请求已返回 · 未发送操作输入'
     : round.status === 'handoff' ? '模型交接 · 重新截图后继续'
     : round.status === 'compiled' ? 'Procedure 已返回 · 未执行任务' : round.status === 'predicted' ? '已生成动作' : round.status;
-  return <article className="round-card">
+  return <article className="round-card" ref={card}>
     <div className="round-number">{String(round.step_index + 1).padStart(2, '0')}</div>
     <div className="round-content"><div className="row-between"><h3>{round.purpose === 'memory' ? 'Agent 经验检索 / 按需加载' : round.purpose === 'improve' ? '固定改进器：执行反馈 → 候选方法' : round.purpose === 'compile' ? 'Agent 编译：历史证据 → Procedure' : ['review', 'verification', 'verify_completion'].includes(round.purpose || '') ? '完成复核' : '观察 → 规划 → 执行'}</h3>
       <span className="quiet mono">{round.duration_ms != null ? `${(round.duration_ms / 1000).toFixed(1)} s` : '等待回包'}</span></div>
@@ -79,29 +92,30 @@ const RoundCard = memo(function RoundCard({round, provider}: {round: Round; prov
           : round.executed !== undefined && <span className="receipt">{round.executed ? '操作输入已交付 · 效果待核对' : '未发送操作输入'}</span>}
         {round.execution_status && <span className="quiet">{round.execution_status}</span>}</div>
       {round.error && <p className="inline-warning">{round.error}</p>}
-      {round.model_role && <p className="quiet">{round.model_role === 'director' ? '指导模型 · 指导与验收' : `${round.actual_model || '执行模型'} · 子任务执行`}</p>}
-      {round.subtask && <><p><strong>{round.subtask.goal || round.subtask.objective}</strong><br/>完成条件：{round.subtask.completion_hint || round.subtask.completion}</p>
-        {!!(round.subtask.notices ?? round.subtask.constraints)?.length && <ul aria-label="执行提示与限制">
-          {(round.subtask.notices ?? round.subtask.constraints)?.map((notice, index) => <li key={index}>{notice}</li>)}
+      {round.model_role && <p className="quiet">{round.model_role === 'director' ? '指导模型 · 指导与验收' : `${round.actual_model || '执行模型'} · 目标执行`}</p>}
+      {round.subtask && <details open={goalChanged}><summary>{goalChanged ? '当前目标（子任务记录）' : '沿用当前目标（子任务记录）'}</summary><p><strong>{round.subtask.goal || round.subtask.objective}</strong></p><details><summary>完成条件与提示</summary><p>完成条件：{round.subtask.completion_hint || round.subtask.completion}</p>
+        {!!(round.subtask.guidance ?? round.subtask.notices ?? round.subtask.constraints)?.length && <ul aria-label="子任务操作指导">
+          {(round.subtask.guidance ?? round.subtask.notices ?? round.subtask.constraints)?.map((notice, index) => <li key={index}>{notice}</li>)}
         </ul>}
         {!!(round.subtask.fail_conditions ?? round.subtask.handoff_conditions)?.length && <div>
           <strong>需要指导的失败条件</strong>
           <ul>{(round.subtask.fail_conditions ?? round.subtask.handoff_conditions)?.map((condition, index) =>
             <li key={index}>{condition}</li>)}</ul>
-        </div>}</>}
+        </div>}</details></details>}
       {round.execution_status === 'intervened' && <p className="inline-warning">人工干预使本轮剩余计划或核验结论作废；已交付动作以回执为准。</p>}
       {round.verification && <p className="verification"><strong>模型视觉复核：{round.verification.verdict}</strong> · {round.verification.evidence} {round.verification.missing}</p>}
       <div className="round-actions">{round.screenshot && <Button size="small" appearance="subtle" icon={<Icon name="screen" size={16}/>}
         aria-expanded={imageOpen} onClick={() => setImageOpen(value => !value)}>{imageOpen ? '收起该轮画面' : '查看该轮画面'}</Button>}
         {round.tokens?.input_tokens != null && <span className="quiet mono">IN {round.tokens.input_tokens.toLocaleString()} · OUT {round.tokens.output_tokens ?? '—'}</span>}</div>
-      {imageOpen && round.screenshot && <RoundObservation key={round.screenshot} path={round.screenshot} step={round.step_index}/>}
+      {imageOpen && round.screenshot && <RoundObservation key={round.screenshot} path={round.screenshot} step={round.step_index} markers={actionMarkers(raw)}/>}
       {imageOpen && round.after_screenshot && <RoundObservation key={round.after_screenshot} path={round.after_screenshot} step={round.step_index} label="动作后画面"/>}
-      <details open={open} onToggle={e => setOpen(e.currentTarget.open)}><summary>模型输入、输出与执行回执</summary>
+      <details open><summary>本轮模型输入</summary>{raw ? <ModelInput raw={raw} provider={provider}/> : <p>{error || '正在读取本轮真实输入…'}</p>}</details>
+      <details open={open} onToggle={e => setOpen(e.currentTarget.open)}><summary>模型输出</summary>
         {error ? <p role="alert">{error}</p> : !raw ? <Spinner size="tiny" label="读取该轮记录"/> : <div className="raw-round">
-          <ModelInput raw={raw} provider={provider}/>
-          <h4>模型输出</h4>
+
           {Array.isArray(raw.button_order) && <p className="quiet">按键列顺序 · {raw.button_order.join('、')}</p>}
           <pre>{raw.raw_output || JSON.stringify(raw.prediction || raw.verification || raw.error || '等待模型返回', null, 2)}</pre>
+
           <details className="execution-receipt"><summary>执行回执</summary>
             <pre>{JSON.stringify(raw.execution || '尚无执行回执；模型输出不代表已执行', null, 2)}</pre></details>
           <details><summary>原始请求 / 完整记录（可能含敏感内容）</summary><pre>{JSON.stringify(raw, null, 2)}</pre></details>
@@ -131,6 +145,7 @@ export function RunInspector({id, onLibrary, state, busy = false, onRun, onError
       {error && <p className="error-inline" role="alert">{error} · 正在重试，不会重复启动任务。</p>}
       {run?.error && <p className="error-inline" role="alert">{run.error}</p>}
       {active(run) && /限流|冷却|^\[capture |^正在读取手机截图|^截图读取超过|^截图已恢复|^请切换到游戏窗口|^NitroGen 实时模式|^游戏已失去焦点|^已切回游戏|^以撒手柄绑定/.test(latestStatus) && <p className="notice" role="status">{latestStatus}</p>}
+      {run?.result?.environment_evaluation && <p className="notice">环境评分：{run.result.environment_evaluation.valid ? String(run.result.environment_evaluation.raw_score) : '无有效评分'} · {run.result.environment_evaluation.valid ? '原任务评分器结果；独立于模型完成声明' : run.result.environment_evaluation.invalid_reason}</p>}
       {run?.result?.stop_reason && <p className="notice">停止原因：{run.result.stop_reason === 'action_limit' ? '动作预算耗尽，任务未完成' : run.result.stop_reason === 'time_limit' ? '时间预算耗尽，任务未完成' : run.result.stop_reason === 'focus_timeout' ? '游戏未恢复前台焦点' : run.result.stop_reason === 'controller_setup_timeout' ? '手柄绑定未完成' : run.result.stop_reason}</p>}
       {performance && <p className="quiet" aria-label="阶段耗时">累计耗时：{[
         ['capture_ms', '截图'], ['model_roundtrip_ms', '模型往返'], ['action_ms', '动作'], ['total_elapsed_ms', '总计'],
@@ -152,7 +167,7 @@ export function RunInspector({id, onLibrary, state, busy = false, onRun, onError
         {picture && !rounds.length && <RoundObservation key={picture} path={picture} label="后台桌面首张截图"/>}
         {picture && !!rounds.length && <details><summary>查看后台桌面首张截图</summary><RoundObservation key={picture} path={picture} label="后台桌面首张截图"/></details>}
       </section>}
-      {rounds.length ? rounds.map(r => <RoundCard key={`${id}:${r.step_index}`} round={r} provider={run?.provider}/>)
+      {rounds.length ? rounds.map((r, index) => <RoundCard key={`${id}:${r.step_index}`} round={r} provider={run?.provider} goalChanged={index === 0 || JSON.stringify(r.subtask) !== JSON.stringify(rounds[index - 1].subtask)}/>)
         : child ? <p className="quiet" role="status">{active(run) ? '正在等待第一轮模型输入。' : '本次运行在第一轮模型输入前结束，未产生模型动作回执。'}</p>
         : <Empty title={active(run) ? '正在准备运行记录' : '此运行没有逐轮模型记录'} text={active(run) ? '过程会在这里更新，你可以随时停止后续动作。' : '可展开运行日志；录制、编译和修订结果也可在经验库查看。'}/>}
       <details className="log-disclosure"><summary>运行日志 · {logs.length} 条</summary><div className="log-scroll" tabIndex={0}>

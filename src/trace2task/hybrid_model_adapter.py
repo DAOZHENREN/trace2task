@@ -24,7 +24,7 @@ from trace2task.hybrid_v7_profile import (
 class HybridModelAdapter:
     def __init__(self, reviewer, *, local_model, inference_backend, root, stop,
                  record, status_callback, prompt_profile=None, predictor=None, chat_executor=None,
-                 controller_config=None, application_knowledge=None):
+                 controller_config=None, application_knowledge=None, android_world=False):
         from trace2task.local_gui_client import predict_gui
 
         self.reviewer, self.session = reviewer, reviewer.session
@@ -56,6 +56,10 @@ class HybridModelAdapter:
         self.teacher_actions = []
         self.director_schema = director_schema(selected_windows=reviewer.selected_windows,
                                                android=reviewer.android)
+        if android_world:
+            from trace2task.android_world_benchmark import schema as benchmark_schema
+            self.director_schema['properties']['actions'] = benchmark_schema()
+            self.director_schema['properties']['actions']['maxItems'] = 12
 
     def _handoff(self, handback_reason, **output):
         reason = handback_reason
@@ -146,7 +150,7 @@ class HybridModelAdapter:
             if self.chat_executor is not None and pair['model_role'] != 'director':
                 continue
             item = {'raw_output': pair['raw_output']}
-            if (pair['model_role'] == 'executor' and self.inference_backend != 'slotread'
+            if ((pair['model_role'] == 'executor' or self.inference_backend == 'gui-swift-native131') and self.inference_backend != 'slotread'
                     and index >= len(pairs) - 2):
                 image = Path(pair['image_path']).read_bytes()
                 if hashlib.sha256(image).hexdigest() != pair['image_sha256']:

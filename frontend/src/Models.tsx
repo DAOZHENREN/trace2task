@@ -59,11 +59,12 @@ export function Models({catalog, config: c, setConfig, busy, refresh, onError, o
       <p>{profile?.note || '独立服务保持现有协议与生命周期。'}</p></div>
       <div className="engine-form"><Field label="推理引擎"><Choice aria-label="推理引擎" disabled={busy || !!pending || !profile} value={c.inference}
         onChange={e => update('inference', e.target.value)}>{(profile?.engines || [c.inference]).map(b => <option key={b}>{b}</option>)}</Choice></Field>
-        <div className="button-row"><Button appearance="primary" disabled={busy || !!pending || availability?.files_present === false} onClick={() => void service('start')}>启动所选服务</Button>
-          <Button disabled={busy || !!pending} onClick={() => void service('stop')}>关闭 GUI 服务</Button></div>
+        <div className="button-row"><Button appearance="primary" disabled={busy || !!pending || catalog.externally_managed || availability?.files_present === false} onClick={() => void service('start')}>启动所选服务</Button>
+          <Button disabled={busy || !!pending || catalog.externally_managed} onClick={() => void service('stop')}>关闭 GUI 服务</Button></div>
       </div>
-      {gui && (gui.model !== c.localModel || gui.backend !== c.inference) && <p className="inline-warning">
+      {gui && !catalog.services?.[c.localModel]?.reachable && (gui.model !== c.localModel || gui.backend !== c.inference) && <p className="inline-warning">
         当前后台为 {modelLabel(gui.model, catalog)} / {gui.backend}，与所选配置不同。选择卡片不会切换模型；启动所选服务会替换当前 GUI 服务。</p>}
+      {catalog.externally_managed && <p className="notice">服务器模型由独立容器保持运行；在上方选择已配置的 MAI-Swift · 2B 或 GUI-Swift · 4B 即可调用。服务启停由服务器管理。</p>}
       <p className="quiet">关闭 GUI 服务会关闭它实际加载的模型，而不是只关闭所选卡片。</p>
       {availability && !availability.files_present && <div className="missing-files"><strong>先准备这些文件</strong>{availability.missing.map(p => <code key={p}>{p}</code>)}
         <p>{c.inference === 'slotread' ? 'GUI-Decisions 需要独立官方部署。默认目录 D:/Models/GUI-Decisions-2B，可通过 TRACE2TASK_GUI_DECISIONS_ROOT 修改。' : 'GGUF 使用注册表中的固定版本：2B 需本机转换，8B 使用官方量化文件；不会覆盖已有 GGUF。组件页可安装环境和下载模型。'}</p><Button size="small" onClick={onComponents}>管理组件与模型文件</Button></div>}

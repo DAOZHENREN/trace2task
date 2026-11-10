@@ -1,4 +1,5 @@
 """Local-only resident model client, with no environment/system proxy usage."""
+
 import base64
 import json
 import os
@@ -16,16 +17,35 @@ from trace2task.local_gui_protocol import MODELS, validate_prompt_profile
 from trace2task.local_process import stop_started_process
 
 _lock = threading.Lock()
+_request_routes = {}
+
+
+def service_route(model=None):
+    root = _data_root() / "runs/local-gui"
+    if model == "gui-swift-4b":
+        return "http://127.0.0.1:8769", root / "swift"
+    return "http://127.0.0.1:8768", root
+
 
 # This is deliberately a compact, derived representation of a confirmed task
 # pack, not a way to upload arbitrary task-pack files to the resident model.
 # Keep this contract independent from Cua's target/capability context.
 EXPERIENCE_CONTEXT_KEYS = frozenset(
-    {"task_id", "goal", "completion", "state_index", "candidate_state",
-     "candidate_is_unverified", "nearby_states", "outgoing_transitions",
-     "candidate_terminals", "human_guidance"}
+    {
+        "task_id",
+        "goal",
+        "completion",
+        "state_index",
+        "candidate_state",
+        "candidate_is_unverified",
+        "nearby_states",
+        "outgoing_transitions",
+        "candidate_terminals",
+        "human_guidance",
+    }
 )
 EXPERIENCE_CONTEXT_MAX_CHARS = 12_000
+
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -44,16 +64,24 @@ def validate_experience_context(value):
     if isinstance(value, dict) and value.get("kind") == "trace_sequence":
         import hashlib
 
-        if (set(value) not in ({"kind", "task_id", "model_input", "sha256"},
-                               {"kind", "task_id", "model_input", "sha256", "images"})
-                or not isinstance(value.get("task_id"), str) or not value["task_id"].strip()
-                or not isinstance(value.get("model_input"), str) or not value["model_input"].strip()
-                or value.get("sha256") != hashlib.sha256(value["model_input"].encode("utf-8")).hexdigest()):
+        if (
+            set(value)
+            not in (
+                {"kind", "task_id", "model_input", "sha256"},
+                {"kind", "task_id", "model_input", "sha256", "images"},
+            )
+            or not isinstance(value.get("task_id"), str)
+            or not value["task_id"].strip()
+            or not isinstance(value.get("model_input"), str)
+            or not value["model_input"].strip()
+            or value.get("sha256")
+            != hashlib.sha256(value["model_input"].encode("utf-8")).hexdigest()
+        ):
             raise ValueError("原始证据或精简序列上下文无效")
-        if 'images' in value:
+        if "images" in value:
             from trace2task.trace_evidence import image_bytes
 
-            image_bytes(value['images'])
+            image_bytes(value["images"])
         # Full text is intentional. The server rejects token overflow, never truncates.
         return dict(value)
     if not isinstance(value, dict) or set(value) != EXPERIENCE_CONTEXT_KEYS:
@@ -81,29 +109,32 @@ def validate_experience_context(value):
         raise ValueError("经验上下文 human_guidance 无效")
     normalized = {**value, "task_id": task_id.strip(), "goal": goal.strip()}
     try:
-        encoded = json.dumps(
-            normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-        )
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, RecursionError) as error:
         raise ValueError("经验上下文必须是有限 JSON 数据") from error
     if len(encoded) > EXPERIENCE_CONTEXT_MAX_CHARS:
-        raise ValueError(
-            f"经验上下文超过 {EXPERIENCE_CONTEXT_MAX_CHARS} 字符预算"
-        )
+        raise ValueError(f"经验上下文超过 {EXPERIENCE_CONTEXT_MAX_CHARS} 字符预算")
     return normalized
 
+
 def _data_root():
-    root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[2]))
-    return Path(os.environ.get('TRACE2TASK_DATA_ROOT', str(root)))
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    return Path(os.environ.get("TRACE2TASK_DATA_ROOT", str(root)))
 
 
 def cancel_gui(request_id):
     """Cancel only the named request; llama-server may unload its owned worker."""
-    token_file = _data_root() / 'runs/local-gui/service.token'
+    url, logs = _request_routes.get(request_id, service_route())
+    token_file = logs / "service.token"
     opener = build_opener(ProxyHandler({}), NoRedirect())
-    request = Request('http://127.0.0.1:8768/cancel',
-        data=json.dumps({'request_id': request_id}).encode(),
-        headers={'Content-Type': 'application/json', 'X-Local-Token': token_file.read_text().strip()})
+    request = Request(
+        url + "/cancel",
+        data=json.dumps({"request_id": request_id}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Local-Token": token_file.read_text().strip(),
+        },
+    )
     with opener.open(request, timeout=5) as response:
         return json.load(response)
 
@@ -112,100 +143,203 @@ def archive_prediction(folder, body, result, logs):
     """Keep wire payloads and service-side actual prompts together; never copy credentials."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder/'request.json').write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding='utf-8')
-    (folder/'response.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
-    if result.get('output_directory'):
-        source = Path(result['output_directory']).resolve()
+    (folder / "request.json").write_text(
+        json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (folder / "response.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    if result.get("output_directory"):
+        source = Path(result["output_directory"]).resolve()
         if not source.is_relative_to(Path(logs).resolve()):
-            raise ValueError('Model archive is outside the local service log directory')
-        names = ['input.json', 'formatted-prompt.txt', 'tokenized-input.json', 'raw-output.json',
-                     'prediction.json', 'outcome.json', 'metrics.json', 'error.log', 'screenshot.png',
-                     'context-management.json', 'prefix-cache.json', 'llama-response.json', 'annotated.png',
-                     'compaction.json', 'compaction-before.json', 'summary-request.json', 'summary-response.json']
-        names.extend(path.name for pattern in ('context-image-*.png', 'attempt-*-input.json')
-                     for path in source.glob(pattern))
+            raise ValueError("Model archive is outside the local service log directory")
+        names = [
+            "input.json",
+            "formatted-prompt.txt",
+            "tokenized-input.json",
+            "raw-output.json",
+            "prediction.json",
+            "outcome.json",
+            "metrics.json",
+            "error.log",
+            "screenshot.png",
+            "context-management.json",
+            "prefix-cache.json",
+            "llama-response.json",
+            "annotated.png",
+            "native-request.json",
+            "native-result.json",
+            "compaction.json",
+            "compaction-before.json",
+            "summary-request.json",
+            "summary-response.json",
+        ]
+        names.extend(
+            path.name
+            for pattern in ("context-image-*.png", "attempt-*-input.json")
+            for path in source.glob(pattern)
+        )
         for name in names:
-            path = source/name
+            path = source / name
             if path.is_file() and path.resolve().is_relative_to(source):
-                shutil.copy2(path, folder/name)
+                shutil.copy2(path, folder / name)
 
 
-def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_context=None,
-                execution_context=None,
-                request_id=None, audit_dir=None, previous_image=None, execution_feedback=None,
-                experience_context=None, prompt_profile=None, cursor_position=None,
-                conversation_id=None, conversation_start=False, expected_backend=None, guided_history=None,
-                guided_history_offset=None, guided_knowledge=None):
+def predict_gui(
+    task,
+    *,
+    model,
+    image=None,
+    history=None,
+    step_index=0,
+    cua_context=None,
+    execution_context=None,
+    request_id=None,
+    audit_dir=None,
+    previous_image=None,
+    execution_feedback=None,
+    experience_context=None,
+    prompt_profile=None,
+    cursor_position=None,
+    conversation_id=None,
+    conversation_start=False,
+    expected_backend=None,
+    guided_history=None,
+    guided_history_offset=None,
+    guided_knowledge=None,
+):
     if model not in MODELS:
-        raise ValueError('Unknown local model')
+        raise ValueError("Unknown local model")
     if previous_image is not None:
-        raise ValueError('每轮只能提交当前截图，不再接受操作前对照图')
+        raise ValueError("每轮只能提交当前截图，不再接受操作前对照图")
     if cua_context is not None and execution_context is not None:
-        raise ValueError('Use either execution_context or legacy cua_context, not both')
+        raise ValueError("Use either execution_context or legacy cua_context, not both")
     context = execution_context if execution_context is not None else cua_context
     with _lock:
-        root = Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parents[2]))
-        data = Path(os.environ.get('TRACE2TASK_DATA_ROOT',str(root)))
-        logs = data/'runs/local-gui'
-        logs.mkdir(parents=True,exist_ok=True)
-        token_file = logs/'service.token'
-        opener=build_opener(ProxyHandler({}), NoRedirect())
-        url='http://127.0.0.1:8768'
+        root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        data = Path(os.environ.get("TRACE2TASK_DATA_ROOT", str(root)))
+        url, logs = service_route(model)
+        if request_id:
+            _request_routes[request_id] = (url, logs)
+        logs.mkdir(parents=True, exist_ok=True)
+        token_file = logs / "service.token"
+        opener = build_opener(ProxyHandler({}), NoRedirect())
         started_process = None
         try:
-            with opener.open(url+'/health',timeout=2) as response:
-                health=json.load(response)
-        except (URLError,OSError):
+            with opener.open(url + "/health", timeout=2) as response:
+                health = json.load(response)
+        except (URLError, OSError):
+            if model == "gui-swift-4b":
+                raise RuntimeError(
+                    "GUI-Swift service on loopback 8769 is unavailable; start its configured Native131 service"
+                ) from None
             if not token_file.exists():
-                token_file.write_text(secrets.token_hex(32),encoding='ascii')
+                token_file.write_text(secrets.token_hex(32), encoding="ascii")
             from trace2task.components import gui_paths
+
             python, models = gui_paths(data)
             if not python.is_file():
-                raise RuntimeError('请在“本地组件管理”中安装 GPU 运行环境')
-            with (logs/'server.log').open('ab') as out:
-                started_process = subprocess.Popen([str(python),str(root/'scripts/local_gui/server.py'),
-                    '--output',str(logs),'--token-file',str(token_file),'--root',str(models)],stdout=out,stderr=out,
-                    creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),cwd=root)
-            deadline=time.monotonic()+30
+                raise RuntimeError("请在“本地组件管理”中安装 GPU 运行环境")
+            with (logs / "server.log").open("ab") as out:
+                started_process = subprocess.Popen(
+                    [
+                        str(python),
+                        str(root / "scripts/local_gui/server.py"),
+                        "--output",
+                        str(logs),
+                        "--token-file",
+                        str(token_file),
+                        "--root",
+                        str(models),
+                    ],
+                    stdout=out,
+                    stderr=out,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    cwd=root,
+                )
+            deadline = time.monotonic() + 30
             while True:
                 try:
-                    with opener.open(url+'/health',timeout=2) as response:
-                        health=json.load(response)
+                    with opener.open(url + "/health", timeout=2) as response:
+                        health = json.load(response)
                     break
-                except (URLError,OSError):
-                    if time.monotonic()>deadline:
+                except (URLError, OSError):
+                    if time.monotonic() > deadline:
                         stop_started_process(started_process)
-                        raise RuntimeError('Local model service did not start; see runs/local-gui/server.log')
+                        raise RuntimeError(
+                            "Local model service did not start; see runs/local-gui/server.log"
+                        )
                     if started_process.poll() is not None:
-                        raise RuntimeError('Local model service exited; see runs/local-gui/server.log')
-                    time.sleep(.2)
+                        raise RuntimeError(
+                            "Local model service exited; see runs/local-gui/server.log"
+                        )
+                    time.sleep(0.2)
         try:
-            if health.get('service')!='trace2task-local-gui' or health.get('protocol')!=1:
-                raise RuntimeError('Port 8768 belongs to another service; no screenshot sent')
-            if expected_backend is not None and (health.get('backend') != expected_backend
-                    or not health.get('capabilities', {}).get('expected_backend')):
-                raise RuntimeError('运行引擎与本次配置不符，或服务版本过旧；请重启所选服务。未发送截图。')
-            if guided_history is not None and not health.get('capabilities', {}).get('guided_history_v6'):
-                raise RuntimeError('本地模型服务尚未支持 v6 已执行历史，请重启本地模型服务；未发送截图。')
-            if guided_history_offset is not None and not health.get('capabilities', {}).get('guided_task_conversations'):
-                raise RuntimeError('请重启本地模型服务以启用混合模式连续会话；未发送截图。')
-            if guided_knowledge is not None and not health.get('capabilities', {}).get('guided_application_knowledge'):
-                raise RuntimeError('请重启本地模型服务以加载混合模式底层知识；未发送截图。')
-            if conversation_id and not health.get('capabilities', {}).get('task_conversations'):
-                raise RuntimeError('本地服务尚不支持连续会话，请关闭并重启本地模型服务')
-            if conversation_id and not health.get('capabilities', {}).get('image_only_history_eviction'):
-                raise RuntimeError('本地服务仍是旧版上下文策略，请关闭并重启模型服务；未发送截图')
-            if (isinstance(experience_context, dict) and 'images' in experience_context
-                    and not health.get('capabilities', {}).get('trace_evidence_images')):
-                raise RuntimeError('本地服务尚不支持原始证据 A 的图片附件，请关闭并重启模型服务；未发送截图或经验')
-            if request_id is not None and not health.get('capabilities', {}).get('cancel'):
-                raise RuntimeError('本地模型服务仍是旧版，请关闭并重新启动服务以启用取消生成和完整日志')
-            if prompt_profile is not None and not health.get('capabilities', {}).get('editable_prompts'):
-                raise RuntimeError('本地模型服务仍是旧版；请点击“关闭本地模型服务”后重新启动，避免忽略自定义提示词')
-            if model == 'gui-owl-2b' and not health.get('capabilities', {}).get('official_owl_adapter'):
-                raise RuntimeError('本地模型服务仍是旧版；请关闭并重新启动服务以使用官方动作适配器')
-            if model == 'gui-decisions-2b' and not health.get('capabilities', {}).get('official_slotread_adapter'):
-                raise RuntimeError('本地模型服务尚未支持官方 SlotRead，请关闭并重新启动服务；未发送截图')
+            if health.get("service") != "trace2task-local-gui" or health.get("protocol") != 1:
+                raise RuntimeError("Port 8768 belongs to another service; no screenshot sent")
+            if expected_backend is not None and (
+                health.get("backend") != expected_backend
+                or not health.get("capabilities", {}).get("expected_backend")
+            ):
+                raise RuntimeError(
+                    "运行引擎与本次配置不符，或服务版本过旧；请重启所选服务。未发送截图。"
+                )
+            if guided_history is not None and not health.get("capabilities", {}).get(
+                "guided_history_v6"
+            ):
+                raise RuntimeError(
+                    "本地模型服务尚未支持 v6 已执行历史，请重启本地模型服务；未发送截图。"
+                )
+            if guided_history_offset is not None and not health.get("capabilities", {}).get(
+                "guided_task_conversations"
+            ):
+                raise RuntimeError("请重启本地模型服务以启用混合模式连续会话；未发送截图。")
+            if guided_knowledge is not None and not health.get("capabilities", {}).get(
+                "guided_application_knowledge"
+            ):
+                raise RuntimeError("请重启本地模型服务以加载混合模式底层知识；未发送截图。")
+            if conversation_id and not health.get("capabilities", {}).get("task_conversations"):
+                raise RuntimeError("本地服务尚不支持连续会话，请关闭并重启本地模型服务")
+            if conversation_id and not health.get("capabilities", {}).get(
+                "image_only_history_eviction"
+            ):
+                raise RuntimeError("本地服务仍是旧版上下文策略，请关闭并重启模型服务；未发送截图")
+            if (
+                isinstance(experience_context, dict)
+                and "images" in experience_context
+                and not health.get("capabilities", {}).get("trace_evidence_images")
+            ):
+                raise RuntimeError(
+                    "本地服务尚不支持原始证据 A 的图片附件，请关闭并重启模型服务；未发送截图或经验"
+                )
+            if request_id is not None and not health.get("capabilities", {}).get("cancel"):
+                raise RuntimeError(
+                    "本地模型服务仍是旧版，请关闭并重新启动服务以启用取消生成和完整日志"
+                )
+            if prompt_profile is not None and not health.get("capabilities", {}).get(
+                "editable_prompts"
+            ):
+                raise RuntimeError(
+                    "本地模型服务仍是旧版；请点击“关闭本地模型服务”后重新启动，避免忽略自定义提示词"
+                )
+            if model == "gui-swift-4b" and not health.get("capabilities", {}).get(
+                "gui_swift_native131"
+            ):
+                raise RuntimeError("Local service lacks GUI-Swift Native131; no screenshot sent")
+            if model == "mai-swift-2b" and not health.get("capabilities", {}).get(
+                "mai_swift_native105"
+            ):
+                raise RuntimeError("本地服务不支持 MAI-Swift Native105；未发送截图")
+            if model == "gui-owl-2b" and not health.get("capabilities", {}).get(
+                "official_owl_adapter"
+            ):
+                raise RuntimeError("本地模型服务仍是旧版；请关闭并重新启动服务以使用官方动作适配器")
+            if model == "gui-decisions-2b" and not health.get("capabilities", {}).get(
+                "official_slotread_adapter"
+            ):
+                raise RuntimeError(
+                    "本地模型服务尚未支持官方 SlotRead，请关闭并重新启动服务；未发送截图"
+                )
         except Exception:
             stop_started_process(started_process)
             raise
@@ -217,59 +351,87 @@ def predict_gui(task, *, model, image=None, history=None, step_index=0, cua_cont
             from trace2task.desktop_runner import DesktopSession
             from trace2task.windows_capture import GdiWindowCapture
             from trace2task.windows_control import Win32Backend, physical_dpi_context
-            capture=GdiWindowCapture(desktop=True)
+
+            capture = GdiWindowCapture(desktop=True)
             with physical_dpi_context(capture.user32):
-                size=lambda:(capture.user32.GetSystemMetrics(0),capture.user32.GetSystemMetrics(1))
-                frame=capture.capture(DesktopSession(Win32Backend(),size).observe())
-            buffer=io.BytesIO()
-            pygame.image.save(frame,buffer,'screenshot.png')
-            image=base64.b64encode(buffer.getvalue()).decode()
-        context_key = ('execution_context' if health.get('capabilities', {}).get('generic_execution_context')
-                       else 'cua_context')
-        body = {'model':model,'task':task,'image':image, 'history':history or [],
-                'step_index':step_index,context_key:context,
-                'execution_feedback':execution_feedback,
-                'request_id':request_id or secrets.token_hex(16)}
+                def size():
+                    return (
+                                    capture.user32.GetSystemMetrics(0),
+                                    capture.user32.GetSystemMetrics(1),
+                                )
+                frame = capture.capture(DesktopSession(Win32Backend(), size).observe())
+            buffer = io.BytesIO()
+            pygame.image.save(frame, buffer, "screenshot.png")
+            image = base64.b64encode(buffer.getvalue()).decode()
+        context_key = (
+            "execution_context"
+            if health.get("capabilities", {}).get("generic_execution_context")
+            else "cua_context"
+        )
+        body = {
+            "model": model,
+            "task": task,
+            "image": image,
+            "history": history or [],
+            "step_index": step_index,
+            context_key: context,
+            "execution_feedback": execution_feedback,
+            "request_id": request_id or secrets.token_hex(16),
+        }
         if expected_backend is not None:
-            body['expected_backend'] = expected_backend
+            body["expected_backend"] = expected_backend
         if guided_history is not None:
-            if bool(conversation_id) != (guided_history_offset is not None) or experience_context is not None:
-                raise ValueError('Guided history requires its own subgoal context')
-            body['guided_history'] = guided_history
+            if (
+                bool(conversation_id) != (guided_history_offset is not None)
+                or experience_context is not None
+            ):
+                raise ValueError("Guided history requires its own subgoal context")
+            body["guided_history"] = guided_history
         if guided_history_offset is not None:
-            body['guided_history_offset'] = guided_history_offset
+            body["guided_history_offset"] = guided_history_offset
         if guided_knowledge is not None:
-            body['guided_knowledge'] = guided_knowledge
+            body["guided_knowledge"] = guided_knowledge
         if cursor_position is not None:
-            body['cursor_position'] = cursor_position
+            body["cursor_position"] = cursor_position
         if conversation_id:
             body.update(conversation_id=conversation_id, conversation_start=conversation_start)
         experience_context = validate_experience_context(experience_context)
         if experience_context is not None:
-            body['experience_context'] = experience_context
+            body["experience_context"] = experience_context
         if prompt_profile is not None:
-            body['prompt_profile'] = validate_prompt_profile(prompt_profile)
+            body["prompt_profile"] = validate_prompt_profile(prompt_profile)
+        if len(_request_routes) > 1024:
+            _request_routes.pop(next(iter(_request_routes)))
+        _request_routes[body["request_id"]] = (url, logs)
         if audit_dir:
-            archive_prediction(audit_dir, body, {'status':'pending', 'request_id':body['request_id']}, logs)
-        request=Request(url+'/predict',data=json.dumps(body,ensure_ascii=False).encode(),
-            headers={'Content-Type':'application/json','X-Local-Token':token_file.read_text().strip()})
+            archive_prediction(
+                audit_dir, body, {"status": "pending", "request_id": body["request_id"]}, logs
+            )
+        request = Request(
+            url + "/predict",
+            data=json.dumps(body, ensure_ascii=False).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Local-Token": token_file.read_text().strip(),
+            },
+        )
         try:
-            with opener.open(request,timeout=300) as response:
+            with opener.open(request, timeout=300) as response:
                 result = json.load(response)
         except HTTPError as error:
             try:
                 result = json.loads(error.read())
             except (ValueError, UnicodeDecodeError):
-                result = {'error': f'Local model HTTP {error.code}'}
-            result.update(status='error',request_id=body['request_id'])
+                result = {"error": f"Local model HTTP {error.code}"}
+            result.update(status="error", request_id=body["request_id"])
         except (URLError, OSError) as error:
-            result = {'status':'error', 'request_id':body['request_id'], 'error':str(error)}
+            result = {"status": "error", "request_id": body["request_id"], "error": str(error)}
             # A timed-out HTTP client must not leave untracked GPU work running.
             try:
-                result['cancel_receipt'] = cancel_gui(body['request_id'])
+                result["cancel_receipt"] = cancel_gui(body["request_id"])
             except Exception as cancel_error:  # noqa: BLE001 - cancellation receipt is diagnostic only
-                result['cancel_error'] = str(cancel_error)
+                result["cancel_error"] = str(cancel_error)
         if audit_dir:
             archive_prediction(audit_dir, body, result, logs)
-            result['audit_directory'] = str(audit_dir)
+            result["audit_directory"] = str(audit_dir)
         return result
