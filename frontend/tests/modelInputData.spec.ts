@@ -85,3 +85,15 @@ test('old archived placeholders are not claimed as full original text', () => {
   const view = modelInput({input: {messages: [{role: 'user', content: '[image or oversized payload archived in events.jsonl]'}]}});
   expect(view.notices.join('')).toContain('占位符');
 });
+
+test('local executor uses native input and never inherits the director provider', () => {
+  const view = modelInput({model_role:'executor',provider:'local',output_directory:'/run/local',
+    input:{messages:[{role:'user',content:'Goal once'},{role:'assistant',content:'click'},
+      {role:'user',content:[{type:'text',text:'Receipt; continue current goal'},
+        {type:'image',image:'/run/local/current-observation.png'}]}],
+      new_messages:[{role:'user',content:'Repeated transport goal'}]}}, 'codex');
+  expect(view.copyText).toBe('Receipt; continue current goal');
+  expect(view.history).toHaveLength(2);
+  expect(view.notices.join('')).not.toContain('Codex');
+  expect(view.current[0].parts[1]).toMatchObject({kind:'image',path:'/run/local/current-observation.png'});
+});

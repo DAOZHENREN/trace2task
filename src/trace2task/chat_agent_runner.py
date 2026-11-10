@@ -26,17 +26,35 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                    android_config=None, android_driver=None, model_adapter=None,
                    memory_mode=None, memory_root=None, on_memory_selection=None, interventions=None,
                    hybrid=None, hybrid_executor_api_config=None, application_knowledge=None, child_desktop=None,
-                   on_desktop_progress=None):
+                   on_desktop_progress=None, osworld_config=None, androidworld_config=None):
     """Execute a primary-desktop or explicitly selected-window chat task.
 
     This is the shared-loop route. Legacy single-window taskpack semantics and
     LangGraph checkpoint recovery are not silently replaced by this function.
     """
-    if executor_backend not in {"win32", "cua", "browser", "android"}:
+    if executor_backend == 'androidworld':
+        from trace2task.androidworld_execution import selection
+        androidworld_config, task = selection(androidworld_config)
+        if instruction != task['instruction'] or cua_target is not None:
+            raise ValueError('AndroidWorld requires the original task and no host target')
+        if not hybrid or hybrid.get('provider', 'local') != 'local' or hybrid.get('local_model') != 'mai-swift-2b':
+            raise ValueError('AndroidWorld currently requires the MAI-Swift hybrid executor')
+        max_actions = androidworld_config['max_actions']
+    elif androidworld_config is not None:
+        raise ValueError('AndroidWorld config requires its execution backend')
+    if executor_backend == 'osworld':
+        from trace2task.osworld_execution import selection
+        osworld_config, task = selection(osworld_config)
+        if instruction != task['instruction'] or cua_target is not None:
+            raise ValueError('OSWorld requires the original task instruction and no host target')
+        max_actions = osworld_config['max_actions']
+    elif osworld_config is not None:
+        raise ValueError('OSWorld configuration requires its execution backend')
+    if executor_backend not in {"win32", "cua", "browser", "android", "osworld", "androidworld"}:
         raise ValueError("Unknown execution backend")
     if hybrid is not None:
         from trace2task.model_registry import profile_for
-        if model_adapter is not None or executor_backend not in {'cua', 'android'}:
+        if model_adapter is not None or executor_backend not in {'cua', 'android', 'osworld', 'androidworld'}:
             raise ValueError('混合模型需要 Cua / Android 执行后端')
         executor_provider = hybrid.get('provider', 'local')
         if executor_provider == 'local':
@@ -116,7 +134,7 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             from trace2task.codex_agent import resolve_codex_binary
             from trace2task.codex_app_server import CodexAppServerSession
             thread_config = {} if hybrid is not None else {"model_auto_compact_token_limit": 2_000_000_000}
-            if executor_backend in {'browser', 'android'} or memory_mode == 'auto' or hybrid is not None:
+            if executor_backend in {'browser', 'android', 'osworld', 'androidworld'} or memory_mode == 'auto' or hybrid is not None:
                 thread_config.update(web_search='disabled', project_doc_max_bytes=0,
                                      include_environment_context=False,
                                      skills={'include_instructions': False},
@@ -153,7 +171,7 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
                                provider=provider, prompt_guidance=prompt_guidance,
                                evidence_directory=root / 'experience-images',
                                browser=executor_backend == 'browser',
-                               android=executor_backend == 'android', application_knowledge=application_knowledge)
+                               android=executor_backend in {'android', 'androidworld'}, application_knowledge=application_knowledge)
     chat_executor = None
     if hybrid is not None:
         from trace2task.hybrid_model_adapter import HybridModelAdapter
@@ -163,15 +181,19 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             from trace2task.hybrid_chat_executor import HybridChatExecutor
             chat_executor = HybridChatExecutor(provider=executor_provider, model=hybrid['model'],
                 reasoning_effort=hybrid.get('reasoning_effort', 'low'), root=root / 'hybrid-executor',
-                stop=emergency_stop, android=executor_backend == 'android',
+                stop=emergency_stop, android=executor_backend in {'android', 'androidworld'},
                 selected_windows=executor_backend == 'cua' and not cua_desktop,
                 api_config=hybrid_executor_api_config)
+        androidworld_predictor = None
+        if executor_backend == 'androidworld':
+            from trace2task.androidworld_execution import predict as androidworld_predictor
         adapter = HybridModelAdapter(adapter, root=root, stop=emergency_stop,
             record=record, status_callback=status_callback,
             local_model=hybrid.get('local_model', hybrid.get('model')),
             inference_backend=hybrid.get('inference_backend', executor_provider),
             prompt_profile=hybrid.get('prompt_profile'), chat_executor=chat_executor,
-            controller_config=hybrid.get('controller_config'), application_knowledge=application_knowledge)
+            controller_config=hybrid.get('controller_config'), application_knowledge=application_knowledge,
+            android_world=executor_backend == 'androidworld', predictor=androidworld_predictor)
         result.update(execution_mode='hybrid', hybrid={
             **{k: v for k, v in hybrid.items() if k != 'prompt_profile'},
             'protocol': PROTOCOL, 'controller_config': adapter.controller_config,
@@ -186,7 +208,27 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
     driver = None
     emergency_stop.start()
     try:
-        if executor_backend == 'android':
+        if executor_backend == 'androidworld':
+            from trace2task.androidworld_execution import AndroidWorldDriver, AndroidWorldObservation, AndroidWorldExecutionBackend
+            driver = AndroidWorldDriver(root, record, emergency_stop, androidworld_config)
+            status_callback('AndroidWorld 正在准备模型并重置任务；仅操作专用模拟器。')
+            driver.start()
+            target = dict(driver.target)
+            observation = AndroidWorldObservation(driver)
+            execution_backend = AndroidWorldExecutionBackend(driver)
+            result['androidworld_task'] = driver.task
+            status_callback('AndroidWorld 已就绪，开始主线混合模型执行。')
+        elif executor_backend == 'osworld':
+            from trace2task.osworld_execution import OSWorldDriver, OSWorldObservation, OSWorldExecutionBackend
+            driver = OSWorldDriver(root, record, emergency_stop, osworld_config)
+            status_callback('OSWorld 正在创建独立访客并重置所选任务；不操作宿主桌面。')
+            driver.start()
+            target = dict(driver.target)
+            observation = OSWorldObservation(driver)
+            execution_backend = OSWorldExecutionBackend(driver)
+            result['osworld_task'] = driver.task
+            status_callback('OSWorld 重置完成，开始主线模型执行。')
+        elif executor_backend == 'android':
             from trace2task.android_execution import (
                 AndroidDriver,
                 AndroidExecutionBackend,
@@ -311,12 +353,15 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             experience_context=experience,
             interventions=interventions,
         )
-        if executor_backend == 'android':
+        if executor_backend in {'android', 'osworld', 'androidworld'}:
             _, _, final_path, capture_ms = observe_with_timing(
                 observation, target, len(result['model_io']), audit=audit, record=record,
                 status_callback=status_callback, phase='final')
             result['final_screenshot'] = str(final_path)
             record('final_capture', screenshot=str(final_path), elapsed_ms=capture_ms)
+        if executor_backend in {'osworld', 'androidworld'}:
+            from trace2task.osworld_execution import finish_evaluation
+            finish_evaluation(driver, result)
     except TimeBudgetExceeded:
         result.update(stop_reason='time_limit', task_complete=False, verified=False)
         status_callback('时间预算耗尽，任务未完成；已停止后续输入，迟到的模型回答不会执行。')
@@ -345,6 +390,9 @@ def run_chat_agent(*, instruction, model, reasoning_effort, output_root,
             result['assisted_by_user'] = result['interventions']['assisted_by_user']
         if result['stop_reason'] == 'action_limit':
             status_callback(f'动作预算耗尽（{max_actions}），任务未完成；未自动续跑。')
+        if executor_backend in {'osworld', 'androidworld'} and 'environment_evaluation' not in result:
+            result['environment_evaluation'] = {'valid': False, 'raw_score': None,
+                'invalid_reason': 'Run interrupted or failed before scoring'}
         if driver is not None:
             try:
                 driver.close()

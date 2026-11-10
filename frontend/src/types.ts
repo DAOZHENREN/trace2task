@@ -9,7 +9,8 @@ export type LocalService = {id: string; label: string; endpoint: string; reachab
   model?: string | null; backend?: string; pid?: number; error?: string};
 export type ServiceSnapshot = {services: LocalService[]; checked_at: string};
 export type Catalog = {models: Profile[]; inference_backends: Engine[];
-  configured_backend?: string; summary_model_present: boolean;
+  externally_managed?: boolean; configured_backend?: string; summary_model_present: boolean;
+  services?: Record<string, {reachable: boolean; model?: string; backend?: string; error?: string}>;
   service: {reachable: boolean; model?: string; backend?: string; error?: string}};
 export type Facts = {run_id: string; model: string; profile: string; inference_backend: string;
   execution_backend: string; operation_scope: string; input_mode: string; data_flow: string;
@@ -38,14 +39,14 @@ export type Run = {job_id: string; task_id: string; instruction: string; status:
   run_facts?: Facts; observed_inference?: {backend: string; context_policy?: string};
   memory_mode?: string; memory_selection?: MemorySelection;
   interventions?: InterventionState;
-  result?: {stop_reason?: string; task_verification_status?: string; performance?: Record<string, number>;
+  result?: {environment_evaluation?: {valid: boolean; raw_score: number | null; binary_reward?: number | null; invalid_reason?: string | null}; stop_reason?: string; task_verification_status?: string; performance?: Record<string, number>;
     representation?: string; compiled_trace_id?: string; trace_name?: string; experience_draft_id?: string; source_run_id?: string;
     memory_selection?: MemorySelection; assisted_by_user?: boolean;
     trace_path?: string; output_directory?: string; narration?: {transcript?: string; segments?: unknown[]; engine?: string}}};
 export type Round = {step_index: number; status: string; purpose: string; duration_ms?: number;
   model_role?: 'director' | 'executor'; actual_model?: string;
   subtask?: {objective?: string; completion?: string; goal?: string; completion_hint?: string;
-    notices?: string[]; constraints?: string[]; fail_conditions?: string[]; handoff_conditions?: string[]};
+    guidance?: string[]; notices?: string[]; constraints?: string[]; fail_conditions?: string[]; handoff_conditions?: string[]} | null;
   tokens: Record<string, number>; screenshot?: string; executed?: boolean; execution_status?: string;
   submitted_steps?: number; after_screenshot?: string;
   verification?: {verdict: string; evidence: string; missing: string}; error?: string; artifact_ref: string};
@@ -120,7 +121,9 @@ export type Config = {provider: 'codex' | 'api' | 'local'; model: string; localM
   desktopKnowledgeId?: string;
   hybridExecutor?: {provider: 'local' | 'codex' | 'api'; model: string; effort: string;
     apiUrl: string; apiKey: string; apiFormat?: string};
-  inference: string; executor: 'cua' | 'browser' | 'android'; scope: 'desktop' | 'child_desktop' | 'selected_windows' | 'browser' | 'android';
+  inference: string; executor: 'cua' | 'browser' | 'android' | 'osworld' | 'androidworld'; scope: 'desktop' | 'child_desktop' | 'selected_windows' | 'browser' | 'android' | 'osworld' | 'androidworld';
+  osworld?: {task_id: string; max_actions: number};
+  androidworld?: {task_id: string; max_actions: number};
   android?: {adb: string; serial: string; package: string; server_port: number; launch_app?: boolean};
   androidBudget?: {max_actions: number; max_seconds: number};
   mobileforge?: string;

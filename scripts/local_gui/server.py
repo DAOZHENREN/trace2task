@@ -56,6 +56,11 @@ class Engine:
         self.llama = LlamaRuntime(root, output) if backend == 'llama-server' else None
         from trace2task.local_gui_slots import SlotRuntime
         self.slots = SlotRuntime(output) if backend == 'slotread' else None
+        from trace2task.local_gui_mai_swift import NativeRuntime
+        self.mai = NativeRuntime() if backend == 'mai-swift-native105' else None
+        if backend == 'gui-swift-native131':
+            from trace2task.local_gui_swift import NativeRuntime as DesktopRuntime
+            self.mai = DesktopRuntime()
         self.model = self.processor = self.key = None
         self.prefix_cache = TextPrefixCache()
         self.conversation = None
@@ -159,6 +164,10 @@ class Engine:
     def load(self, key):
         from trace2task.model_registry import profile_for
         profile_for(key, self.backend)
+        if self.mai is not None:
+            runtime = self.mai.load()
+            self.model, self.processor, self.key = runtime.model, runtime.processor, key
+            return
         if self.slots is not None:
             self.slots.load()
             self.key = key
@@ -473,6 +482,70 @@ class Engine:
             save('outcome.json', outcome)
             self.finish_cancellation(request_id)
 
+    def _predict_mai(self, request, key, image, folder, save, cancelled, request_id,
+                     conversation, content, current_images, messages, images, record, context, review):
+        started = time.perf_counter()
+        raw, outcome = '', None
+        try:
+            if cancelled.is_set():
+                outcome = {'status': 'cancelled', 'reason': 'cancelled_before_prediction'}
+            elif review:
+                outcome = {'status': 'reviewed', 'phase': 'verification',
+                    'execution_status': 'read_only_no_actions', 'verification': {'verdict': 'unknown',
+                    'evidence': 'Slot reader cannot produce an independent textual review.',
+                    'missing': 'Director or human review of the fresh screenshot is required.'}}
+            else:
+                self.load(key)
+                if cancelled.is_set():
+                    outcome = {'status': 'cancelled', 'reason': 'cancelled_after_load'}
+                else:
+                    self.mai.session_id = conversation.identity if conversation else request_id
+                    self.mai.conversation_start = request.get('conversation_start') is True
+                    raw, count, image_names = self.mai.predict(messages, images, folder)
+                    (folder / 'raw.txt').write_text(raw, encoding='utf-8')
+                    record.update(input_stage='inferred', image_order=image_names)
+                    context.update(policy=INFERENCE_BACKENDS[self.backend].context_policy, input_tokens_after_cleanup=count)
+                    if key == 'gui-swift-4b' and (folder/'native-request.json').exists():
+                        record['native_request'] = json.loads((folder/'native-request.json').read_text())
+                        record['native_result'] = json.loads((folder/'native-result.json').read_text())
+                        if record['native_result'].get('input_mode'):
+                            record['transport_messages'] = record['messages']
+                            record['messages'] = record['native_request']['messages']
+                            context.update(policy=record['native_result']['input_mode'],
+                                retained_observations=record['native_result']['retained_observations'],
+                                dropped_history_turns=record['native_result']['dropped_history_turns'],
+                                prefix_verified_tokens=record['native_result']['prefix_verified_tokens'])
+                        else:
+                            context['released_history_images'] = min(2, len(record['native_request']['history']))
+                    if cancelled.is_set():
+                        outcome = {'status': 'cancelled', 'reason': 'cancelled_during_slot_read'}
+                    else:
+                        outcome = self._decode_prediction(key, raw, image, request, folder, False,
+                            conversation, content, current_images)
+            return outcome
+        except Exception as error:
+            (folder / 'error.log').write_text(traceback.format_exc(), encoding='utf-8')
+            outcome = {'status': 'error', 'error': f'{type(error).__name__}: {error}'}
+            return outcome
+        finally:
+            record['configuration'] = {'backend': self.backend, 'slots': 131 if key == 'gui-swift-4b' else 105, 'context_window': 24576 if key == 'gui-swift-4b' else 16384,
+                'max_pixels': 1048576, 'dtype': 'bfloat16',
+                'inference_engine': ('vllm-0.11.0-pooling' if key == 'gui-swift-4b' and os.environ.get('TRACE2TASK_SWIFT_VLLM_MODEL') else 'transformers'),
+                'attention': ('vllm-native' if key == 'gui-swift-4b' and os.environ.get('TRACE2TASK_SWIFT_VLLM_MODEL') else 'sdpa'), 'image_count': len(images),
+                'prompt_condition': ((record.get('native_result') or {}).get('input_mode') or 'mainline_messages_with_released_native131_scaffold') if key == 'gui-swift-4b' else 'mainline_messages_with_released_native105_scaffold'}
+            if (record.get('native_result') or {}).get('retained_observations'):
+                record['configuration']['image_count'] = record['native_result']['retained_observations']
+            if outcome is not None:
+                outcome.update(request_id=request_id, model=key, raw_output=raw,
+                    elapsed_seconds=time.perf_counter() - started, output_directory=str(folder),
+                    context_management=context)
+                if conversation is not None:
+                    outcome['conversation_id'] = conversation.identity
+                save('outcome.json', outcome)
+            save('input.json', record)
+            save('context-management.json', context)
+            self.finish_cancellation(request_id)
+
     def predict(self, request):
         key = request.get('model')
         if key not in MODELS:
@@ -492,6 +565,9 @@ class Engine:
         experience_context = validate_experience_context(request.get('experience_context'))
         prompt_profile = (validate_prompt_profile(request['prompt_profile'])
                           if request.get('prompt_profile') is not None else None)
+        if self.mai is not None and prompt_profile not in (None, {
+                'system_prompt': prompt(key), 'turn_template': default_turn_template(key)}):
+            raise ValueError('Swift uses its fixed released action system and mainline turn template')
         if self.slots is not None and prompt_profile not in (None, {
                 'system_prompt': prompt(key), 'turn_template': default_turn_template(key)}):
             raise ValueError('GUI-Decisions 使用固定的官方槽位提示词，不支持自定义提示词')
@@ -550,6 +626,8 @@ class Engine:
         if image.width*image.height > 32_000_000:
             raise ValueError('Image too large')
         image = image.convert('RGB')
+        if key == 'gui-swift-4b' and (experience_context or {}).get('images'):
+            raise ValueError('Desktop131 supports executed-action screenshots, not additional demonstration images')
         evidence_images = []
         evidence_ids = [item['id'] for item in (experience_context or {}).get('images', [])]
         if conversation is None or conversation.total_turns == 0:
@@ -622,7 +700,7 @@ class Engine:
                       + json.dumps(targets, ensure_ascii=False))
         if self.slots is not None:
             if guided_offset is not None:
-                task = conversation.initial_user_text + '\nCurrent subgoal: ' + task
+                task = conversation.initial_user_text + '\nCurrent goal: ' + task
             return self._predict_slots(request, key, image, folder, save, cancelled, request_id,
                 conversation, history, task + experience_block + execution_context_block, experience_context, review)
         text = render_turn_template(
@@ -646,7 +724,7 @@ class Engine:
         content = [{'type': 'image'}, {'type': 'text', 'text': text}]
         if guided_offset is not None:
             content = [{'type': 'image'},
-                       {'type': 'text', 'text': 'Current subgoal: ' + task + execution_context_block}]
+                       {'type': 'text', 'text': 'Current goal: ' + task + execution_context_block}]
         elif conversation is not None and not review:
             content = [{'type': 'image'}]
             if conversation.total_turns:
@@ -696,6 +774,9 @@ class Engine:
                               'dtype':'bfloat16','attention':'sdpa','profile':'local-12GB',
                               'memory_policy': 'measured_vram_images_only', 'image_count':len(images)}}
         save('input.json', input_record)
+        if self.mai is not None:
+            return self._predict_mai(request, key, image, folder, save, cancelled, request_id,
+                conversation, content, current_images, messages, images, input_record, context_report, review)
         if self.llama is not None:
             return self._predict_llama(request, key, image, folder, save, cancelled, request_id,
                                        conversation, system_prompt, content, current_images,
@@ -924,6 +1005,7 @@ class Engine:
 
 def main():
     parser=argparse.ArgumentParser()
+    parser.add_argument('--port',type=int,default=8768)
     parser.add_argument('--root',type=Path,default=Path('D:/Models/Trace2Task-GUI'))
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--token-file',type=Path,required=True)
@@ -944,6 +1026,8 @@ def main():
                 return self.reply(404,{'error':'Not found'})
             self.reply(200,{'service':'trace2task-local-gui','protocol':1, **engine.runtime_status(),
                             'backend': engine.backend,
+                            'swift_input_mode': os.environ.get('TRACE2TASK_SWIFT_INPUT_MODE', 'released'),
+                            'inference_engine': ('vllm-0.11.0-pooling' if engine.backend == 'gui-swift-native131' and os.environ.get('TRACE2TASK_SWIFT_VLLM_MODEL') else engine.backend),
                             'capabilities': {'cancel': True, 'detailed_metrics': True,
                                              'expected_backend': True, 'model_profiles': True,
                                              'editable_prompts': True,
@@ -955,6 +1039,8 @@ def main():
                                              'image_only_history_eviction': True,
                                              'generic_execution_context': True,
                                              'official_slotread_adapter': True,
+                                             'mai_swift_native105': engine.backend == 'mai-swift-native105',
+                                             'gui_swift_native131': engine.backend == 'gui-swift-native131',
                                              'official_owl_adapter': True}})
         def do_POST(self):
             if self.path not in {'/predict', '/load', '/cancel'} or not secrets.compare_digest(self.headers.get('X-Local-Token',''),token):
@@ -991,7 +1077,7 @@ def main():
             if hasattr(socket,'SO_EXCLUSIVEADDRUSE'):
                 self.socket.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
             super().server_bind()
-    server=LocalServer(('127.0.0.1',8768),Handler)
+    server=LocalServer(('127.0.0.1',args.port),Handler)
     server.serve_forever()
 
 if __name__=='__main__':

@@ -45,7 +45,8 @@ export function modelInput(raw: RawRound, provider?: string) {
       if (imageTypes.has(String(part.type))) {
         const number = imageIndex++;
         const image = sources[number] || {};
-        const localPath = part.local_path ?? (part.type === 'localImage' ? part.path : undefined);
+        const localPath = part.local_path ?? (part.type === 'localImage' ? part.path : undefined)
+          ?? (part.type === 'image' && typeof part.image === 'string' && part.image.startsWith('/') ? part.image : undefined);
         const path = typeof localPath === 'string' ? localPath
           : archiveImage(raw.output_directory, image.filename ?? order[number]);
         const label = image.kind === 'current' ? '当前截图'
@@ -76,7 +77,7 @@ export function modelInput(raw: RawRound, provider?: string) {
   if (input.input_stage === 'prepared_not_yet_inferred' || input.submission_kind === 'prepared_client_call_not_wire') {
     notices.push('这是准备输入；记录未确认进入模型推理，不能视为已发送。');
   }
-  if (raw.system_managed_externally || raw.provider === 'codex' || provider === 'codex') {
+  if (raw.system_managed_externally || (raw.provider ?? (raw.model_role === 'executor' && raw.output_directory ? 'local' : provider)) === 'codex') {
     notices.push('Codex：这里只展示本程序提交的本轮内容；服务端保留的历史与内置系统指令未由接口返回，不代表完整上下文。');
   } else if (source === 'incremental') {
     notices.push('这份记录只有本轮增量消息，没有完整历史上下文。');

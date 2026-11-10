@@ -89,6 +89,8 @@ class ChatRunAudit:
             for key in ('model_role', 'actual_model', 'subtask', 'output_directory'):
                 if key in output:
                     entry[key] = output[key]
+            from trace2task.round_input_evidence import with_local_input
+            entry.update(with_local_input(entry, self.root.parent))
             self.record("model_output", step_index=step, output={
                 key: value for key, value in output.items()
                 if key not in {"prompt", "schema", "input_messages"}},

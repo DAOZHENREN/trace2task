@@ -82,7 +82,15 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
                         capture=None, size=None, predictor=predict_local, model="D-5970", executor_backend="win32", cua_target=None,
                         experience_context=None, prompt_profile=None, on_model_round=None, inference_backend=None,
                         android_config=None, android_driver=None, max_seconds=None, application_knowledge=None,
-                        child_desktop=None, on_desktop_progress=None):
+                        child_desktop=None, on_desktop_progress=None, osworld_config=None):
+    if executor_backend == 'osworld':
+        from trace2task.osworld_execution import selection
+        osworld_config, task = selection(osworld_config)
+        if instruction != task['instruction'] or cua_target is not None:
+            raise ValueError('OSWorld requires the original task instruction and no host target')
+        max_actions = osworld_config['max_actions']
+    elif osworld_config is not None:
+        raise ValueError('OSWorld configuration requires its execution backend')
     if model == "D-5970" and experience_context is not None:
         raise ValueError("D-5970 冻结输入结构不支持经验指导")
     if executor_backend == 'android':
@@ -102,7 +110,7 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
                              prompt_profile=prompt_profile, on_model_round=on_model_round, inference_backend=inference_backend,
                              application_knowledge=application_knowledge, child_desktop=child_desktop,
                              on_desktop_progress=on_desktop_progress)
-    if executor_backend not in {"win32", "android"}:
+    if executor_backend not in {"win32", "android", "osworld"}:
         raise ValueError("Unknown executor backend")
     if model != "D-5970":
         from functools import partial
@@ -141,7 +149,17 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
     started = time.perf_counter()
     driver = None
     try:
-        if executor_backend == 'android':
+        if executor_backend == 'osworld':
+            from trace2task.osworld_execution import OSWorldDriver, OSWorldObservation, OSWorldExecutionBackend
+            driver = OSWorldDriver(root, record, emergency_stop, osworld_config)
+            status_callback('OSWorld 正在创建独立访客并重置所选任务；不操作宿主桌面。')
+            driver.start()
+            target = dict(driver.target)
+            observer = OSWorldObservation(driver)
+            execution_backend = OSWorldExecutionBackend(driver)
+            result['osworld_task'] = driver.task
+            status_callback('OSWorld 重置完成，开始主线模型执行。')
+        elif executor_backend == 'android':
             from trace2task.android_execution import (
                 AndroidDriver,
                 AndroidExecutionBackend,
@@ -188,6 +206,9 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
                 status_callback=status_callback, phase='final')
             result['final_screenshot'] = str(final_path)
             record('final_capture', screenshot=str(final_path), elapsed_ms=capture_ms)
+        if executor_backend == 'osworld':
+            from trace2task.osworld_execution import finish_evaluation
+            finish_evaluation(driver, result)
     except TimeBudgetExceeded:
         result.update(stop_reason='time_limit', task_complete=False, verified=False)
         status_callback('时间预算耗尽，任务未完成；已停止后续输入。')
@@ -197,6 +218,9 @@ def run_trained_desktop(*, instruction, output_root, emergency_stop, status_call
         result.update(stop_reason="error", error=f"{type(error).__name__}: {error}")
         record("error", error=result["error"], note="No automatic retry after uncertain input")
     finally:
+        if executor_backend == 'osworld' and 'environment_evaluation' not in result:
+            result['environment_evaluation'] = {'valid': False, 'raw_score': None,
+                'invalid_reason': 'Run interrupted or failed before scoring'}
         if driver is not None:
             try:
                 driver.close()

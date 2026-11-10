@@ -536,3 +536,20 @@ def test_text_token_requires_fresh_complete_editable_control(harness):
     with pytest.raises(ActionUnavailable):
         harness[0].backend.prepare(ActionPlan.from_prediction({'actions': [
             {'skill': 'type_text', 'args': {'text': 'abc'}}]}).actions[0], state)
+
+
+def test_dispatch_rejection_preserves_prefix_and_abandons_suffix(harness, monkeypatch):
+    core = harness[0]
+    original = core.backend.dispatch
+    calls = []
+    def dispatch(action, prepared, target, stop):
+        calls.append(action)
+        if len(calls) == 2:
+            raise ActionUnavailable('invalid_action: active terminal window blocked the GUI action')
+        return original(action, prepared, target, stop)
+    monkeypatch.setattr(core.backend, 'dispatch', dispatch)
+    result = execute(harness, [CLICK, CLICK, CLICK])
+    assert result.status == 'rejected'
+    assert len(result.steps) == 1 and len(calls) == 2
+    assert core.feedback['executed'] is False
+    assert core.last_requests[-1]['status'] == 'rejected'

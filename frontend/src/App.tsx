@@ -1,3 +1,4 @@
+import {loadConfigMemory, saveConfigMemory} from './configMemory';
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {Button, Spinner} from '@fluentui/react-components';
 import {api} from './api';
@@ -42,7 +43,8 @@ export function App() {
   const serviceRequest = useRef(false);
   const [runs, setRuns] = useState<Run[]>([]);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
-  const [config, setConfig] = useState(initialConfig);
+  const savedConfig = useRef(loadConfigMemory());
+  const [config, setConfig] = useState<Config>(() => ({...initialConfig, ...savedConfig.current}));
   useEffect(() => {
     if (config.executionMode !== 'hybrid' && config.experience === AUTO_MEMORY && (config.provider === 'local' || config.mobileforge))
       setConfig(current => current.executionMode !== 'hybrid' && current.experience === AUTO_MEMORY && (current.provider === 'local' || current.mobileforge)
@@ -50,6 +52,7 @@ export function App() {
   }, [config.experience, config.provider, config.mobileforge, config.executionMode]);
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(true);
+  useEffect(() => {if (!starting) saveConfigMemory(config);}, [config, starting]);
   const [stopping, setStopping] = useState(false);
   const [visited, setVisited] = useState(new Set<Page>(['tasks']));
   const [recordId, setRecordId] = useState('');
@@ -98,10 +101,12 @@ export function App() {
         api<{runs: Run[]}>('/api/workbench/runs')]);
       setState(next); setCatalog(cat); setRuns(history.runs);
       const saved = next.agent_options.api_defaults.saved_settings;
-      setConfig(c => ({...c, model: next.agent_options.defaults.model, effort: next.agent_options.defaults.reasoning_effort,
+      setConfig(c => ({...c, ...(cat.externally_managed && cat.service.model === 'mai-swift-2b' ?
+        {provider: 'local' as const, localModel: 'mai-swift-2b', executor: 'android' as const, scope: 'android' as const} : {}), model: next.agent_options.defaults.model, effort: next.agent_options.defaults.reasoning_effort,
         apiUrl: saved?.base_url || c.apiUrl, apiModel: saved?.model || c.apiModel,
         apiFormat: saved?.response_format || c.apiFormat, apiTimeout: saved?.timeout_seconds || c.apiTimeout,
-        apiBudget: saved?.context_window_tokens || c.apiBudget, inference: cat.configured_backend || c.inference}));
+        apiBudget: saved?.context_window_tokens || c.apiBudget, inference: cat.configured_backend || c.inference, ...savedConfig.current,
+        ...(!savedConfig.current?.model ? {model: next.agent_options.defaults.model, effort: next.agent_options.defaults.reasoning_effort} : {})}));
       if (active(next.active_job)) {
         if (isRecording(next.active_job!)) {setRecordId(next.active_job!.job_id); setPage('record');}
         else setSelectedRun(next.active_job!.job_id);

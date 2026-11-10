@@ -86,6 +86,7 @@ class RunSession:
         return cls(job.job_id, job.model, profile, backend, job.executor_backend, scope,
             "local" if local else "remote", destination,
             context_policy, context_description, job.task_path,
+            "isolated_androidworld_emulator" if job.executor_backend == "androidworld" else "isolated_osworld_guest" if job.executor_backend == "osworld" else
             "remote_android" if job.executor_backend == "android" else "isolated_browser" if job.executor_backend == "browser" else
             "child_session" if scope == "child_desktop" else
             "background_preferred" if job.executor_backend == "cua" and scope == "selected_windows"
@@ -109,6 +110,8 @@ def runtime_catalog(root):
     )
     python, models = gui_paths(root)
     result = public_catalog()
+    import os
+    result['externally_managed'] = os.environ.get('TRACE2TASK_GUI_EXTERNALLY_MANAGED') == '1'
     try:
         result["configured_backend"] = read_backend(Path(root) / "runs/local-gui")
     except (OSError, ValueError, KeyError) as error:
@@ -116,7 +119,13 @@ def runtime_catalog(root):
     for item in result["models"]:
         item["availability"] = {}
         for backend in item["engines"]:
-            if backend == 'slotread':
+            if backend == 'gui-swift-native131':
+                from trace2task.local_gui_swift import required_paths
+                paths = required_paths()
+            elif backend == 'mai-swift-native105':
+                from trace2task.local_gui_mai_swift import required_paths
+                paths = required_paths()
+            elif backend == 'slotread':
                 from trace2task.local_gui_slots import required_paths
                 paths = [python, *required_paths()]
             else:
@@ -134,6 +143,16 @@ def runtime_catalog(root):
                              {"reachable": False, "error": "服务身份不匹配"})
     except (OSError, ValueError, RuntimeError) as error:
         result["service"] = {"reachable": False, "error": str(error)}
+    from trace2task.local_gui_client import service_route
+    url, _ = service_route('gui-swift-4b')
+    result['services'] = {}
+    try:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(url+'/health', timeout=1) as response:
+            health = json.load(response)
+        result['services']['gui-swift-4b'] = {'reachable': health.get('service') == 'trace2task-local-gui',
+            'model': health.get('model'), 'backend': health.get('backend')}
+    except (OSError, ValueError, RuntimeError) as error:
+        result['services']['gui-swift-4b'] = {'reachable': False, 'error': str(error)}
     return result
 
 
@@ -143,7 +162,7 @@ def compact_snapshot(snapshot):
         # Whitelist the status summary; raw prompts/history/screenshots stay in the
         # existing run archive and per-round records, never in every poll response.
         result["result"] = {k: snapshot["result"][k] for k in (
-            "status", "completed", "stop_reason", "execution_status", "task_verification_status",
+            "environment_evaluation", "osworld_task", "androidworld_task", "status", "completed", "stop_reason", "execution_status", "task_verification_status",
             "performance", "trace_path", "audit_path", "output_directory", "representation",
             "compiled_trace_id", "trace_name", "experience_draft_id", "source_run_id",
             "memory_mode", "memory_selection", "use_experience", "experience_task_path",
@@ -165,7 +184,8 @@ def round_summary(entry):
 
 class RunStore:
     def __init__(self, root):
-        path = Path(root) / "runs/workbench.sqlite3"
+        self.runs_root = Path(root) / "runs"
+        path = self.runs_root / "workbench.sqlite3"
         path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
@@ -290,7 +310,8 @@ class RunStore:
             row = self.db.execute("SELECT value FROM rounds WHERE run_id=? AND step=?", (run_id, step)).fetchone()
             if row is None:
                 raise KeyError("Unknown model round")
-            return json.loads(row[0])
+            from trace2task.round_input_evidence import with_local_input
+            return with_local_input(json.loads(row[0]), self.runs_root)
 
     def closed_evidence(self, run_id):
         """Consistent snapshot for an explicit improvement request, never a polling response."""

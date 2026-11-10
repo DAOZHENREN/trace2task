@@ -122,7 +122,7 @@ def test_guided_conversation_keeps_only_confirmed_actions(service_module, tmp_pa
     assert conversation.total_turns == 1
 
 
-def test_guided_slot_reader_uses_stored_knowledge_with_fresh_notices(service_module, tmp_path, monkeypatch):
+def test_guided_slot_reader_uses_stored_knowledge_with_fresh_guidance(service_module, tmp_path, monkeypatch):
     _install_predict_fakes(monkeypatch)
     engine = service_module.Engine(tmp_path, tmp_path / 'output', backend='slotread')
     instructions = []
@@ -137,10 +137,10 @@ def test_guided_slot_reader_uses_stored_knowledge_with_fresh_notices(service_mod
     start = _request('guided-slot-first')
     start.update(model='gui-decisions-2b', conversation_id='guided-slot-run', conversation_start=True,
                  guided_history_offset=0, guided_history=[], guided_knowledge='\nCombat toolbar layout',
-                 task='Fight\nNotices: ["Wait while auto battle runs."]')
+                 task='Fight\nGuidance: ["Wait while auto battle runs."]')
     engine.predict(start)
     followup = {**start, 'request_id': 'guided-slot-next', 'conversation_start': False,
-                'task': 'Check results\nNotices: ["Verify the reward screen."]'}
+                'task': 'Check results\nGuidance: ["Verify the reward screen."]'}
     del followup['guided_knowledge']
     engine.predict(followup)
     assert all('Combat toolbar layout' in instruction for instruction in instructions)

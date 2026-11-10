@@ -197,9 +197,11 @@ class ActionCall:
                 raise ActionValidationError(
                     f"Skill 'type_text' text must not exceed {MAX_TEXT_LENGTH} characters"
                 )
-            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in text):
+            # Preserve horizontal tabs used by models for tabular text.
+            # Other control characters still require explicit key actions.
+            if any((ord(character) < 0x20 and character != "\t") or ord(character) == 0x7F for character in text):
                 raise ActionValidationError(
-                    "Skill 'type_text' does not allow control characters or newlines"
+                    "Skill 'type_text' does not allow control characters other than horizontal tabs"
                 )
             return {"text": text}
         if self.skill == "press_key":

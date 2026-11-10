@@ -23,7 +23,10 @@ class UnifiedAction:
                 or not isinstance(payload['skill'], str) or not isinstance(payload['args'], dict)):
             raise ValueError('Action requires exactly skill and args')
         skill, args = payload['skill'], deepcopy(payload['args'])
-        if skill in ('joystick_move', 'navigate_to'):
+        if skill in ('android_text', 'android_scroll', 'android_open_app', 'android_key'):
+            from trace2task.android_world_benchmark import validate_action
+            args = validate_action(skill, args)
+        elif skill in ('joystick_move', 'navigate_to'):
             from trace2task.android_navigation import validate_navigation_action
             args = validate_navigation_action(skill, args)
         elif skill == 'camera_drag':

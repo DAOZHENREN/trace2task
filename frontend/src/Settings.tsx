@@ -89,7 +89,7 @@ function Components({catalog, busy, visible, onError}: {catalog: Catalog; busy: 
   return <section className="surface workflow-card"><div className="row-between"><h2>组件与模型文件</h2><Refresh busy={!!pending} onClick={() => void refresh().catch(e => onError(String(e)))}/></div>
     <p className="notice" role="status">{status ? `${status.status} · ${status.message}` : '等待组件状态'}</p>
     <div className="two-fields"><Field label="组件安装目录"><Input value={directory} disabled={disabled} onChange={(_, d) => setDirectory(d.value)}/></Field>
-      <Field label="下载模型"><Choice value={model} disabled={disabled} onChange={e => setModel(e.target.value)}>{catalog.models.filter(p => !p.engines.includes('slotread')).map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field></div>
+      <Field label="下载模型"><Choice value={model} disabled={disabled} onChange={e => setModel(e.target.value)}>{catalog.models.filter(p => !p.engines.includes('slotread') && !p.engines.includes('mai-swift-native105') && !p.engines.includes('gui-swift-native131')).map(p => <option value={p.id} key={p.id}>{p.label}</option>)}</Choice></Field></div>
     <p className="quiet">GUI-Decisions 复用已有独立部署；在“模型与连接”中选择并启动。</p>
     <div className="button-row"><Button disabled={disabled || !directory} onClick={() => void action('runtime')}>安装 GPU 环境</Button><Button appearance="primary" disabled={disabled || !directory || !model} onClick={() => void action('model')}>下载所选模型</Button>
       <Button disabled={!!pending || status?.status !== 'running'} onClick={() => void action('cancel')}>取消安装 / 下载</Button></div>

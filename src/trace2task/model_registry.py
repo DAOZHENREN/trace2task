@@ -49,6 +49,9 @@ class InferenceBackend:
 
 
 INFERENCE_BACKENDS = {
+    "gui-swift-native131": InferenceBackend("gui-swift-native131", "GUI-Swift · Native131", "released_desktop131_history", "发布版单次前向读取器；历史坐标 bin，最近两张历史截图；24K 上限，原版动态图像预算。", 24576),
+    "mai-swift-native105": InferenceBackend("mai-swift-native105", "MAI-Swift · Native105", "fixed_16k_mainline_history",
+        "复用已发布的 105 槽读取器；主线任务与历史提示词，16K 上限，超限明确报错；非自回归生成。", 16384),
     "slotread": InferenceBackend("slotread", "官方 SlotRead · Transformers", "current_image_text_history",
         "常驻官方槽位读取器；每轮使用当前截图、原任务、完整文字经验与动作历史；不支持历史图片和文本生成。"),
     "transformers": InferenceBackend("transformers", "Transformers", "vram_images_only",
@@ -65,6 +68,14 @@ INFERENCE_BACKENDS = {
 
 MODEL_PROFILES = {
     p.id: p for p in (
+        ModelProfile("gui-swift-4b", "GUI-Swift · 4B", "dongjintao/GUI-Swift-4B",
+            "46f5c248ab5dbd017fccc2fff999826ec27e2a4d", "gui-swift-native131",
+            ("windows",), ("gui-swift-native131",), "experimental",
+            "发布版 Desktop131 step3368；复用原始因果槽位读取器，支持主线单模型与混合执行。"),
+        ModelProfile("mai-swift-2b", "MAI-Swift · 2B", "dongjintao/MAI-Swift-2B",
+            "c97f37b27053d56771238d84d46ddb68fc99e6bd", "mai-swift-native105",
+            ("android",), ("mai-swift-native105",), "experimental",
+            "已发布 Mobile105 权重；复用主线混合运行链路。方向滚动、Home、菜单和启动应用尚无主线对应路由，明确交还；完成声明仍需核验。"),
         ModelProfile("qwen3-vl-2b", "Qwen3-VL · 2B", "Qwen/Qwen3-VL-2B-Instruct",
             "89644892e4d85e24eaac8bacfd4f463576704203", "qwen-normalized-actions",
             ("windows",), ("llama-server", "transformers"),

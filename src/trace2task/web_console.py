@@ -563,6 +563,8 @@ class ConsoleJob:
     continuous: bool = False
     executor_backend: str = "win32"
     cua_target: dict | None = None
+    osworld_config: dict | None = None
+    androidworld_config: dict | None = None
     android_config: dict | None = None
     android_budget: dict | None = None
     mobileforge: str = ""
@@ -606,7 +608,7 @@ class ConsoleJob:
             "kind": self.kind,
             "narrated": self.narrated,
             "defer_compilation": self.defer_compilation,
-            "input_mode": ("remote_android" if self.executor_backend == "android" else "isolated_browser" if self.executor_backend == "browser" else
+            "input_mode": ("isolated_androidworld_emulator" if self.executor_backend == "androidworld" else "isolated_osworld_guest" if self.executor_backend == "osworld" else "remote_android" if self.executor_backend == "android" else "isolated_browser" if self.executor_backend == "browser" else
                            "child_session" if scope == "child_desktop" else
                            "background_preferred" if self.executor_backend == "cua" and scope == "selected_windows"
                            else "background" if self.background else "foreground"),
@@ -637,17 +639,19 @@ class ConsoleJob:
 class ConsoleEmergencyStop:
     """Combine the existing F9 stop with a stop request from the web console."""
 
-    def __init__(self, stop_event: threading.Event) -> None:
+    def __init__(self, stop_event: threading.Event, *, use_hotkey: bool = True) -> None:
         self.stop_event = stop_event
-        self.hotkey = Win32EmergencyStop()
+        self.hotkey = Win32EmergencyStop() if use_hotkey else None
 
     def start(self) -> None:
-        self.hotkey.start()
+        if self.hotkey is not None:
+            self.hotkey.start()
 
     def raise_if_requested(self) -> None:
         if self.stop_event.is_set():
             raise EmergencyStopRequested("Web console stop requested")
-        self.hotkey.raise_if_requested()
+        if self.hotkey is not None:
+            self.hotkey.raise_if_requested()
 
     def sleep(self, seconds: float) -> None:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -659,7 +663,8 @@ class ConsoleEmergencyStop:
             self.stop_event.wait(min(remaining, 0.05))
 
     def close(self) -> None:
-        self.hotkey.close()
+        if self.hotkey is not None:
+            self.hotkey.close()
 
 
 class ConsoleRecordingMonitor:
@@ -862,7 +867,7 @@ class WebConsoleController:
             validate_prompt_profile,
         )
 
-        if model not in MODELS or backend not in {"win32", "cua", "android"}:
+        if model not in MODELS or backend not in {"win32", "cua", "android", "osworld", "androidworld"}:
             raise ValueError("仅本地 GUI 模型可编辑执行提示词")
         default = {"system_prompt": prompt(model),
                    "turn_template": default_turn_template(model)}
@@ -1429,6 +1434,8 @@ class WebConsoleController:
         executor_backend: str = "cua",
         cua_target: dict | None = None,
         inference_backend: str | None = None,
+        osworld_config: dict | None = None,
+        androidworld_config: dict | None = None,
         android_config: dict | None = None,
         android_budget: dict | None = None,
         mobileforge: str = "",
@@ -1437,19 +1444,44 @@ class WebConsoleController:
         hybrid: dict | None = None,
         knowledge_selection: dict | None = None,
     ) -> dict[str, Any]:
+        if executor_backend == 'androidworld' or execution_scope == 'androidworld':
+            if (executor_backend != 'androidworld' or execution_scope != 'androidworld' or not execute
+                    or orchestration != 'legacy' or resume_from or background or cua_target is not None
+                    or use_experience or task_path or memory_mode not in (None, 'off') or knowledge_selection
+                    or mobileforge or android_model_profile or android_config or osworld_config):
+                raise ValueError('AndroidWorld requires isolated benchmark scope without task/experience overrides')
+            if (execution_mode != 'hybrid' or provider not in {'codex', 'api'} or not hybrid
+                    or hybrid.get('provider', 'local') != 'local' or hybrid.get('local_model') != 'mai-swift-2b'
+                    or hybrid.get('inference_backend') != 'mai-swift-native105'):
+                raise ValueError('AndroidWorld currently requires MAI-Swift native105 hybrid mode')
+            from trace2task.androidworld_execution import selection
+            androidworld_config, selected = selection(androidworld_config)
+            instruction = selected['instruction']
+        elif androidworld_config is not None:
+            raise ValueError('AndroidWorld config requires AndroidWorld scope')
+        if executor_backend == 'osworld' or execution_scope == 'osworld':
+            if (executor_backend != 'osworld' or execution_scope != 'osworld' or not execute
+                    or orchestration != 'legacy' or resume_from or background or cua_target is not None
+                    or use_experience or task_path or memory_mode not in (None, 'off') or knowledge_selection):
+                raise ValueError('OSWorld requires its isolated task scope; no task/experience overrides')
+            from trace2task.osworld_execution import selection
+            osworld_config, selected = selection(osworld_config)
+            instruction = selected['instruction']
+        elif osworld_config is not None:
+            raise ValueError('OSWorld config requires OSWorld scope')
         if execution_mode not in {'original', 'hybrid'}:
             raise ValueError('执行模式必须是 original / hybrid')
         hybrid_api_config = None
         if execution_mode == 'hybrid':
             from trace2task.hybrid_connections import prepare_executor
-            if (provider not in {'codex', 'api'} or executor_backend not in {'cua', 'android'} or not execute
+            if (provider not in {'codex', 'api'} or executor_backend not in {'cua', 'android', 'osworld', 'androidworld'} or not execute
                     or orchestration != 'legacy' or resume_from or mobileforge or android_model_profile
-                    or execution_scope not in {'desktop', 'android'}):
+                    or execution_scope not in {'desktop', 'android', 'osworld', 'androidworld'}):
                 raise ValueError('混合模式需要 Codex / 视觉 API 指导、Cua / Android 独立任务；不支持 MobileForge 或浏览器')
             hybrid, hybrid_api_config = prepare_executor(hybrid, self.codex_catalog, self.api_settings)
         elif hybrid is not None:
             raise ValueError('原模式不能附带混合模型配置')
-        normalized_instruction = " ".join(instruction.split())
+        normalized_instruction = instruction if executor_backend in {"osworld", "androidworld"} else " ".join(instruction.split())
         memory_mode = memory_mode if memory_mode is not None else ('manual' if use_experience else 'off')
         if not isinstance(memory_mode, str) or memory_mode not in {'off', 'manual', 'auto'}:
             raise ValueError('经验模式必须是 off / manual / auto')
@@ -1461,7 +1493,7 @@ class WebConsoleController:
             raise ValueError('自动经验仅支持 Codex / 视觉 API 通用代理的独立任务；请清空手动路径或关闭自动经验')
         if executor_backend == "win32":
             raise ValueError("Win32 执行后端已停用，请选择 Cua；Android 范围请使用 ADB")
-        if executor_backend not in {"cua", "browser", "android"}:
+        if executor_backend not in {"cua", "browser", "android", "osworld", "androidworld"}:
             raise ValueError("不支持的执行后端")
         if executor_backend == 'android' or execution_scope == 'android':
             if (executor_backend != 'android' or execution_scope != 'android'
@@ -1539,7 +1571,7 @@ class WebConsoleController:
             resume_from = str(resumed)
         if not isinstance(use_experience, bool):
             raise TypeError("使用经验必须是布尔值")
-        if execution_scope not in {"window", "desktop", "browser", "android"}:
+        if execution_scope not in {"window", "desktop", "browser", "android", "osworld", "androidworld"}:
             raise ValueError("不支持的执行范围")
         if execution_scope == "desktop" and background:
             raise ValueError("桌面 Baseline 仅支持前台执行")
@@ -1547,10 +1579,10 @@ class WebConsoleController:
             raise ValueError("不使用经验时，请手动选择任务以确定目标窗口和允许的操作")
         if not normalized_instruction:
             raise ValueError("请输入一条任务指令")
-        if len(normalized_instruction) > 2_000:
+        if executor_backend not in {"osworld", "androidworld"} and len(normalized_instruction) > 2_000:
             raise ValueError("任务指令不能超过 2000 个字符")
         if provider == "trained_d":
-            if execution_scope not in {"desktop", "android"} or orchestration != "legacy" or resume_from:
+            if execution_scope not in {"desktop", "android", "osworld", "androidworld"} or orchestration != "legacy" or resume_from:
                 raise ValueError("本地 GPU 模型支持桌面或 Android 的独立任务")
             if type(continuous) is not bool:
                 raise ValueError("continuous 必须为布尔值")
@@ -1602,7 +1634,7 @@ class WebConsoleController:
         allowed_efforts = API_REASONING_EFFORTS if provider == "api" else CODEX_REASONING_EFFORTS
         if reasoning_effort not in allowed_efforts:
             raise ValueError(f"不支持的思考强度：{reasoning_effort}")
-        if execution_scope in {"desktop", "browser", "android"} and not use_experience:
+        if execution_scope in {"desktop", "browser", "android", "osworld", "androidworld"} and not use_experience:
             resolved_task = None
             task_id = ("Ancient Beast 浏览器 · 无经验 Baseline" if execution_scope == 'browser'
                        else "Android · MobileForge" if mobileforge else "Android · ADB" if execution_scope == 'android' else "桌面 · 无经验 Baseline")
@@ -1621,7 +1653,7 @@ class WebConsoleController:
         if resolved_task is not None and resolved_task.name == "model-input.txt":
             from trace2task.trace_library import execution_context
 
-            if execution_scope not in {"desktop", "browser", "android"} or orchestration != "legacy" or not execute:
+            if execution_scope not in {"desktop", "browser", "android", "osworld", "androidworld"} or orchestration != "legacy" or not execute:
                 raise ValueError("A/B/C/D 经验支持独立任务执行，请使用桌面或 Cua 执行入口")
             task_id = execution_context(resolved_task)["task_id"]
             from trace2task.run_experience import validate_experience_scope
@@ -1655,7 +1687,7 @@ class WebConsoleController:
             job = ConsoleJob(
                 job_id=uuid.uuid4().hex,
                 task_path=resolved_task.relative_to(self.project_root).as_posix() if resolved_task else "",
-                task_id=task_id,
+                task_id=androidworld_config['task_id'] if androidworld_config else osworld_config['task_id'] if osworld_config else task_id,
                 instruction=normalized_instruction,
                 mode="execute" if execute else "plan",
                 model=model,
@@ -1674,6 +1706,8 @@ class WebConsoleController:
                 continuous=continuous,
                 executor_backend=executor_backend,
                 cua_target=cua_target,
+                osworld_config=osworld_config,
+                androidworld_config=androidworld_config,
                 android_config=android_config,
                 android_budget=android_budget,
                 mobileforge=mobileforge,
@@ -1690,6 +1724,10 @@ class WebConsoleController:
                 api_url=api_config.base_url if api_config else "",
                 requested_backend=inference_backend).public()
             job.run_facts.update(execution_mode=execution_mode)
+            if androidworld_config:
+                job.run_facts['androidworld'] = dict(androidworld_config)
+            if osworld_config:
+                job.run_facts['osworld'] = dict(osworld_config)
             if application_knowledge:
                 job.run_facts['application_knowledge'] = application_knowledge
             if hybrid:
@@ -4281,11 +4319,11 @@ class WebConsoleController:
         self, job: ConsoleJob, task_path: Path | None, execute: bool,
         api_config: ModelAPIConfig | None = None,
     ) -> None:
-        desktop = job.execution_scope in {"desktop", "browser", "android"}
+        desktop = job.execution_scope in {"desktop", "browser", "android", "osworld", "androidworld"}
         if job.executor_backend == 'android':
             self._update(job, log=f"Android · {(job.android_config or {}).get('serial')} · {(job.android_config or {}).get('package')} · {'MobileForge' if job.mobileforge else '通用视觉代理'}")
         self._update(job, status="running", log=(
-            f"任务已启动 · {'Android 远程手机' if job.executor_backend == 'android' else 'Ancient Beast 独立浏览器' if job.executor_backend == 'browser' else 'Windows 后台桌面' if (job.cua_target or {}).get('display_id') == 'child_session' else '指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
+            f"任务已启动 · {'AndroidWorld 专用模拟器' if job.executor_backend == 'androidworld' else 'OSWorld 独立访客' if job.executor_backend == 'osworld' else 'Android 远程手机' if job.executor_backend == 'android' else 'Ancient Beast 独立浏览器' if job.executor_backend == 'browser' else 'Windows 后台桌面' if (job.cua_target or {}).get('display_id') == 'child_session' else '指定窗口 / 应用' if job.executor_backend == 'cua' and (job.cua_target or {}).get('kind') != 'desktop' else '全桌面' if desktop else '单窗口'} · "
             f"{'Agent 自动选择经验' if job.memory_mode == 'auto' else '使用经验' if job.use_experience else '无经验 Baseline'}。"
         ))
         try:
@@ -4304,12 +4342,20 @@ class WebConsoleController:
             if api_config is not None:
                 kwargs["api_config"] = api_config
             if desktop or self.runner is run_windows_agent:
-                kwargs["emergency_stop"] = ConsoleEmergencyStop(job.stop_event)
+                kwargs["emergency_stop"] = (
+                    ConsoleEmergencyStop(job.stop_event, use_hotkey=False)
+                    if job.executor_backend in {"osworld", "androidworld"}
+                    else ConsoleEmergencyStop(job.stop_event)
+                )
             from trace2task.cua_desktop import CHILD_DESKTOP_TARGET
             child_options = {
                 'child_desktop': self.child_desktop,
                 'on_desktop_progress': lambda message, screenshot: self._update(job, log=message, screenshot=screenshot),
             } if job.cua_target == CHILD_DESKTOP_TARGET else {}
+            if job.executor_backend == 'androidworld':
+                child_options['androidworld_config'] = job.androidworld_config
+            if job.executor_backend == 'osworld':
+                child_options['osworld_config'] = job.osworld_config
             run_failure: Exception | None = None
             try:
                 if job.provider == "trained_d":
@@ -4628,6 +4674,10 @@ class WebConsoleController:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        # Close interactive controls before publishing a terminal job state.
+        # Otherwise wait()/UI polling can observe a finished job still accepting input.
+        if status in {"completed", "stopped", "failed"} and job.intervention_control is not None:
+            job.intervention_control.close((result or job.result or {}).get("stop_reason") or status)
         with self._lock:
             if status is not None:
                 job.status = status
@@ -4675,6 +4725,14 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
         parsed = urlparse(self.path)
+        if parsed.path == '/api/androidworld/tasks':
+            from trace2task.androidworld_execution import catalog
+            self._json(catalog())
+            return
+        if parsed.path == '/api/osworld/tasks':
+            from trace2task.osworld_execution import catalog
+            self._json(catalog())
+            return
         if parsed.path == '/api/chatgpt-browser':
             self._json(self.controller.chatgpt_browser.snapshot())
             return
@@ -5148,6 +5206,8 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
                     executor_backend=payload.get("executor_backend", "android" if payload.get("execution_scope") == "android" else "cua"),
                     cua_target=payload.get("cua_target"),
                     inference_backend=payload.get("inference_backend"),
+                    osworld_config=payload.get("osworld_config"),
+                    androidworld_config=payload.get("androidworld_config"),
                     android_config=payload.get("android_config"),
                     android_budget=payload.get("android_budget"),
                     mobileforge=payload.get("mobileforge", ""),
@@ -5472,9 +5532,13 @@ class WebConsoleHandler(BaseHTTPRequestHandler):
 
     def _require_loopback_host(self) -> str:
         """Reject DNS-rebinding hosts before serving local task data or images."""
-        port = self.server.server_address[1]
-        host = self.headers.get("Host", "")
-        if host not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+        # SSH/app forwarding may expose a different browser-side port. Validate
+        # the literal loopback authority, not equality with the backend port.
+        # POST still requires Origin == this exact Host plus the CSRF token.
+        hosts = self.headers.get_all("Host", [])
+        host = hosts[0] if len(hosts) == 1 else ""
+        match = re.fullmatch(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?", host)
+        if match is None or (match.group(1) is not None and not 1 <= int(match.group(1)) <= 65535):
             raise ValueError("本机控制台请求必须通过 127.0.0.1 或 localhost 访问")
         return host
 
